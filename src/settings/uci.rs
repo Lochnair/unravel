@@ -2,14 +2,15 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use crate::settings::uci_schema::{UciConfigSchema, UciSectionMapping};
 use config::{ConfigError as SourceError, Map, Source, Value, ValueKind};
 
-use rust_uci::config::{
-    Config as UciConfig, Package as UciPackage, SectionSelector, Value as UciValue,
-};
+use ucifer::document::{FromStrError, Section};
+use ucifer::{ConfigOption, Document};
 
 #[derive(Clone, Debug)]
 enum PackageSelection {
@@ -44,7 +45,6 @@ pub(crate) struct UciSource {
     required: bool,
     schema: &'static [UciSectionMapping],
     config_dir: Option<PathBuf>,
-    save_dir: Option<PathBuf>,
 }
 
 impl UciSource {
@@ -55,7 +55,6 @@ impl UciSource {
             required: true,
             schema: &[],
             config_dir: None,
-            save_dir: None,
         }
     }
 
@@ -99,52 +98,38 @@ impl UciSource {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn with_directories(
-        mut self,
-        config_dir: impl AsRef<Path>,
-        save_dir: impl AsRef<Path>,
-    ) -> Self {
+    pub(crate) fn with_config_dir(mut self, config_dir: impl AsRef<Path>) -> Self {
         self.config_dir = Some(config_dir.as_ref().to_owned());
-        self.save_dir = Some(save_dir.as_ref().to_owned());
         self
     }
 
-    fn open(&self) -> Result<UciConfig, SourceError> {
-        let mut uci = rust_uci::Uci::new()
-            .map_err(|e| SourceError::Message(format!("failed to open UCI: {e}")))?;
-
-        if let Some(config_dir) = &self.config_dir {
-            uci.set_config_dir(config_dir).map_err(|e| {
-                SourceError::Message(format!(
-                    "failed to set UCI config directory {config_dir:?}: {e}"
-                ))
-            })?;
+    fn package_names(&self, config_dir: &Path) -> Result<Vec<String>, SourceError> {
+        if let PackageSelection::Selected(names) = &self.packages {
+            return Ok(names.clone());
         }
 
-        if let Some(save_dir) = &self.save_dir {
-            uci.set_save_dir(save_dir).map_err(|e| {
-                SourceError::Message(format!(
-                    "failed to set UCI save directory {save_dir:?}: {e}"
-                ))
-            })?;
+        let enumerate_error = |error| {
+            SourceError::Message(format!(
+                "failed to enumerate UCI packages in {config_dir:?}: {error}"
+            ))
+        };
+        let entries = match fs::read_dir(config_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(enumerate_error(error)),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(enumerate_error)?;
+            let Ok(name) = entry.file_name().into_string() else {
+                continue;
+            };
+            if !name.contains('.') && entry.path().is_file() {
+                names.push(name);
+            }
         }
-
-        Ok(uci.into())
-    }
-
-    ///
-    /// Converts a [`SectionSelector`] into a string representation.
-    /// Anonymous sections are converted to `section_type[index]` format,
-    /// because config-rs does not allow @-prefixed section names.
-    fn config_selector(selector: &SectionSelector<'_>) -> String {
-        match selector {
-            SectionSelector::Named(name) => (*name).to_owned(),
-
-            SectionSelector::Anonymous {
-                section_type,
-                index,
-            } => format!("{section_type}[{index}]"),
-        }
+        names.sort();
+        Ok(names)
     }
 
     /// Without any schema the source maps every option to
@@ -157,8 +142,8 @@ impl UciSource {
     fn passthrough_table(
         mapping: &UciSectionMapping,
         key_field: &str,
-        entries: &[(String, UciValue)],
-        section: &str,
+        section: &Section<'_>,
+        section_key: &str,
     ) -> Result<Option<String>, SourceError> {
         let key_option = mapping
             .options
@@ -166,15 +151,14 @@ impl UciSource {
             .find(|option| option.config_field == key_field)
             .map_or(key_field, |option| option.uci_option);
 
-        let Some((_, value)) = entries.iter().find(|(name, _)| name == key_option) else {
-            return Ok(None);
-        };
-
-        let table = match value {
-            UciValue::String(table) => table,
-            UciValue::List(_) => {
+        let table = match section.get(key_option) {
+            // libuci treats an empty scalar as an unset option.
+            None => return Ok(None),
+            Some(ConfigOption::Scalar(table)) if table.is_empty() => return Ok(None),
+            Some(ConfigOption::Scalar(table)) => table.as_ref(),
+            Some(ConfigOption::List(_)) => {
                 return Err(SourceError::Message(format!(
-                    "UCI option {section}.{key_option} must be a single value, not a list"
+                    "UCI option {section_key}.{key_option} must be a single value, not a list"
                 )));
             }
         };
@@ -187,29 +171,22 @@ impl UciSource {
                 .all(|option| option.config_field != table);
         if !valid {
             return Err(SourceError::Message(format!(
-                "UCI option {section}.{key_option} has unusable value {table:?}: \
+                "UCI option {section_key}.{key_option} has unusable value {table:?}: \
                  expected letters, digits and underscores, and not the name of an \
                  option of this section"
             )));
         }
 
-        Ok(Some(table.clone()))
+        Ok(Some(table.to_owned()))
     }
 
     fn collect_package(
         &self,
         package_name: &str,
-        package: &UciPackage,
+        package: &Document<'_>,
         values: &mut Map<String, Value>,
         repeated_values: &mut Map<String, Vec<Value>>,
     ) -> Result<(), SourceError> {
-        let sections = package.sections().map_err(|e| {
-            SourceError::Message(format!(
-                "failed to retrieve sections from UCI package \
-                 {package_name:?}: {e}"
-            ))
-        })?;
-
         // Section types an anchor section can refer to by name.
         let reference_types: Vec<&str> = self
             .schema
@@ -220,13 +197,17 @@ impl UciSource {
 
         let mut mapped = Vec::new();
 
-        for section in sections {
+        for (key, section) in package.sections_iter() {
+            let section_type = package
+                .type_name(key.type_key)
+                .expect("document section types are interned");
+            let section_name = package.section_name(*key);
             // A repeated section goes to `<parent section>.<field>`.
             let repeated_mapping = self.schema.iter().find_map(|parent| {
                 let mapping = parent
                     .repeated
                     .iter()
-                    .find(|mapping| mapping.uci_section == section.type_())?;
+                    .find(|mapping| mapping.uci_section == section_type)?;
                 Some((
                     format!("{}.{}", parent.config_section, mapping.field),
                     mapping,
@@ -234,76 +215,51 @@ impl UciSource {
             });
             let mut section_values = Map::new();
 
-            let selector = section.selector().ok_or_else(|| {
-                SourceError::Message(format!(
-                    "loaded UCI section of type {:?} in package \
-                     {package_name:?} has no selector",
-                    section.type_()
-                ))
-            })?;
-            let section_key = format!("{package_name}.{selector}");
+            // config-rs paths omit the @ prefix used by UCI anonymous selectors.
+            let config_selector = section_name
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{section_type}[{}]", key.index));
+            let uci_selector = if section_name.is_some() {
+                config_selector.clone()
+            } else {
+                format!("@{config_selector}")
+            };
+
+            let section_key = format!("{package_name}.{uci_selector}");
 
             let mut singleton = None;
-            let mut section_name = None;
             if repeated_mapping.is_none() && self.has_schema() {
                 let Some(mapping) = self
                     .schema
                     .iter()
-                    .find(|mapping| mapping.uci_section == section.type_())
+                    .find(|mapping| mapping.uci_section == section_type)
                 else {
                     return Err(SourceError::Message(format!(
                         "UCI section {section_key} has unrecognised type {:?}",
-                        section.type_()
+                        section_type
                     )));
                 };
 
                 // `@type[n]` counts named sections too, so the index of the
                 // first anonymous section is not always 0.
-                match selector {
-                    SectionSelector::Named(name) => section_name = Some(name.to_owned()),
-                    SectionSelector::Anonymous { .. }
-                        if mapped.iter().any(|mapped: &MappedSection| {
-                            mapped.section_type == mapping.uci_section && mapped.name.is_none()
-                        }) =>
-                    {
-                        return Err(SourceError::Message(format!(
-                            "UCI section {section_key} is not supported: only one anonymous \
-                             {:?} section is read; give the others names",
-                            section.type_()
-                        )));
-                    }
-                    SectionSelector::Anonymous { .. } => {}
+                if section_name.is_none()
+                    && mapped.iter().any(|mapped: &MappedSection| {
+                        mapped.section_type == mapping.uci_section && mapped.name.is_none()
+                    })
+                {
+                    return Err(SourceError::Message(format!(
+                        "UCI section {section_key} is not supported: only one anonymous \
+                         {section_type:?} section is read; give the others names"
+                    )));
                 }
 
                 singleton = Some(mapping);
             }
 
-            let options = section.options().map_err(|e| {
-                SourceError::Message(format!(
-                    "failed to retrieve options from UCI section \
-                     {section_key}: {e}"
-                ))
-            })?;
-
-            let mut entries = Vec::new();
-            for option in options {
-                let option_name = option.name().to_owned();
-                let Some(value) = option.get().map_err(|e| {
-                    SourceError::Message(format!(
-                        "failed to retrieve UCI option \
-                         {section_key}.{option_name}: {e}"
-                    ))
-                })?
-                else {
-                    continue;
-                };
-                entries.push((option_name, value));
-            }
-
             let passthrough_table = match singleton {
                 Some(mapping) => match mapping.passthrough_key {
                     Some(key_field) => {
-                        Self::passthrough_table(mapping, key_field, &entries, &section_key)?
+                        Self::passthrough_table(mapping, key_field, section, &section_key)?
                     }
                     None => None,
                 },
@@ -312,8 +268,12 @@ impl UciSource {
 
             let mut references = Vec::new();
 
-            for (option_name, value) in entries {
-                let option_name = option_name.as_str();
+            for (option_name, option) in section.iter() {
+                // libuci treats an empty scalar as an unset option.
+                if matches!(option, ConfigOption::Scalar(value) if value.is_empty()) {
+                    continue;
+                }
+                let option_name = option_name.as_ref();
                 let uci_key = format!("{section_key}.{option_name}");
 
                 let repeated_option = repeated_mapping.as_ref().and_then(|(_, mapping)| {
@@ -337,14 +297,14 @@ impl UciSource {
                     {
                         format!("{}.{}", mapping.config_section, option.config_field)
                     } else if mapping.anchor && reference_types.contains(&option_name) {
-                        let UciValue::String(target) = value else {
+                        let ConfigOption::Scalar(target) = option else {
                             return Err(SourceError::Message(format!(
                                 "UCI option {uci_key} must name one section, not a list"
                             )));
                         };
                         references.push(Reference {
                             section_type: option_name.to_owned(),
-                            target,
+                            target: target.as_ref().to_owned(),
                             uci_key,
                         });
                         continue;
@@ -365,21 +325,24 @@ impl UciSource {
                         )));
                     }
                 } else {
-                    format!(
-                        "{package_name}.{}.{option_name}",
-                        Self::config_selector(&selector)
-                    )
+                    format!("{package_name}.{config_selector}.{option_name}")
                 };
 
                 let origin = format!("UCI option {uci_key}");
 
-                let value = match value {
-                    UciValue::String(value) => Value::new(Some(&origin), ValueKind::String(value)),
-
-                    UciValue::List(items) => {
+                let value = match option {
+                    ConfigOption::Scalar(value) => {
+                        Value::new(Some(&origin), ValueKind::String(value.as_ref().to_owned()))
+                    }
+                    ConfigOption::List(items) => {
                         let items = items
-                            .into_iter()
-                            .map(|item| Value::new(Some(&origin), ValueKind::String(item)))
+                            .iter()
+                            .map(|item| {
+                                Value::new(
+                                    Some(&origin),
+                                    ValueKind::String(item.as_ref().to_owned()),
+                                )
+                            })
                             .collect();
 
                         Value::new(Some(&origin), ValueKind::Array(items))
@@ -403,7 +366,7 @@ impl UciSource {
             }
 
             if let Some((config_path, _)) = repeated_mapping {
-                let origin = format!("UCI section {package_name}.{selector}");
+                let origin = format!("UCI section {section_key}");
                 repeated_values
                     .entry(config_path)
                     .or_default()
@@ -412,7 +375,7 @@ impl UciSource {
                 mapped.push(MappedSection {
                     key: section_key,
                     section_type: mapping.uci_section,
-                    name: section_name,
+                    name: section_name.map(str::to_owned),
                     values: section_values,
                     references,
                 });
@@ -549,56 +512,39 @@ impl Source for UciSource {
     }
 
     fn collect(&self) -> Result<Map<String, Value>, SourceError> {
-        let resolved = (|| {
-            let uci = self.open()?;
-
-            let packages: Vec<UciPackage> = match &self.packages {
-                PackageSelection::Selected(package_names) => package_names
-                    .iter()
-                    .map(|package_name| {
-                        uci.package(package_name)
-                            .map_err(|e| {
-                                SourceError::Message(format!(
-                                    "failed to open UCI package {package_name:?}: {e}"
-                                ))
-                            })?
-                            .ok_or_else(|| {
-                                SourceError::NotFound(format!("UCI package {package_name:?}"))
-                            })
-                    })
-                    .collect::<Result<_, SourceError>>()?,
-
-                PackageSelection::All => uci
-                    .packages()
-                    .map_err(|e| {
-                        SourceError::Message(format!("failed to enumerate UCI packages: {e}"))
-                    })?
-                    .collect(),
-            };
-
-            Ok::<_, SourceError>((uci, packages))
-        })();
-
-        let (_uci, packages) = match resolved {
-            Ok(resolved) => resolved,
-
-            Err(SourceError::NotFound(_)) if !self.required => {
-                return Ok(Map::new());
-            }
-
-            Err(error) => {
-                return Err(error);
-            }
-        };
-
+        let config_dir = self
+            .config_dir
+            .as_deref()
+            .unwrap_or(Path::new("/etc/config"));
         let mut values = Map::new();
         let mut repeated_values = Map::new();
 
-        for package in packages {
-            let package_name = package
-                .name()
-                .map_err(|e| SourceError::Message(format!("failed to read UCI package name: {e}")))?
-                .to_owned();
+        // ucifer reads package files directly. OpenWrt's runtime overlays and staged
+        // deltas are managed by libuci and are outside this source's file input.
+        for package_name in self.package_names(config_dir)? {
+            let path = config_dir.join(&package_name);
+            let contents = match fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return if self.required {
+                        Err(SourceError::NotFound(format!("UCI package {path:?}")))
+                    } else {
+                        Ok(Map::new())
+                    };
+                }
+                Err(error) => {
+                    return Err(SourceError::Message(format!(
+                        "failed to read UCI package {path:?}: {error}"
+                    )));
+                }
+            };
+            let package = Document::try_from(contents.as_str()).map_err(|error| {
+                let detail = match &error {
+                    FromStrError::Syntax(error) => error.to_string(),
+                    FromStrError::Import(error) => error.to_string(),
+                };
+                SourceError::Message(format!("failed to parse UCI package {path:?}: {detail}"))
+            })?;
 
             self.collect_package(&package_name, &package, &mut values, &mut repeated_values)?;
         }
@@ -626,24 +572,93 @@ impl Source for UciSource {
 mod tests {
     use super::*;
     use crate::settings::Settings;
-    use std::fs;
+    use crate::settings::uci_schema::{UciOptionMapping, UciRepeatedSectionMapping};
 
     #[test]
-    fn malformed_optional_package_is_an_error() {
+    fn optional_package_distinguishes_missing_and_malformed_files() {
         let root = std::env::temp_dir().join(format!("unravel-uci-{}", std::process::id()));
         let config_dir = root.join("config");
-        let save_dir = root.join("save");
         fs::create_dir_all(&config_dir).unwrap();
-        fs::create_dir_all(&save_dir).unwrap();
         let config_file = config_dir.join("unravel");
-        fs::write(&config_file, "config network 'unterminated\n").unwrap();
-
         let source = UciSource::from_schema::<Settings>()
-            .with_directories(&config_dir, &save_dir)
+            .with_config_dir(&config_dir)
             .required(false);
+        let missing = source.collect();
+        fs::write(&config_file, "config network 'unterminated\n").unwrap();
         let result = source.collect();
 
         fs::remove_dir_all(root).unwrap();
+        assert!(missing.unwrap().is_empty());
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn maps_anonymous_indices_and_preserves_repeated_list_order() {
+        let config_dir =
+            std::env::temp_dir().join(format!("unravel-uci-mapping-{}", std::process::id()));
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("unravel"),
+            "\
+config network 'named'
+    option device 'eth0'
+config reflector 'first'
+    list address 'one'
+    list address 'two'
+config network
+    option device 'eth1'
+    option unused ''
+config reflector
+    list address 'three'
+",
+        )
+        .unwrap();
+
+        let source = UciSource::new(["unravel"]).with_config_dir(&config_dir);
+        let raw = source.collect().unwrap();
+        assert!(raw.contains_key("unravel.named.device"));
+        assert!(raw.contains_key("unravel.network[1].device"));
+        assert!(!raw.contains_key("unravel.network[1].unused"));
+
+        let source = source.with_schema(&[UciSectionMapping {
+            uci_section: "network",
+            config_section: "network",
+            anchor: true,
+            options: &[UciOptionMapping {
+                uci_option: "device",
+                config_field: "device",
+            }],
+            external: &[],
+            repeated: &[UciRepeatedSectionMapping {
+                uci_section: "reflector",
+                field: "entries",
+                options: &[UciOptionMapping {
+                    uci_option: "address",
+                    config_field: "addresses",
+                }],
+            }],
+            passthrough_key: None,
+        }]);
+        let result = config::Config::builder().add_source(source.clone()).build();
+        let named = config::Config::builder()
+            .add_source(source.with_instance(Some("named")))
+            .build();
+        fs::remove_dir_all(config_dir).unwrap();
+
+        let config = result.unwrap();
+        assert_eq!(config.get_string("network.device").unwrap(), "eth1");
+        assert_eq!(named.unwrap().get_string("network.device").unwrap(), "eth0");
+        assert_eq!(
+            config
+                .get::<Vec<String>>("network.entries[0].addresses")
+                .unwrap(),
+            ["one", "two"]
+        );
+        assert_eq!(
+            config
+                .get::<Vec<String>>("network.entries[1].addresses")
+                .unwrap(),
+            ["three"]
+        );
     }
 }
