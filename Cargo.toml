@@ -25,7 +25,7 @@ config = { version = "0.15.27", default-features = false }
 csv = "1.4.0"
 fastrand = "2"
 icmp-socket2 = { version = "0.6.4", features = ["tokio"] }
-irtt-client = { version = "0.7.0", optional = true, features = ["ancillary", "tokio"] }
+irtt-client = { version = "0.8.0", optional = true, features = ["ancillary", "tokio"] }
 libc = "0.2"
 rustix = { version = "1.1", features = ["fs", "system", "thread", "time"] }
 serde = { version = "1", features = ["derive"] }

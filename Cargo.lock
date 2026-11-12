@@ -290,9 +290,9 @@ dependencies = [
 
 [[package]]
 name = "irtt-client"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f353c4b64006ca005136724a63616a086176893950539890374d60bc75ce346b"
+checksum = "0b65e8db13c4aaeb43703ffa3625cbc3abda2346b85467ca4c216be902bddde1"
 dependencies = [
  "irtt-proto",
  "nix",
