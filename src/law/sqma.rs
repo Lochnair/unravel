@@ -4,11 +4,12 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    time::{Duration, Instant, SystemTime},
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use tokio::sync::watch;
 
 use crate::{
@@ -26,12 +27,96 @@ const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
 const RECENT_HALF_LIFE_SECS: f64 = 0.4;
 const STALE_AFTER: Duration = Duration::from_secs(30);
 
+// With history_file set, the recorded safe rates are saved there so a
+// service restart does not throw them away.
+const HISTORY_SAVE_EVERY: Duration = Duration::from_secs(30);
+const HISTORY_MAX_AGE_SECS: u64 = 6 * 3600;
+const HISTORY_HEADER: &str = "unravel-history 1";
+
 struct RateState {
     current_kbps: f64,
     safe_rates: VecDeque<f64>,
     /// How many safe rates are recorded rather than startup placeholders.
     /// Recorded rates sit at the back.
     observed: usize,
+    /// Base the history was learned against.
+    base_kbps: f64,
+}
+
+/// The saved history, without the header and time lines.
+/// One line per direction: `<name> <base> <count> <rate>...`, recorded rates only.
+fn history_body(size: usize, dirs: &[(&str, f64, &RateState)]) -> String {
+    let mut body = format!("size {size}\n");
+    for (name, base, state) in dirs {
+        let skip = state.safe_rates.len() - state.observed;
+        let recorded: Vec<String> = state
+            .safe_rates
+            .iter()
+            .skip(skip)
+            .map(|r| r.to_string())
+            .collect();
+        body.push_str(&format!(
+            "{name} {base} {} {}\n",
+            recorded.len(),
+            recorded.join(" ")
+        ));
+    }
+    body
+}
+
+/// Parse a saved history. None if it is malformed, from a
+/// different history size, or older than HISTORY_MAX_AGE_SECS.
+fn parse_history(text: &str, now_unix: u64, size: usize) -> Option<Vec<(String, f64, Vec<f64>)>> {
+    let mut lines = text.lines();
+    if lines.next()? != HISTORY_HEADER {
+        return None;
+    }
+    let saved: u64 = lines.next()?.strip_prefix("saved ")?.parse().ok()?;
+    if saved > now_unix + 60 || now_unix.saturating_sub(saved) > HISTORY_MAX_AGE_SECS {
+        return None;
+    }
+    let saved_size: usize = lines.next()?.strip_prefix("size ")?.parse().ok()?;
+    if saved_size != size {
+        return None;
+    }
+    let mut dirs = vec![];
+    for line in lines {
+        let mut words = line.split_whitespace();
+        let name = words.next()?.to_string();
+        let base: f64 = words.next()?.parse().ok()?;
+        let count: usize = words.next()?.parse().ok()?;
+        let rates: Vec<f64> = words
+            .map(|w| w.parse::<f64>())
+            .collect::<Result<_, _>>()
+            .ok()?;
+        if !(base.is_finite() && base > 0.0)
+            || rates.len() != count
+            || count > size
+            || rates
+                .iter()
+                .any(|r| !r.is_finite() || *r <= 0.0 || *r > 10.0 * base)
+        {
+            return None;
+        }
+        dirs.push((name, base, rates));
+    }
+    Some(dirs)
+}
+
+/// Put saved recorded rates at the back of the history, oldest first.
+fn restore_samples(state: &mut RateState, rates: &[f64]) {
+    let n = rates.len().min(state.safe_rates.len());
+    for r in &rates[rates.len() - n..] {
+        state.safe_rates.pop_front();
+        state.safe_rates.push_back(*r);
+    }
+    state.observed = n;
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl RateState {
@@ -46,6 +131,7 @@ impl RateState {
             current_kbps: base_speed,
             safe_rates: rates,
             observed: 0,
+            base_kbps: base_speed,
         }
     }
 
@@ -135,6 +221,11 @@ pub(crate) struct SqmaLaw {
     rng: fastrand::Rng,
     diagnostics: Option<DiagnosticsSender>,
 
+    // Restart-proof safe-rate history (None = off).
+    history_path: Option<PathBuf>,
+    history_saved_at: Option<Instant>,
+    history_saved_body: String,
+
     // TODO: Eventually the selector should do its own calculations,
     // and not depend on the law for measurements
     control_tx: watch::Sender<Option<ControlSnapshot>>,
@@ -185,6 +276,13 @@ impl SqmaLaw {
         diagnostics: Option<DiagnosticsSender>,
     ) -> Self {
         let tick = settings.advanced_settings.tick_interval;
+        let history_path = settings
+            .advanced_settings
+            .history_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
 
         Self {
             settings,
@@ -196,6 +294,71 @@ impl SqmaLaw {
             rng: fastrand::Rng::new(),
             control_tx,
             diagnostics,
+            history_path,
+            history_saved_at: None,
+            history_saved_body: String::new(),
+        }
+    }
+
+    /// Put back the recorded rates saved before a restart.
+    fn restore_history(&self, name: &str, base_kbps: f64, state: &mut RateState) {
+        let Some(path) = &self.history_path else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let size = state.safe_rates.len();
+        let Some(dirs) = parse_history(&text, unix_now(), size) else {
+            warn!(
+                "Ignoring {}: unreadable, stale or a different history size",
+                path.display()
+            );
+            return;
+        };
+        let Some((_, saved_base, rates)) = dirs.iter().find(|(n, _, _)| n == name) else {
+            return;
+        };
+        if *saved_base != base_kbps {
+            info!("Not restoring {name} history: base was {saved_base}, now {base_kbps}");
+            return;
+        }
+        restore_samples(state, rates);
+        info!("Restored {} recorded {name} safe rates", rates.len());
+    }
+
+    /// Write the recorded rates out, at most every 30 s and only if they changed.
+    fn save_history(&mut self, now: Instant) {
+        let Some(path) = &self.history_path else {
+            return;
+        };
+        if self
+            .history_saved_at
+            .is_some_and(|t| now.saturating_duration_since(t) < HISTORY_SAVE_EVERY)
+        {
+            return;
+        }
+        self.history_saved_at = Some(now);
+        let mut dirs = vec![];
+        for (name, state) in [
+            ("download", self.download.as_ref()),
+            ("upload", self.upload.as_ref()),
+        ] {
+            if let Some(state) = state {
+                dirs.push((name, state.base_kbps, state));
+            }
+        }
+        let size = dirs.first().map_or(0, |(_, _, s)| s.safe_rates.len());
+        let body = history_body(size, &dirs);
+        if body == self.history_saved_body {
+            return;
+        }
+        let text = format!("{HISTORY_HEADER}\nsaved {}\n{body}", unix_now());
+        let tmp = path.with_extension("tmp");
+        let result = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path));
+        match result {
+            Ok(()) => self.history_saved_body = body,
+            Err(error) => warn!("Could not save {}: {error}", path.display()),
         }
     }
 
@@ -209,6 +372,7 @@ impl SqmaLaw {
 
             let mut state = RateState::new(shaper.base_kbps, size, &mut self.rng);
             state.current_kbps = initial;
+            self.restore_history("download", shaper.base_kbps, &mut state);
 
             self.download = Some(state);
         }
@@ -220,6 +384,7 @@ impl SqmaLaw {
 
             let mut state = RateState::new(shaper.base_kbps, size, &mut self.rng);
             state.current_kbps = initial;
+            self.restore_history("upload", shaper.base_kbps, &mut state);
 
             self.upload = Some(state);
         }
@@ -372,6 +537,8 @@ impl SqmaLaw {
                 delta_delay: deltas[deltas.len() / 2],
             });
         }
+
+        self.save_history(now);
 
         if let Some(diagnostics) = &mut self.diagnostics {
             diagnostics.publish(now, |history_due| DiagnosticRecord {

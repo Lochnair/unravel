@@ -462,6 +462,10 @@ pub(crate) struct AdvancedSettings {
     /// Load at or below which low_load_cut_floor and idle_recovery_percent
     /// act. Above it, the decision is unchanged from upstream.
     pub(crate) low_load_level: f64,
+    /// File to keep the recorded safe rates in across a service restart.
+    /// Read at startup if under 6 h old and saved with the same
+    /// speed_hist_size and base rate. Unset = off, the upstream behaviour.
+    pub(crate) history_file: Option<String>,
 }
 
 impl Default for AdvancedSettings {
@@ -478,6 +482,7 @@ impl Default for AdvancedSettings {
             low_load_cut_floor: 0.0,
             idle_recovery_percent: 0.0,
             low_load_level: 0.3,
+            history_file: None,
         }
     }
 }

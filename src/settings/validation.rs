@@ -393,6 +393,13 @@ impl AdvancedSettings {
             );
         }
 
+        if let Some(path) = self.history_file.as_deref().map(str::trim)
+            && !path.is_empty()
+            && !path.starts_with('/')
+        {
+            report.error("advanced_settings.history_file", "must be an absolute path");
+        }
+
         if self.speed_hist_size == 0 {
             report.error(
                 "advanced_settings.speed_hist_size",
