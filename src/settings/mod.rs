@@ -195,6 +195,13 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
+    pub(crate) fn protocol_preferences(&self) -> Vec<ReflectorProtocol> {
+        if self.reflectors.protocol_preferences.is_empty() {
+            vec![self.advanced_settings.measurement_type]
+        } else {
+            self.reflectors.protocol_preferences.clone()
+        }
+    }
     pub(crate) fn load() -> Result<Self, ConfigError> {
         let builder = Config::builder();
 
@@ -226,7 +233,8 @@ impl Settings {
                 .try_parsing(true)
                 .list_separator(",")
                 .with_list_parse_key("reflectors.files")
-                .with_list_parse_key("reflectors.countries"),
+                .with_list_parse_key("reflectors.countries")
+                .with_list_parse_key("reflectors.protocol_preferences"),
         );
         let mut settings: Self = builder.build()?.try_deserialize()?;
 
@@ -296,7 +304,9 @@ pub(crate) struct ReflectorSettings {
     pub(crate) bootstrap: Vec<ReflectorDefinition>,
 
     pub(crate) num_reflectors: u8,
-    pub(crate) peer_reselection_time: u64,
+    pub(crate) protocol_preferences: Vec<ReflectorProtocol>,
+    pub(crate) num_candidates: usize,
+    pub(crate) candidate_period: f64,
 }
 
 impl ReflectorSettings {
@@ -371,7 +381,9 @@ impl Default for ReflectorSettings {
                 irtt("nl-ams1.irtt.lochnair.net", Some("NL")),
             ],
             num_reflectors: 5,
-            peer_reselection_time: 15,
+            protocol_preferences: Vec::new(),
+            num_candidates: 3,
+            candidate_period: 3.0,
         }
     }
 }

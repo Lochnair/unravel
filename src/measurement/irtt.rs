@@ -2,19 +2,16 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use super::{
-    model::{
-        MeasurementOutcome, MeasurementStreamId, OneWayClock, OneWayLatency, ProbeCompletion,
-        SignedDuration,
-    },
-    plan::{ExecutionPhase, MeasurementAssignment, StreamExecution},
+use super::model::{
+    MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayClock, OneWayLatency,
+    SignedDuration,
 };
 use crate::settings::NetworkSettings;
 use irtt_client::{
     AsyncClient, AsyncOpenState, ClientConfig, ClientEvent, NegotiationPolicy, OpenOutcome,
     OpenPolicy, SendProbeError,
 };
-use log::{debug, warn};
+use log::{debug, trace, warn};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -25,6 +22,15 @@ use std::{
 
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+// A remotely expired token can be silently discarded. Repeated protocol
+// timeouts trigger session recovery, independently of target selection policy.
+const SESSION_TIMEOUT_LIMIT: u32 = 2;
+
+#[derive(Default)]
+struct SessionLiveness {
+    last_reply_started: Option<Instant>,
+    consecutive_timeouts: u32,
+}
 type Connecting =
     Pin<Box<dyn Future<Output = Result<AsyncClient, irtt_client::ClientError>> + Send>>;
 
@@ -39,22 +45,19 @@ enum Session {
 }
 
 struct Target {
-    assignment: MeasurementAssignment,
     interval: Duration,
     session: Session,
-    failures: u64,
-    generation: u64,
+    liveness: SessionLiveness,
 }
 
 struct Closing {
     client: Box<AsyncClient>,
-    status: StreamExecution,
     deadline: Instant,
 }
 
 pub struct IrttDriver {
     settings: NetworkSettings,
-    targets: BTreeMap<MeasurementStreamId, Target>,
+    targets: BTreeMap<MeasurementTarget, Target>,
     closing: Vec<Closing>,
 }
 
@@ -76,72 +79,60 @@ impl IrttDriver {
 
     fn connect(
         settings: &NetworkSettings,
-        assignment: &MeasurementAssignment,
+        target: &MeasurementTarget,
         interval: Duration,
     ) -> Connecting {
+        let MeasurementTarget::Irtt {
+            endpoint,
+            authentication,
+        } = target
+        else {
+            unreachable!("IRTT driver requires an IRTT target");
+        };
         let mut config = client_config(interval, settings);
-        if let Some(key) = assignment
-            .irtt_hmac
-            .as_ref()
-            .filter(|k| !k.trim().is_empty())
-        {
+        if let Some(key) = authentication {
             config.auth = irtt_client::Authentication::Hmac(irtt_client::HmacKey::new(
                 key.as_bytes().to_vec().into_boxed_slice(),
             ));
         }
-        let endpoint =
-            std::net::SocketAddr::new(assignment.stream.peer, assignment.irtt_port).to_string();
+        let endpoint = endpoint.to_string();
         Box::pin(async move { AsyncClient::connect(endpoint, config).await })
     }
 
-    pub fn reconcile(&mut self, assignments: &[MeasurementAssignment], interval: Duration) {
+    pub fn reconcile(&mut self, targets: &[MeasurementTarget], interval: Duration) {
         let removed = self
             .targets
             .keys()
-            .copied()
-            .filter(|id| !assignments.iter().any(|a| a.stream.id == *id))
+            .filter(|target| !targets.contains(target))
+            .cloned()
             .collect::<Vec<_>>();
-        for id in removed {
-            let target = self.targets.remove(&id).unwrap();
-            self.retire(target);
+        for target in removed {
+            let execution = self.targets.remove(&target).unwrap();
+            self.retire(execution);
         }
-        for assignment in assignments {
-            if let Some(target) = self.targets.get_mut(&assignment.stream.id) {
-                if target.interval == interval
-                    && target.assignment.stream == assignment.stream
-                    && target.assignment.irtt_port == assignment.irtt_port
-                    && target.assignment.irtt_hmac == assignment.irtt_hmac
-                {
-                    target.assignment = assignment.clone();
-                    continue;
-                }
-                let target = self.targets.remove(&assignment.stream.id).unwrap();
-                self.retire(target);
+        for target in targets {
+            if self
+                .targets
+                .get(target)
+                .is_some_and(|t| t.interval == interval)
+            {
+                continue;
+            }
+            if let Some(previous) = self.targets.remove(target) {
+                self.retire(previous);
             }
             self.targets.insert(
-                assignment.stream.id,
+                target.clone(),
                 Target {
-                    assignment: assignment.clone(),
                     interval,
-                    session: Session::Connecting(Self::connect(
-                        &self.settings,
-                        assignment,
-                        interval,
-                    )),
-                    failures: 0,
-                    generation: 0,
+                    session: Session::Connecting(Self::connect(&self.settings, target, interval)),
+                    liveness: SessionLiveness::default(),
                 },
             );
         }
     }
 
     fn retire(&mut self, target: Target) {
-        let status = StreamExecution {
-            assignment: target.assignment,
-            phase: ExecutionPhase::Retiring,
-            failures: target.failures,
-            generation: target.generation,
-        };
         match target.session {
             Session::Opening {
                 mut client,
@@ -153,7 +144,6 @@ impl IrttDriver {
                 client.discard_prepared_probe();
                 self.closing.push(Closing {
                     client,
-                    status,
                     deadline: Instant::now() + CLOSE_TIMEOUT,
                 });
             }
@@ -161,12 +151,13 @@ impl IrttDriver {
         }
     }
 
-    fn fail(target: &mut Target, closing: &mut Vec<Closing>, error: impl std::fmt::Display) {
-        warn!(
-            "IRTT {} execution failure: {error}",
-            target.assignment.stream.peer
-        );
-        target.failures = target.failures.saturating_add(1);
+    fn fail(
+        identity: &MeasurementTarget,
+        target: &mut Target,
+        closing: &mut Vec<Closing>,
+        error: impl std::fmt::Display,
+    ) {
+        warn!("IRTT {identity:?} execution failure: {error}");
         let previous = std::mem::replace(
             &mut target.session,
             Session::Cooling(Instant::now() + RETRY_DELAY),
@@ -176,12 +167,6 @@ impl IrttDriver {
                 client.discard_prepared_probe();
                 closing.push(Closing {
                     client,
-                    status: StreamExecution {
-                        assignment: target.assignment.clone(),
-                        phase: ExecutionPhase::Retiring,
-                        failures: target.failures,
-                        generation: target.generation,
-                    },
                     deadline: Instant::now() + CLOSE_TIMEOUT,
                 });
             }
@@ -201,9 +186,9 @@ impl IrttDriver {
         &mut self,
         cx: &mut Context<'_>,
         now: Instant,
-        completions: &mut Vec<ProbeCompletion>,
+        completions: &mut Vec<MeasurementEvent>,
     ) {
-        for target in self.targets.values_mut() {
+        for (identity, target) in &mut self.targets {
             let mut failure = None;
             match &mut target.session {
                 Session::Connecting(future) => match future.as_mut().poll(cx) {
@@ -222,11 +207,8 @@ impl IrttDriver {
                 },
                 Session::Opening { client, operation } => match client.poll_open(operation, cx) {
                     Poll::Ready(Ok(OpenOutcome::Started(session))) => {
-                        debug!(
-                            "IRTT session started for {}: token {}",
-                            session.remote, session.token
-                        );
-                        target.generation += 1;
+                        debug!("IRTT session started for {}", session.remote);
+                        target.liveness = SessionLiveness::default();
                         let previous =
                             std::mem::replace(&mut target.session, Session::Cooling(now));
                         let Session::Opening { client, .. } = previous else {
@@ -245,7 +227,7 @@ impl IrttDriver {
                     if let Poll::Ready(result) = client.poll_recv(cx) {
                         match result {
                             Ok(events) => {
-                                map_events(&target.assignment, events, completions);
+                                map_events(identity, &mut target.liveness, events, completions);
                                 cx.waker().wake_by_ref();
                             }
                             Err(error) => failure = Some(error.to_string()),
@@ -254,7 +236,12 @@ impl IrttDriver {
                     if failure.is_none() {
                         match client.poll_timeouts_bounded_at(now, 32) {
                             Ok(batch) => {
-                                map_events(&target.assignment, batch.events, completions);
+                                map_events(
+                                    identity,
+                                    &mut target.liveness,
+                                    batch.events,
+                                    completions,
+                                );
                                 if batch.more_due {
                                     cx.waker().wake_by_ref();
                                 }
@@ -263,13 +250,15 @@ impl IrttDriver {
                         }
                         if client.is_peer_closed() {
                             failure = Some("remote closed session".into());
+                        } else if target.liveness.consecutive_timeouts >= SESSION_TIMEOUT_LIMIT {
+                            failure = Some("session stopped replying to probes".into());
                         }
                     }
                 }
                 Session::Cooling(until) if now >= *until => {
                     target.session = Session::Connecting(Self::connect(
                         &self.settings,
-                        &target.assignment,
+                        identity,
                         target.interval,
                     ));
                     cx.waker().wake_by_ref();
@@ -277,20 +266,31 @@ impl IrttDriver {
                 Session::Cooling(_) => {}
             }
             if let Some(error) = failure {
-                Self::fail(target, &mut self.closing, error);
+                Self::fail(identity, target, &mut self.closing, error);
             }
         }
         self.closing.retain_mut(|closing| {
-            now < closing.deadline && closing.client.poll_close(cx).is_pending()
+            if now >= closing.deadline {
+                warn!("IRTT retired session close deadline expired");
+                return false;
+            }
+            match closing.client.poll_close(cx) {
+                Poll::Pending => true,
+                Poll::Ready(Ok(_)) => false,
+                Poll::Ready(Err(error)) => {
+                    debug!("IRTT retired session close finished with error: {error}");
+                    false
+                }
+            }
         });
     }
 
     pub fn poll_send(
         &mut self,
-        id: MeasurementStreamId,
+        identity: &MeasurementTarget,
         cx: &mut Context<'_>,
     ) -> Poll<SendProgress> {
-        let Some(target) = self.targets.get_mut(&id) else {
+        let Some(target) = self.targets.get_mut(identity) else {
             return Poll::Ready(SendProgress {
                 accepted_at: None,
                 failed: true,
@@ -301,16 +301,24 @@ impl IrttDriver {
         };
         match client.poll_send_probe(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(receipt)) => Poll::Ready(SendProgress {
-                accepted_at: Some(receipt.sent_at.mono),
-                failed: false,
-            }),
+            Poll::Ready(Ok(receipt)) => {
+                trace!(
+                    "IRTT {} next protocol timeout: {:?}, configured timeout: {:?}",
+                    identity.peer(),
+                    client.next_probe_timeout_deadline(),
+                    client.probe_timeout()
+                );
+                Poll::Ready(SendProgress {
+                    accepted_at: Some(receipt.sent_at.mono),
+                    failed: false,
+                })
+            }
             Poll::Ready(Err(error)) => {
                 let accepted_at = match &error {
                     SendProbeError::AfterCommit { receipt, .. } => Some(receipt.sent_at.mono),
                     SendProbeError::NotCommitted(_) => None,
                 };
-                Self::fail(target, &mut self.closing, error);
+                Self::fail(identity, target, &mut self.closing, error);
                 Poll::Ready(SendProgress {
                     accepted_at,
                     failed: true,
@@ -319,11 +327,11 @@ impl IrttDriver {
         }
     }
 
-    pub fn discard(&mut self, id: MeasurementStreamId) {
+    pub fn discard(&mut self, identity: &MeasurementTarget) {
         if let Some(Target {
             session: Session::Ready(client),
             ..
-        }) = self.targets.get_mut(&id)
+        }) = self.targets.get_mut(identity)
         {
             client.discard_prepared_probe();
         }
@@ -341,26 +349,10 @@ impl IrttDriver {
             .min()
     }
 
-    pub fn statuses(&self) -> Vec<StreamExecution> {
+    pub fn is_ready(&self, target: &MeasurementTarget) -> bool {
         self.targets
-            .values()
-            .map(|t| StreamExecution {
-                assignment: t.assignment.clone(),
-                failures: t.failures,
-                generation: t.generation,
-                phase: match t.session {
-                    Session::Ready(_) => ExecutionPhase::Ready,
-                    Session::Cooling(_) => ExecutionPhase::Failed,
-                    _ => ExecutionPhase::Establishing,
-                },
-            })
-            .chain(
-                self.closing
-                    .iter()
-                    .filter(|c| !self.targets.contains_key(&c.status.assignment.stream.id))
-                    .map(|c| c.status.clone()),
-            )
-            .collect()
+            .get(target)
+            .is_some_and(|t| matches!(t.session, Session::Ready(_)))
     }
 
     pub fn shutdown(&mut self) {
@@ -375,11 +367,30 @@ impl IrttDriver {
 }
 
 fn map_events(
-    assignment: &MeasurementAssignment,
+    target: &MeasurementTarget,
+    liveness: &mut SessionLiveness,
     events: Vec<ClientEvent>,
-    completions: &mut Vec<ProbeCompletion>,
+    completions: &mut Vec<MeasurementEvent>,
 ) {
     for event in events {
+        match &event {
+            ClientEvent::EchoReply { sent_at, .. }
+                if liveness
+                    .last_reply_started
+                    .is_none_or(|started| sent_at.mono >= started) =>
+            {
+                liveness.last_reply_started = Some(sent_at.mono);
+                liveness.consecutive_timeouts = 0;
+            }
+            ClientEvent::EchoLoss { sent_at, .. }
+                if liveness
+                    .last_reply_started
+                    .is_none_or(|started| sent_at.mono > started) =>
+            {
+                liveness.consecutive_timeouts = liveness.consecutive_timeouts.saturating_add(1);
+            }
+            _ => {}
+        }
         let (started_at, completed_at, outcome) = match event {
             ClientEvent::EchoReply {
                 sent_at,
@@ -401,11 +412,19 @@ fn map_events(
                 sent_at,
                 timeout_at,
                 ..
-            } => (sent_at.mono, timeout_at, MeasurementOutcome::Loss),
+            } => {
+                debug!(
+                    "IRTT {} protocol timeout at {:?}; consecutive timeouts: {}",
+                    target.peer(),
+                    timeout_at,
+                    liveness.consecutive_timeouts
+                );
+                (sent_at.mono, timeout_at, MeasurementOutcome::Loss)
+            }
             _ => continue,
         };
-        completions.push(ProbeCompletion {
-            stream: assignment.stream,
+        completions.push(MeasurementEvent {
+            target: target.clone(),
             started_at,
             completed_at,
             outcome,

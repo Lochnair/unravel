@@ -2,34 +2,48 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::fmt::{self, Display};
-use std::{net::IpAddr, time::Instant};
+use crate::settings::ReflectorProtocol;
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Instant,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MeasurementStreamId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MeasurementSource {
-    IcmpEcho,
-    IcmpTimestamp,
-    Irtt,
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MeasurementTarget {
+    IcmpEcho(Ipv4Addr),
+    IcmpTimestamps(Ipv4Addr),
+    Irtt {
+        endpoint: SocketAddr,
+        authentication: Option<Arc<str>>,
+    },
 }
 
-impl Display for MeasurementSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl MeasurementTarget {
+    pub fn peer(&self) -> IpAddr {
         match self {
-            MeasurementSource::IcmpEcho => write!(f, "icmp-echo"),
-            MeasurementSource::IcmpTimestamp => write!(f, "icmp-timestamps"),
-            MeasurementSource::Irtt => write!(f, "irtt"),
+            Self::IcmpEcho(peer) | Self::IcmpTimestamps(peer) => (*peer).into(),
+            Self::Irtt { endpoint, .. } => endpoint.ip(),
+        }
+    }
+
+    pub fn protocol(&self) -> ReflectorProtocol {
+        match self {
+            Self::IcmpEcho(_) => ReflectorProtocol::IcmpEcho,
+            Self::IcmpTimestamps(_) => ReflectorProtocol::IcmpTimestamps,
+            Self::Irtt { .. } => ReflectorProtocol::Irtt,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MeasurementStream {
-    pub id: MeasurementStreamId,
-    pub peer: IpAddr,
-    pub source: MeasurementSource,
+impl fmt::Debug for MeasurementTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Irtt { endpoint, .. } => write!(f, "irtt({endpoint})"),
+            _ => write!(f, "{}({})", self.protocol(), self.peer()),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -79,10 +93,9 @@ pub enum MeasurementRole {
 }
 
 /// One completed measurement. Latencies belong only to successful replies.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MeasurementEvent {
-    pub stream: MeasurementStream,
-    pub role: MeasurementRole,
+    pub target: MeasurementTarget,
     /// Local monotonic time at which the probe started.
     pub started_at: Instant,
     /// Local receive time for a reply; the producer-reported timeout time for
@@ -118,12 +131,4 @@ impl MeasurementEvent {
             MeasurementOutcome::Loss => None,
         }
     }
-}
-
-/// Protocol completion before the engine attaches its currently applied role.
-pub struct ProbeCompletion {
-    pub stream: MeasurementStream,
-    pub started_at: Instant,
-    pub completed_at: Instant,
-    pub outcome: MeasurementOutcome,
 }

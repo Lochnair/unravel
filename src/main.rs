@@ -8,7 +8,6 @@
 extern crate core;
 
 mod app;
-mod controller;
 mod diagnostics;
 mod error;
 mod law;
@@ -16,12 +15,10 @@ mod log;
 mod measurement;
 mod metrics;
 mod platform;
-mod reflector_selector;
-mod reflector_setup;
+mod reflector_manager;
 mod runtime;
 mod settings;
 mod time;
-mod util;
 
 use crate::app::App;
 use crate::platform::warn_platform_limitations;

@@ -211,8 +211,28 @@ impl ReflectorSettings {
             report.error("reflectors.num_reflectors", "must be greater than 0");
         }
 
-        if self.peer_reselection_time == 0 {
-            report.error("reflectors.peer_reselection_time", "must be greater than 0");
+        if !std::time::Duration::try_from_secs_f64(self.candidate_period).is_ok_and(|period| {
+            !period.is_zero() && std::time::Instant::now().checked_add(period).is_some()
+        }) {
+            report.error(
+                "reflectors.candidate_period",
+                "must be a nonzero representable duration",
+            );
+        }
+        let mut protocols = std::collections::HashSet::new();
+        for &protocol in &self.protocol_preferences {
+            if !protocols.insert(protocol) {
+                report.error(
+                    "reflectors.protocol_preferences",
+                    "must not contain duplicates",
+                );
+            }
+            if protocol == super::ReflectorProtocol::Irtt && !cfg!(feature = "irtt") {
+                report.error(
+                    "reflectors.protocol_preferences",
+                    "IRTT feature is disabled in this build",
+                );
+            }
         }
 
         if self.files.is_empty() && self.entries.is_empty() && self.bootstrap.is_empty() {
@@ -366,11 +386,14 @@ impl AdvancedSettings {
             );
         }
 
-        validate_greater_than_zero_f64(
-            report,
-            "advanced_settings.tick_interval",
-            self.tick_interval,
-        );
+        if !std::time::Duration::try_from_secs_f64(self.tick_interval).is_ok_and(|period| {
+            !period.is_zero() && std::time::Instant::now().checked_add(period).is_some()
+        }) {
+            report.error(
+                "advanced_settings.tick_interval",
+                "must be a nonzero representable duration",
+            );
+        }
 
         if !(0.0..1.0).contains(&self.low_load_cut_floor) {
             report.error(

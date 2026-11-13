@@ -6,12 +6,12 @@
 use super::irtt::IrttDriver;
 use super::{
     icmp::IcmpDriver,
-    model::{MeasurementEvent, MeasurementSource, MeasurementStreamId},
-    plan::{AppliedState, ExecutionPhase, MeasurementPlan, StreamExecution},
+    model::{MeasurementEvent, MeasurementOutcome, MeasurementTarget},
+    plan::{AppliedState, AppliedTarget, MeasurementPlan},
     scheduler::ProbeScheduler,
 };
 use crate::{error::ChannelClosed, settings::NetworkSettings};
-use log::warn;
+use log::{trace, warn};
 use std::{
     collections::{BTreeMap, HashSet},
     future::{Future, poll_fn},
@@ -32,7 +32,7 @@ pub struct MeasurementEngine {
     applied: watch::Sender<AppliedState>,
     measurements: broadcast::Sender<MeasurementEvent>,
     stop: watch::Receiver<bool>,
-    icmp_status: BTreeMap<MeasurementStreamId, StreamExecution>,
+    icmp_status: BTreeMap<MeasurementTarget, bool>,
     timer: Pin<Box<tokio::time::Sleep>>,
     rejected_revision: Option<u64>,
 }
@@ -71,59 +71,41 @@ impl MeasurementEngine {
 
     fn apply(&mut self, plan: MeasurementPlan) -> anyhow::Result<()> {
         plan.validate()?;
-        for assignment in &plan.assignments {
-            if let Some(old) = self
-                .plan
-                .assignments
-                .iter()
-                .find(|a| a.stream.id == assignment.stream.id)
-            {
-                anyhow::ensure!(
-                    old.stream == assignment.stream
-                        && old.irtt_port == assignment.irtt_port
-                        && old.irtt_hmac == assignment.irtt_hmac,
-                    "stream IDs cannot change protocol identity"
-                );
-            }
-        }
+        anyhow::ensure!(
+            plan.revision >= self.plan.revision,
+            "measurement plan revision went backwards"
+        );
+        anyhow::ensure!(
+            plan.revision != self.plan.revision || plan == self.plan,
+            "measurement plan changed without a new revision"
+        );
         let schedules = plan
             .assignments
             .iter()
-            .map(|a| (a.stream.id, a.schedule))
+            .map(|a| (a.target.clone(), a.schedule))
             .collect::<Vec<_>>();
-        for id in self.scheduler.reconcile(&schedules, Instant::now()) {
-            self.discard(id);
+        for target in self.scheduler.reconcile(&schedules, Instant::now()) {
+            self.discard(&target);
         }
-        let icmp_ids = plan
+        let icmp_targets = plan
             .assignments
             .iter()
-            .filter(|a| a.stream.source != MeasurementSource::Irtt)
-            .map(|a| a.stream.id)
+            .filter(|a| !matches!(a.target, MeasurementTarget::Irtt { .. }))
+            .map(|a| a.target.clone())
             .collect::<HashSet<_>>();
-        self.icmp.retain(&icmp_ids);
-        self.icmp_status.retain(|id, _| icmp_ids.contains(id));
-        for assignment in plan
-            .assignments
-            .iter()
-            .filter(|a| icmp_ids.contains(&a.stream.id))
-        {
-            self.icmp_status
-                .entry(assignment.stream.id)
-                .and_modify(|s| s.assignment = assignment.clone())
-                .or_insert(StreamExecution {
-                    assignment: assignment.clone(),
-                    phase: ExecutionPhase::Ready,
-                    failures: 0,
-                    generation: 1,
-                });
+        self.icmp.retain(&icmp_targets);
+        self.icmp_status
+            .retain(|target, _| icmp_targets.contains(target));
+        for target in icmp_targets {
+            self.icmp_status.entry(target).or_insert(false);
         }
         #[cfg(feature = "irtt")]
         self.irtt.reconcile(
             &plan
                 .assignments
                 .iter()
-                .filter(|a| a.stream.source == MeasurementSource::Irtt)
-                .cloned()
+                .filter(|a| matches!(a.target, MeasurementTarget::Irtt { .. }))
+                .map(|a| a.target.clone())
                 .collect::<Vec<_>>(),
             plan.active_interval,
         );
@@ -133,20 +115,36 @@ impl MeasurementEngine {
         Ok(())
     }
 
-    fn discard(&mut self, id: MeasurementStreamId) {
-        self.icmp.discard(id);
+    fn discard(&mut self, target: &MeasurementTarget) {
+        self.icmp.discard(target);
         #[cfg(feature = "irtt")]
-        self.irtt.discard(id);
+        self.irtt.discard(target);
     }
 
     fn publish_status(&self) {
-        let mut streams = self.icmp_status.values().cloned().collect::<Vec<_>>();
-        #[cfg(feature = "irtt")]
-        streams.extend(self.irtt.statuses());
-        streams.sort_by_key(|s| s.assignment.stream.id);
+        let targets = self
+            .plan
+            .assignments
+            .iter()
+            .map(|assignment| {
+                let ready = match &assignment.target {
+                    MeasurementTarget::IcmpEcho(_) | MeasurementTarget::IcmpTimestamps(_) => {
+                        self.icmp_status[&assignment.target]
+                    }
+                    #[cfg(feature = "irtt")]
+                    MeasurementTarget::Irtt { .. } => self.irtt.is_ready(&assignment.target),
+                    #[cfg(not(feature = "irtt"))]
+                    MeasurementTarget::Irtt { .. } => false,
+                };
+                AppliedTarget {
+                    assignment: assignment.clone(),
+                    ready,
+                }
+            })
+            .collect();
         let state = AppliedState {
             revision: self.plan.revision,
-            streams,
+            targets,
             rejected_revision: self.rejected_revision,
         };
         self.applied.send_if_modified(|current| {
@@ -175,68 +173,56 @@ impl MeasurementEngine {
         #[cfg(feature = "irtt")]
         self.irtt.poll_maintenance(cx, now, &mut completions);
         let (due, withdrawn) = self.scheduler.opportunities(now);
-        for id in withdrawn {
-            self.discard(id);
+        for target in withdrawn {
+            self.discard(&target);
         }
-        for id in due {
-            let assignment = self
-                .plan
-                .assignments
-                .iter()
-                .find(|a| a.stream.id == id)
-                .unwrap();
-            match assignment.stream.source {
-                MeasurementSource::IcmpEcho | MeasurementSource::IcmpTimestamp => {
-                    match self.icmp.poll_send(assignment.stream, cx) {
+        // A correlated reply proves ICMP receive readiness. A later send error
+        // in this poll takes precedence over that reply.
+        for completion in &completions {
+            if matches!(completion.outcome, MeasurementOutcome::Reply { .. })
+                && let Some(ready) = self.icmp_status.get_mut(&completion.target)
+            {
+                *ready = true;
+            }
+        }
+        for target in due {
+            match &target {
+                MeasurementTarget::IcmpEcho(_) | MeasurementTarget::IcmpTimestamps(_) => {
+                    match self.icmp.poll_send(&target, cx) {
                         Poll::Ready(Ok(accepted_at)) => {
-                            self.scheduler.committed(id, accepted_at);
-                            self.icmp_status.get_mut(&id).unwrap().phase = ExecutionPhase::Ready;
+                            self.scheduler.committed(&target, accepted_at);
+                            trace!("Probe accepted: {target:?}");
                         }
                         Poll::Ready(Err(error)) => {
-                            warn!("ICMP {} send failed: {error:#}", assignment.stream.peer);
-                            self.scheduler.withdraw(id);
-                            let status = self.icmp_status.get_mut(&id).unwrap();
-                            status.phase = ExecutionPhase::Failed;
-                            status.failures = status.failures.saturating_add(1);
+                            warn!("ICMP {target:?} send failed: {error:#}");
+                            self.scheduler.withdraw(&target);
+                            *self.icmp_status.get_mut(&target).unwrap() = false;
                         }
                         Poll::Pending => {}
                     }
                 }
                 #[cfg(feature = "irtt")]
-                MeasurementSource::Irtt => {
-                    if let Poll::Ready(progress) = self.irtt.poll_send(id, cx) {
+                MeasurementTarget::Irtt { .. } => {
+                    if let Poll::Ready(progress) = self.irtt.poll_send(&target, cx) {
                         if let Some(accepted_at) = progress.accepted_at {
-                            self.scheduler.committed(id, accepted_at);
+                            self.scheduler.committed(&target, accepted_at);
+                            trace!("Probe accepted: {target:?}");
                         }
                         if progress.failed {
-                            self.scheduler.withdraw(id);
-                            self.irtt.discard(id);
+                            self.scheduler.withdraw(&target);
+                            self.irtt.discard(&target);
                         }
                     }
                 }
                 #[cfg(not(feature = "irtt"))]
-                MeasurementSource::Irtt => unreachable!("validated plan"),
+                MeasurementTarget::Irtt { .. } => unreachable!("validated plan"),
             }
         }
-        for completion in completions {
-            // Retired sessions cannot publish; surviving sessions use the role
-            // applied now, including replies to probes sent before promotion.
-            if let Some(assignment) = self
-                .plan
-                .assignments
-                .iter()
-                .find(|a| a.stream == completion.stream)
-            {
-                let _ = self.measurements.send(MeasurementEvent {
-                    stream: completion.stream,
-                    role: assignment.role,
-                    started_at: completion.started_at,
-                    completed_at: completion.completed_at,
-                    outcome: completion.outcome,
-                });
-            }
-        }
+        // Consumers must see readiness before the first usable measurement.
         self.publish_status();
+        for completion in completions {
+            let _ = self.measurements.send(completion);
+        }
         let deadline = self
             .scheduler
             .next_deadline()
@@ -263,8 +249,17 @@ impl MeasurementEngine {
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
+        let result = self.run_until_stop().await;
+        self.shutdown().await;
+        result
+    }
+
+    async fn run_until_stop(&mut self) -> anyhow::Result<()> {
         let mut desired = self.desired.clone();
         let mut stop = self.stop.clone();
+        if *stop.borrow() {
+            return Ok(());
+        }
         loop {
             tokio::select! {
                 changed = desired.changed() => {
@@ -277,10 +272,13 @@ impl MeasurementEngine {
                         self.publish_status();
                     }
                 },
-                changed = stop.changed() => { changed.map_err(|_| ChannelClosed)?; if *stop.borrow() { break; } },
+                changed = stop.changed() => { changed.map_err(|_| ChannelClosed)?; if *stop.borrow() { return Ok(()); } },
                 result = poll_fn(|cx| self.poll_progress(cx)) => { result?; },
             }
         }
+    }
+
+    async fn shutdown(&mut self) {
         self.plan.assignments.clear();
         self.icmp_status.clear();
         self.icmp.retain(&HashSet::new());
@@ -305,6 +303,5 @@ impl MeasurementEngine {
             .await;
         }
         self.publish_status();
-        Ok(())
     }
 }

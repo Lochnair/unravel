@@ -5,27 +5,24 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::controller::Controller;
 use crate::diagnostics::CsvWriter;
 use crate::error::ChannelClosed;
 use crate::law::{Law, LawContext, SqmaLaw};
-use crate::measurement::model::MeasurementSource;
 use crate::measurement::{
     engine::MeasurementEngine,
     plan::{AppliedState, MeasurementPlan},
 };
 use crate::metrics::{Metric, Metrics, MetricsSender};
 use crate::platform::Platform;
-use crate::reflector_selector::ReflectorSelector;
-use crate::reflector_setup::{ReflectorSetup, setup_reflectors};
+use crate::reflector_manager::ReflectorManager;
 use crate::runtime::{Direction, Runtime};
-use crate::settings::{ReflectorProtocol, Settings};
+#[cfg(not(feature = "irtt"))]
+use crate::settings::ReflectorProtocol;
+use crate::settings::Settings;
 use ::log::{error, info};
 use anyhow::Context;
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::{
     sync::{broadcast, mpsc, watch},
@@ -38,12 +35,9 @@ type TaskResult = (&'static str, anyhow::Result<()>);
 struct PreparedWorkers {
     engine: MeasurementEngine,
     engine_done: watch::Sender<bool>,
-    controller: Controller,
-    initial_reflectors: Vec<SocketAddr>,
-    reflector_tx: mpsc::UnboundedSender<Vec<SocketAddr>>,
+    manager: ReflectorManager,
     law: Box<SqmaLaw>,
     law_ctx: LawContext,
-    selector: Option<ReflectorSelector>,
 }
 
 pub(crate) struct App {
@@ -61,7 +55,10 @@ impl App {
     pub(crate) async fn prepare(settings: Settings) -> anyhow::Result<Self> {
         settings.validate()?;
         #[cfg(not(feature = "irtt"))]
-        if settings.advanced_settings.measurement_type == ReflectorProtocol::Irtt {
+        if settings
+            .protocol_preferences()
+            .contains(&ReflectorProtocol::Irtt)
+        {
             anyhow::bail!(
                 "IRTT measurement selected, but this binary was built without the `irtt` feature"
             );
@@ -71,29 +68,18 @@ impl App {
             info!("*** MONITORING MODE ACTIVE — qdisc rates will NOT be changed ***");
         }
 
-        let ReflectorSetup {
-            initial: initial_reflectors,
-            pool: reflector_pool,
-            reflectors,
-            reselection_enabled,
-        } = setup_reflectors(&settings)?;
-
-        let active_streams = Arc::new(RwLock::new(Vec::new()));
-        let endpoint_streams = Arc::new(RwLock::new(HashMap::new()));
         let interval = Duration::from_secs_f64(settings.advanced_settings.tick_interval);
 
-        let (control_snapshot_tx, control_snapshot_rx) = watch::channel(None);
         let (plan_tx, plan_rx) = watch::channel(MeasurementPlan {
             revision: 0,
             active_interval: interval,
             assignments: Vec::new(),
         });
-        let (applied_tx, _applied_rx) = watch::channel(AppliedState::default());
+        let (applied_tx, applied_rx) = watch::channel(AppliedState::default());
         let (measurement_stop, stop_rx) = watch::channel(false);
         let (engine_done, measurement_done) = watch::channel(false);
         let (measurement_tx, measurement_rx) = broadcast::channel(256);
-        let (reflector_tx, reflector_rx) = mpsc::unbounded_channel();
-        let (reselect_tx, reselect_rx) = mpsc::channel(1);
+        let manager_measurements = measurement_tx.subscribe();
         let (traffic_tx, traffic_rx) = watch::channel(None);
 
         let platform = Arc::new(Platform::default());
@@ -109,20 +95,6 @@ impl App {
 
         let runtime = Arc::new(Runtime::new(platform, settings.clone(), traffic_tx)?);
 
-        let source = match settings.advanced_settings.measurement_type {
-            ReflectorProtocol::IcmpEcho => MeasurementSource::IcmpEcho,
-            ReflectorProtocol::IcmpTimestamps => MeasurementSource::IcmpTimestamp,
-            ReflectorProtocol::Irtt => MeasurementSource::Irtt,
-        };
-        let controller = Controller::new(
-            reflector_rx,
-            plan_tx,
-            reflectors,
-            Arc::clone(&active_streams),
-            Arc::clone(&endpoint_streams),
-            source,
-            interval,
-        );
         let engine = MeasurementEngine::new(
             &settings.network,
             plan_rx,
@@ -144,45 +116,30 @@ impl App {
         };
 
         let (diagnostics, csv_writer) = CsvWriter::new(&settings.output).await?.unzip();
-        let law = Box::new(SqmaLaw::new(
-            settings.clone(),
-            control_snapshot_tx,
-            diagnostics,
-        ));
+        let law = Box::new(SqmaLaw::new(settings.clone(), diagnostics));
         let law_ctx = LawContext::new(
             measurement_rx,
             metrics.clone(),
-            reselect_tx,
             Arc::clone(&runtime),
-            active_streams,
+            applied_rx.clone(),
             traffic_rx,
         );
-        let selector = if reselection_enabled {
-            Some(ReflectorSelector {
-                settings: settings.clone(),
-                snapshot_rx: control_snapshot_rx,
-                reflector_peers_lock: Arc::new(RwLock::new(initial_reflectors.clone())),
-                reflector_pool,
-                endpoint_streams,
-                trigger_channel: reselect_rx,
-                metrics: metrics.clone(),
-                reflector_tx: reflector_tx.clone(),
-            })
-        } else {
-            None
-        };
+        let manager = ReflectorManager::new(
+            &settings,
+            plan_tx,
+            applied_rx,
+            manager_measurements,
+            metrics.clone(),
+        )?;
 
         Ok(Self {
             runtime,
             prepared: PreparedWorkers {
                 engine,
                 engine_done,
-                controller,
-                initial_reflectors,
-                reflector_tx,
+                manager,
                 law,
                 law_ctx,
-                selector,
             },
             exporter,
             csv_writer,
@@ -286,12 +243,9 @@ impl PreparedWorkers {
         let PreparedWorkers {
             engine,
             engine_done,
-            controller,
-            initial_reflectors,
-            reflector_tx,
+            manager,
             law,
             law_ctx,
-            selector,
         } = self;
         workers.spawn(async move { ("runtime sampler", runtime.run().await) });
         workers.spawn(async move {
@@ -300,13 +254,7 @@ impl PreparedWorkers {
             ("measurement engine", result)
         });
         workers.spawn(async move { ("control law", law.run(law_ctx).await) });
-        workers.spawn(async move {
-            let _reflector_keepalive = reflector_tx;
-            ("controller", controller.run(initial_reflectors).await)
-        });
-        if let Some(selector) = selector {
-            workers.spawn(async move { ("reflector selector", selector.run().await) });
-        }
+        workers.spawn(async move { ("reflector manager", manager.run().await) });
     }
 }
 

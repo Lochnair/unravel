@@ -10,13 +10,12 @@ use std::{
 
 use anyhow::Context;
 use log::{debug, info, warn};
-use tokio::sync::watch;
 
 use crate::{
     diagnostics::{DiagnosticRecord, DiagnosticsSender, DirectionStatistics, SpeedHistory},
     error::ChannelClosed,
     law::{Law, LawContext},
-    measurement::model::{MeasurementEvent, MeasurementOutcome, MeasurementStream, OneWayLatency},
+    measurement::model::{MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayLatency},
     metrics::Metric,
     runtime::{Direction, Shaper},
     settings::{AdvancedSettings, Settings},
@@ -210,7 +209,7 @@ impl RateState {
 pub(crate) struct SqmaLaw {
     settings: Settings,
 
-    reflectors: HashMap<MeasurementStream, ReflectorState>,
+    reflectors: HashMap<MeasurementTarget, ReflectorState>,
 
     download: Option<RateState>,
     upload: Option<RateState>,
@@ -225,10 +224,6 @@ pub(crate) struct SqmaLaw {
     history_path: Option<PathBuf>,
     history_saved_at: Option<Instant>,
     history_saved_body: String,
-
-    // TODO: Eventually the selector should do its own calculations,
-    // and not depend on the law for measurements
-    control_tx: watch::Sender<Option<ControlSnapshot>>,
 }
 
 #[async_trait::async_trait]
@@ -283,11 +278,7 @@ impl Law for SqmaLaw {
 }
 
 impl SqmaLaw {
-    pub fn new(
-        settings: Settings,
-        control_tx: watch::Sender<Option<ControlSnapshot>>,
-        diagnostics: Option<DiagnosticsSender>,
-    ) -> Self {
+    pub fn new(settings: Settings, diagnostics: Option<DiagnosticsSender>) -> Self {
         let tick = settings.advanced_settings.tick_interval;
         let history_path = settings
             .advanced_settings
@@ -305,7 +296,6 @@ impl SqmaLaw {
             fast_factor: (0.5_f64.ln() / (RECENT_HALF_LIFE_SECS / tick)).exp(),
             slow_factor: (0.5_f64.ln() / (BASELINE_HALF_LIFE_SECS / tick)).exp(),
             rng: fastrand::Rng::new(),
-            control_tx,
             diagnostics,
             history_path,
             history_saved_at: None,
@@ -411,7 +401,7 @@ impl SqmaLaw {
         Ok(())
     }
 
-    fn deltas(&self, targets: &[MeasurementStream], now: Instant) -> (Vec<f64>, Vec<f64>) {
+    fn deltas(&self, targets: &[MeasurementTarget], now: Instant) -> (Vec<f64>, Vec<f64>) {
         let mut down = Vec::with_capacity(targets.len());
         let mut up = Vec::with_capacity(targets.len());
 
@@ -434,7 +424,10 @@ impl SqmaLaw {
 
             debug!(
                 "Reflector: {} ({:?}) down_delay: {} up_delay: {}",
-                target.peer, target.source, down_delta, up_delta
+                target.peer(),
+                target.protocol(),
+                down_delta,
+                up_delta
             );
         }
 
@@ -448,7 +441,7 @@ impl SqmaLaw {
         let now = Instant::now();
 
         let (down_deltas, up_deltas, target_count) = {
-            let targets = ctx.targets.read().expect("active streams lock poisoned");
+            let targets = ctx.applied.borrow().active_targets();
             let (down, up) = self.deltas(targets.as_slice(), now);
             (down, up, targets.len())
         };
@@ -457,12 +450,11 @@ impl SqmaLaw {
         let minimum = num_reflectors.min(target_count);
         if target_count == 0 || down_deltas.len() < minimum || up_deltas.len() < minimum {
             warn!(
-                "Not enough delta values (D: {}, U: {}, need {}), triggering reselection",
+                "Not enough active delta values (D: {}, U: {}, need {})",
                 down_deltas.len(),
                 up_deltas.len(),
                 minimum
             );
-            let _ = ctx.reselect_trigger.try_send(true);
         }
 
         if down_deltas.is_empty() || up_deltas.is_empty() {
@@ -589,15 +581,20 @@ impl SqmaLaw {
     }
 
     fn observe(&mut self, event: MeasurementEvent, ctx: &super::LawContext) -> anyhow::Result<()> {
+        if !ctx.applied.borrow().is_active(&event.target) {
+            return Ok(());
+        }
         let MeasurementOutcome::Reply { one_way, .. } = event.outcome else {
             return Ok(());
         };
-        let rtt_ms = event.rtt_ms().expect("a reply has an RTT");
+        let Some(rtt_ms) = event.rtt_ms().filter(|rtt| rtt.is_finite() && *rtt >= 0.0) else {
+            return Ok(());
+        };
         let sample = EwmaStats::from_reply(rtt_ms, one_way);
         let (state, anomaly) = {
             let state = self
                 .reflectors
-                .entry(event.stream)
+                .entry(event.target.clone())
                 .or_insert_with(|| ReflectorState::new(sample, event.completed_at));
 
             let anomaly = state.update(
@@ -610,18 +607,9 @@ impl SqmaLaw {
             (*state, anomaly)
         };
 
-        if anomaly {
-            ctx.metrics.send(Metric::Event {
-                name: "reselection",
-                reason: "anomaly",
-                reflector: Some(event.stream.peer),
-                tags: &[],
-            });
-
-            let _ = ctx.reselect_trigger.try_send(true);
-        } else {
+        if !anomaly {
             ctx.metrics.send(Metric::Baseline {
-                reflector: event.stream.peer,
+                reflector: event.target.peer(),
                 baseline_up_ewma: state.baseline.up,
                 baseline_down_ewma: state.baseline.down,
                 recent_up_ewma: state.recent.up,
@@ -629,13 +617,9 @@ impl SqmaLaw {
             });
         }
 
-        self.control_tx.send_replace(Some(ControlSnapshot {
-            reflectors: self.reflectors.clone(),
-        }));
-
         ctx.metrics.send(Metric::Ping {
-            reflector: event.stream.peer,
-            measurement_type: event.stream.source,
+            reflector: event.target.peer(),
+            measurement_type: event.target.protocol(),
             rtt: rtt_ms,
             up_time: one_way
                 .map(|o| o.uplink.as_nanos() as f64 / 1000000.0)
@@ -647,11 +631,6 @@ impl SqmaLaw {
 
         Ok(())
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct ControlSnapshot {
-    pub reflectors: HashMap<MeasurementStream, ReflectorState>,
 }
 
 #[derive(Clone, Copy, Debug)]
