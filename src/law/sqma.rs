@@ -254,10 +254,10 @@ impl Law for SqmaLaw {
 
                 _ = ticker.tick() => {
                     if !initialized {
-                        self.initialize(&ctx)?;
+                        self.initialize(&ctx).await?;
                         initialized = true;
                     } else {
-                        self.evaluate(&mut ctx)?;
+                        self.evaluate(&mut ctx).await?;
                     }
 
                     self.reflectors.retain(|_, state| {
@@ -301,11 +301,11 @@ impl SqmaLaw {
     }
 
     /// Put back the recorded rates saved before a restart.
-    fn restore_history(&self, name: &str, base_kbps: f64, state: &mut RateState) {
+    async fn restore_history(&self, name: &str, base_kbps: f64, state: &mut RateState) {
         let Some(path) = &self.history_path else {
             return;
         };
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Ok(text) = tokio::fs::read_to_string(path).await else {
             return;
         };
         let size = state.safe_rates.len();
@@ -328,7 +328,7 @@ impl SqmaLaw {
     }
 
     /// Write the recorded rates out, at most every 30 s and only if they changed.
-    fn save_history(&mut self, now: Instant) {
+    async fn save_history(&mut self, now: Instant) {
         let Some(path) = &self.history_path else {
             return;
         };
@@ -355,14 +355,18 @@ impl SqmaLaw {
         }
         let text = format!("{HISTORY_HEADER}\nsaved {}\n{body}", unix_now());
         let tmp = path.with_extension("tmp");
-        let result = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path));
+        let result: std::io::Result<()> = async {
+            tokio::fs::write(&tmp, text).await?;
+            tokio::fs::rename(&tmp, path).await
+        }
+        .await;
         match result {
             Ok(()) => self.history_saved_body = body,
             Err(error) => warn!("Could not save {}: {error}", path.display()),
         }
     }
 
-    fn initialize(&mut self, ctx: &super::LawContext) -> anyhow::Result<()> {
+    async fn initialize(&mut self, ctx: &super::LawContext) -> anyhow::Result<()> {
         let size = self.settings.advanced_settings.speed_hist_size;
 
         if let Some(shaper) = ctx.shaper(Direction::Download) {
@@ -372,7 +376,8 @@ impl SqmaLaw {
 
             let mut state = RateState::new(shaper.base_kbps, size, &mut self.rng);
             state.current_kbps = initial;
-            self.restore_history("download", shaper.base_kbps, &mut state);
+            self.restore_history("download", shaper.base_kbps, &mut state)
+                .await;
 
             self.download = Some(state);
         }
@@ -384,7 +389,8 @@ impl SqmaLaw {
 
             let mut state = RateState::new(shaper.base_kbps, size, &mut self.rng);
             state.current_kbps = initial;
-            self.restore_history("upload", shaper.base_kbps, &mut state);
+            self.restore_history("upload", shaper.base_kbps, &mut state)
+                .await;
 
             self.upload = Some(state);
         }
@@ -425,7 +431,7 @@ impl SqmaLaw {
         (down, up)
     }
 
-    fn evaluate(&mut self, ctx: &mut super::LawContext) -> anyhow::Result<()> {
+    async fn evaluate(&mut self, ctx: &mut super::LawContext) -> anyhow::Result<()> {
         let now = Instant::now();
 
         let (down_deltas, up_deltas, target_count) = {
@@ -538,7 +544,7 @@ impl SqmaLaw {
             });
         }
 
-        self.save_history(now);
+        self.save_history(now).await;
 
         if let Some(diagnostics) = &mut self.diagnostics {
             diagnostics.publish(now, |history_due| DiagnosticRecord {
