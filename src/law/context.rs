@@ -8,6 +8,7 @@ use crate::{
     measurement::{model::MeasurementEvent, plan::AppliedState},
     metrics::MetricsSender,
     runtime::{Direction, Runtime, Shaper, TrafficRates},
+    time::ClockStep,
 };
 use tokio::sync::{broadcast, watch};
 
@@ -17,6 +18,10 @@ pub struct LawContext {
     runtime: Arc<Runtime>,
     pub applied: watch::Receiver<AppliedState>,
     pub traffic: watch::Receiver<Option<TrafficRates>>,
+    /// Local clock discontinuities. Await `changed()` or poll `has_changed()`,
+    /// then acknowledge with `borrow_and_update()`. Updates may coalesce: this
+    /// is an invalidation signal, not a log of corrections to sum together.
+    pub clock_steps: watch::Receiver<Option<ClockStep>>,
 }
 
 impl LawContext {
@@ -28,6 +33,7 @@ impl LawContext {
         traffic: watch::Receiver<Option<TrafficRates>>,
     ) -> Self {
         Self {
+            clock_steps: runtime.clock_steps(),
             measurements,
             metrics,
             runtime,

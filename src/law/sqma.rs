@@ -25,6 +25,8 @@ const ANOMALY_THRESHOLD_MS: f64 = 5_000.0;
 const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
 const RECENT_HALF_LIFE_SECS: f64 = 0.4;
 const STALE_AFTER: Duration = Duration::from_secs(30);
+// Give outstanding queues a chance to drain before learning a new clock reference.
+const CLOCK_STEP_SETTLE_TIME: Duration = Duration::from_secs(5);
 
 // With history_file set, the recorded safe rates are saved there so a
 // service restart does not throw them away.
@@ -210,6 +212,8 @@ pub(crate) struct SqmaLaw {
     settings: Settings,
 
     reflectors: HashMap<MeasurementTarget, ReflectorState>,
+    /// Also retained after settling to exclude late replies to older probes.
+    measurements_after: Option<Instant>,
 
     download: Option<RateState>,
     upload: Option<RateState>,
@@ -242,6 +246,33 @@ impl Law for SqmaLaw {
 
         loop {
             tokio::select! {
+                biased;
+                changed = ctx.clock_steps.changed() => {
+                    changed.context("Clock-step channel closed")?;
+                    let step = *ctx.clock_steps.borrow_and_update();
+                    if let Some(step) = step {
+                        warn!("SQMA resetting after local clock step of {:.3}s detected {:?} ago",
+                            step.delta_secs, step.detected_at.elapsed());
+                        self.recover_clock(&ctx)?;
+                    }
+                }
+
+                _ = ticker.tick() => {
+                    if self.measurements_after.is_some_and(|until| Instant::now() < until) {
+                        continue;
+                    }
+                    if !initialized {
+                        self.initialize(&ctx).await?;
+                        initialized = true;
+                    } else {
+                        self.evaluate(&mut ctx).await?;
+                    }
+
+                    self.reflectors.retain(|_, state| {
+                        Instant::now().saturating_duration_since(state.last_receive_at) <= STALE_AFTER
+                    });
+                }
+
                 event = ctx.measurements.recv() => {
                     match event {
                         Ok(event) => self.observe(event, &ctx)?,
@@ -258,19 +289,6 @@ impl Law for SqmaLaw {
                             return Err(ChannelClosed).context("Measurement channel closed");
                         }
                     }
-                }
-
-                _ = ticker.tick() => {
-                    if !initialized {
-                        self.initialize(&ctx).await?;
-                        initialized = true;
-                    } else {
-                        self.evaluate(&mut ctx).await?;
-                    }
-
-                    self.reflectors.retain(|_, state| {
-                        Instant::now().saturating_duration_since(state.last_receive_at) <= STALE_AFTER
-                    });
                 }
             }
         }
@@ -291,6 +309,7 @@ impl SqmaLaw {
         Self {
             settings,
             reflectors: HashMap::new(),
+            measurements_after: None,
             download: None,
             upload: None,
             fast_factor: (0.5_f64.ln() / (RECENT_HALF_LIFE_SECS / tick)).exp(),
@@ -369,11 +388,39 @@ impl SqmaLaw {
         }
     }
 
+    fn recover_clock(&mut self, ctx: &LawContext) -> anyhow::Result<()> {
+        self.reflectors.clear();
+        for (direction, state) in [
+            (Direction::Download, self.download.as_mut()),
+            (Direction::Upload, self.upload.as_mut()),
+        ] {
+            if let Some(shaper) = ctx.shaper(direction) {
+                ctx.set_rate(direction, shaper.min_kbps)?;
+                if let Some(state) = state {
+                    state.current_kbps = shaper.min_kbps;
+                }
+            }
+        }
+        // Start the hold after lowering both rates, not when Runtime detected the step.
+        self.measurements_after = Some(Instant::now() + CLOCK_STEP_SETTLE_TIME);
+        ctx.metrics.send(Metric::Event {
+            name: "clock_step",
+            reason: "baseline_reset",
+            reflector: None,
+            tags: &[],
+        });
+        Ok(())
+    }
+
     async fn initialize(&mut self, ctx: &super::LawContext) -> anyhow::Result<()> {
         let size = self.settings.advanced_settings.speed_hist_size;
 
         if let Some(shaper) = ctx.shaper(Direction::Download) {
-            let initial = (shaper.base_kbps * 0.6).max(shaper.min_kbps);
+            let initial = if self.measurements_after.is_some() {
+                shaper.min_kbps
+            } else {
+                (shaper.base_kbps * 0.6).max(shaper.min_kbps)
+            };
 
             ctx.set_rate(Direction::Download, initial)?;
 
@@ -386,7 +433,11 @@ impl SqmaLaw {
         }
 
         if let Some(shaper) = ctx.shaper(Direction::Upload) {
-            let initial = (shaper.base_kbps * 0.6).max(shaper.min_kbps);
+            let initial = if self.measurements_after.is_some() {
+                shaper.min_kbps
+            } else {
+                (shaper.base_kbps * 0.6).max(shaper.min_kbps)
+            };
 
             ctx.set_rate(Direction::Upload, initial)?;
 
@@ -581,6 +632,12 @@ impl SqmaLaw {
     }
 
     fn observe(&mut self, event: MeasurementEvent, ctx: &super::LawContext) -> anyhow::Result<()> {
+        if self
+            .measurements_after
+            .is_some_and(|after| event.started_at < after)
+        {
+            return Ok(());
+        }
         if !ctx.applied.borrow().is_active(&event.target) {
             return Ok(());
         }
