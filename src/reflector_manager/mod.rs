@@ -55,7 +55,7 @@ impl Live {
         self.strikes >= 3
     }
 
-    fn check_health(&mut self, applied: &AppliedState, now: Instant) {
+    fn check_health(&mut self, applied: &AppliedState, now: Instant, max_age: Duration) {
         let Some(status) = self.status(applied) else {
             return;
         };
@@ -68,7 +68,7 @@ impl Live {
         let stale = now.saturating_duration_since(last_reply) > deadline;
         let unavailable =
             !status.ready && now.saturating_duration_since(self.entered_at) > deadline;
-        self.strikes = if stale || unavailable {
+        self.strikes = if stale || unavailable || self.evidence.timing_unhealthy(now, max_age) {
             (self.strikes + 1).min(3)
         } else {
             0
@@ -363,8 +363,9 @@ impl ReflectorManager {
         if now >= self.next_health_at {
             let period = self.active_period.max(Duration::from_secs(1));
             self.next_health_at = now + period;
+            let max_age = self.max_age();
             for live in self.active.iter_mut().flatten() {
-                live.check_health(applied, now);
+                live.check_health(applied, now, max_age);
             }
         }
         let periodic = now >= self.next_policy_at;
@@ -500,6 +501,7 @@ impl ReflectorManager {
                 Some(Ok(event)) => self.observe(event),
                 Some(Err(broadcast::error::RecvError::Lagged(count))) => {
                     warn!("Reflector manager missed {count} measurements");
+                    self.reset_evidence(now);
                     self.metrics.send(Metric::Event {
                         name: "measurement_lag",
                         reason: "reflector_manager",
@@ -511,6 +513,16 @@ impl ReflectorManager {
                 None => {}
             }
             self.reconcile(&applied, now)?;
+        }
+    }
+
+    fn reset_evidence(&mut self, now: Instant) {
+        // A missed event may have changed the directional reference. Require
+        // fresh probes, without treating a local subscriber overrun as loss.
+        for live in self.active.iter_mut().chain(&mut self.candidates).flatten() {
+            live.evidence = Evidence::new(now);
+            live.entered_at = now;
+            live.strikes = 0;
         }
     }
 }

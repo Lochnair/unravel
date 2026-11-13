@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::measurement::{
-    model::{MeasurementEvent, MeasurementOutcome, MeasurementTarget},
+    model::{MeasurementEvent, MeasurementOutcome, OneWayRejection, OneWayStatus},
     plan::AppliedTarget,
 };
 use std::time::{Duration, Instant};
@@ -21,6 +21,8 @@ pub(super) struct Evidence {
     since: Instant,
     pub last_reply: Option<Instant>,
     outcomes: Vec<MeasurementEvent>,
+    first_reference: Option<Instant>,
+    reference_since: Option<Instant>,
 }
 
 impl Evidence {
@@ -29,6 +31,8 @@ impl Evidence {
             since: now,
             last_reply: None,
             outcomes: Vec::with_capacity(WINDOW + 1),
+            first_reference: None,
+            reference_since: None,
         }
     }
 
@@ -45,6 +49,10 @@ impl Evidence {
         }
         // Late timeouts belong before newer replies. Duplicate completions
         // cannot manufacture a qualifying streak; a real late reply may replace a loss.
+        let started_at = event.started_at;
+        let reference_changed = matches!(event.outcome,
+            MeasurementOutcome::Reply { one_way: Some(owd), .. }
+            if owd.status == OneWayStatus::ReferenceChanged);
         match self
             .outcomes
             .binary_search_by_key(&event.started_at, |e| e.started_at)
@@ -61,6 +69,41 @@ impl Evidence {
         if self.outcomes.len() > WINDOW {
             self.outcomes.remove(0);
         }
+        if reference_changed && self.reference_since.is_none_or(|since| started_at > since) {
+            self.first_reference.get_or_insert(started_at);
+            self.reference_since = Some(started_at);
+        }
+    }
+
+    /// RTT liveness and directional service health are independent. An isolated
+    /// step can requalify; repeated transitions or a run of rejected timing
+    /// should open replacement qualification even while RTT replies continue.
+    pub fn timing_unhealthy(&self, now: Instant, max_age: Duration) -> bool {
+        let recent = self
+            .outcomes
+            .iter()
+            .rev()
+            .filter(|e| now.saturating_duration_since(e.completed_at) <= max_age)
+            .collect::<Vec<_>>();
+        let repeated_changes = recent
+            .iter()
+            .filter(|e| {
+                Some(e.started_at) != self.first_reference
+                    && matches!(e.outcome,
+                MeasurementOutcome::Reply { one_way: Some(owd), .. }
+                if owd.status == OneWayStatus::ReferenceChanged)
+            })
+            .count()
+            >= 2;
+        let rejected_streak = recent.len() >= STREAK
+            && recent.iter().take(STREAK).all(|e| {
+                valid_rtt(e).is_some()
+                    && matches!(e.outcome,
+                MeasurementOutcome::Reply { one_way: Some(owd), .. }
+                if matches!(owd.status, OneWayStatus::Unusable(
+                    OneWayRejection::InconsistentTimestamps | OneWayRejection::Discontinuity)))
+            });
+        repeated_changes || rejected_streak
     }
 
     pub fn quality(
@@ -71,9 +114,22 @@ impl Evidence {
     ) -> Option<Quality> {
         let freshness = status.assignment.schedule.period.saturating_mul(3);
         if !status.ready
+            || self.timing_unhealthy(now, max_age)
             || self.outcomes.len() < STREAK
             || !self.outcomes.iter().rev().take(STREAK).all(|e| {
-                valid_rtt(e).is_some() && now.saturating_duration_since(e.completed_at) <= freshness
+                valid_rtt(e).is_some()
+                    && now.saturating_duration_since(e.completed_at) <= freshness
+                    && match e.outcome {
+                        MeasurementOutcome::Reply {
+                            one_way: Some(owd), ..
+                        } => {
+                            !matches!(owd.status, OneWayStatus::Unusable(_))
+                                && self
+                                    .reference_since
+                                    .is_none_or(|since| e.started_at >= since)
+                        }
+                        _ => true,
+                    }
             })
         {
             return None;
@@ -91,18 +147,12 @@ impl Evidence {
             if let MeasurementOutcome::Reply {
                 one_way: Some(owd), ..
             } = event.outcome
+                && self
+                    .reference_since
+                    .is_none_or(|since| event.started_at >= since)
             {
                 directions += 1;
-                let uncertainty = if matches!(event.target, MeasurementTarget::IcmpTimestamps(_)) {
-                    4.0
-                } else {
-                    1.0
-                };
-                let tolerance = uncertainty + rtt * 0.10;
-                if [owd.uplink, owd.downlink].iter().all(|d| {
-                    let ms = d.as_secs_f64() * 1000.0;
-                    ms >= -tolerance && ms <= rtt + tolerance
-                }) {
+                if !matches!(owd.status, OneWayStatus::Unusable(_)) {
                     credible += 1;
                 }
             }
@@ -125,5 +175,5 @@ impl Evidence {
 }
 
 fn valid_rtt(event: &MeasurementEvent) -> Option<f64> {
-    event.rtt_ms().filter(|rtt| rtt.is_finite() && *rtt >= 0.0)
+    event.rtt_ms()
 }
