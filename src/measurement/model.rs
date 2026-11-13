@@ -46,11 +46,35 @@ impl fmt::Debug for MeasurementTarget {
     }
 }
 
-#[allow(dead_code)]
+/// Engine assessment of directional continuity, not absolute clock calibration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OneWayClock {
-    Uncalibrated,
-    Calibrated,
+pub enum OneWayStatus {
+    Usable,
+    /// Start new directional history before consuming this observation.
+    ReferenceChanged,
+    /// Raw values remain available for diagnostics; RTT is assessed independently.
+    Unusable(OneWayRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneWayRejection {
+    InvalidRtt,
+    InconsistentTimestamps,
+    Discontinuity,
+    LocalClockStep,
+    OutOfOrder,
+}
+
+impl OneWayRejection {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::InvalidRtt => "invalid_rtt",
+            Self::InconsistentTimestamps => "inconsistent_timestamps",
+            Self::Discontinuity => "directional_discontinuity",
+            Self::LocalClockStep => "local_clock_step",
+            Self::OutOfOrder => "out_of_order",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,7 +107,8 @@ impl SignedDuration {
 pub struct OneWayLatency {
     pub uplink: SignedDuration,
     pub downlink: SignedDuration,
-    pub clock: OneWayClock,
+    /// Finalized by MeasurementEngine before publication.
+    pub status: OneWayStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +140,8 @@ pub enum MeasurementOutcome {
 }
 
 impl MeasurementEvent {
-    /// RTT in milliseconds for a reply; timeout detection is never an RTT.
+    /// Usable RTT in milliseconds. Raw protocol values remain in `outcome`.
+    /// Invalid RTTs and losses return None; directional rejection does not affect RTT.
     pub fn rtt_ms(&self) -> Option<f64> {
         match self.outcome {
             MeasurementOutcome::Reply { round_trip, .. } => Some(
@@ -123,11 +149,12 @@ impl MeasurementEvent {
                     .map(SignedDuration::as_secs_f64)
                     .unwrap_or_else(|| {
                         self.completed_at
-                            .duration_since(self.started_at)
-                            .as_secs_f64()
+                            .checked_duration_since(self.started_at)
+                            .map_or(f64::NAN, |d| d.as_secs_f64())
                     })
                     * 1000.0,
-            ),
+            )
+            .filter(|rtt| rtt.is_finite() && *rtt >= 0.0),
             MeasurementOutcome::Loss => None,
         }
     }

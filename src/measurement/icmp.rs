@@ -4,7 +4,7 @@
 
 use crate::{
     measurement::model::{
-        MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayClock, OneWayLatency,
+        MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayLatency, OneWayStatus,
         SignedDuration,
     },
     settings::NetworkSettings,
@@ -115,10 +115,17 @@ impl IcmpDriver {
                 return Poll::Ready(Err(error));
             }
         }
-        let prepared = &self.prepared[target];
+        let prepared = self.prepared.get_mut(target).unwrap();
         let IpAddr::V4(peer) = target.peer() else {
             unreachable!("plan validated IPv4");
         };
+        // Pending sends transmit nothing. Refresh both clocks on every attempt
+        // so time waiting for writability does not become apparent uplink delay.
+        let sent_at = Instant::now();
+        if let Icmpv4Message::Timestamp { originate, .. } = &mut prepared.packet.message {
+            *originate = ClockSample::<Realtime>::now().as_time_since_midnight() as u32;
+            prepared.correlation = *originate as u64;
+        }
         match self.socket.poll_send_to(cx, peer, &prepared.packet) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => {
@@ -126,7 +133,6 @@ impl IcmpDriver {
                 Poll::Ready(Err(error.into()))
             }
             Poll::Ready(Ok(_accepted_bytes)) => {
-                let sent_at = Instant::now();
                 let prepared = self.prepared.remove(target).unwrap();
                 let key = (target.clone(), prepared.sequence);
                 self.used.insert(key.clone(), sent_at + PROBE_TIMEOUT);
@@ -371,7 +377,7 @@ impl IcmpDriver {
                         one_way: Some(OneWayLatency {
                             uplink: SignedDuration::from_millis(uplink_ms),
                             downlink: SignedDuration::from_millis(downlink_ms),
-                            clock: OneWayClock::Uncalibrated,
+                            status: OneWayStatus::Usable,
                         }),
                     },
                 })

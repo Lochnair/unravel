@@ -6,11 +6,12 @@
 use super::irtt::IrttDriver;
 use super::{
     icmp::IcmpDriver,
+    integrity::MeasurementIntegrity,
     model::{MeasurementEvent, MeasurementOutcome, MeasurementTarget},
     plan::{AppliedState, AppliedTarget, MeasurementPlan},
     scheduler::ProbeScheduler,
 };
-use crate::{error::ChannelClosed, settings::NetworkSettings};
+use crate::{error::ChannelClosed, settings::NetworkSettings, time::ClockStep};
 use log::{trace, warn};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -35,6 +36,8 @@ pub struct MeasurementEngine {
     icmp_status: BTreeMap<MeasurementTarget, bool>,
     timer: Pin<Box<tokio::time::Sleep>>,
     rejected_revision: Option<u64>,
+    integrity: MeasurementIntegrity,
+    clock_steps: watch::Receiver<Option<ClockStep>>,
 }
 
 impl MeasurementEngine {
@@ -44,6 +47,7 @@ impl MeasurementEngine {
         applied: watch::Sender<AppliedState>,
         measurements: broadcast::Sender<MeasurementEvent>,
         stop: watch::Receiver<bool>,
+        clock_steps: watch::Receiver<Option<ClockStep>>,
     ) -> anyhow::Result<Self> {
         let initial = desired.borrow().clone();
         initial.validate()?;
@@ -64,6 +68,8 @@ impl MeasurementEngine {
             icmp_status: BTreeMap::new(),
             timer: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
             rejected_revision: None,
+            integrity: MeasurementIntegrity::default(),
+            clock_steps,
         };
         engine.apply(initial)?;
         Ok(engine)
@@ -109,6 +115,8 @@ impl MeasurementEngine {
                 .collect::<Vec<_>>(),
             plan.active_interval,
         );
+        self.integrity
+            .retain(&plan.assignments.iter().map(|a| a.target.clone()).collect());
         self.plan = plan;
         self.rejected_revision = None;
         self.publish_status();
@@ -158,6 +166,7 @@ impl MeasurementEngine {
     }
 
     fn poll_progress(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
+        self.sync_clock()?;
         let now = Instant::now();
         let mut completions = self.icmp.expire(now);
         // Bound ICMP receive work even on a continuously readable raw socket.
@@ -220,7 +229,28 @@ impl MeasurementEngine {
         }
         // Consumers must see readiness before the first usable measurement.
         self.publish_status();
-        for completion in completions {
+        self.sync_clock()?;
+        for mut completion in completions {
+            // Retired targets must not recreate integrity state with late replies.
+            if !self
+                .plan
+                .assignments
+                .iter()
+                .any(|a| a.target == completion.target)
+            {
+                continue;
+            }
+            self.integrity.assess(&mut completion);
+            if let MeasurementOutcome::Reply {
+                one_way: Some(owd), ..
+            } = completion.outcome
+                && let super::model::OneWayStatus::Unusable(reason) = owd.status
+            {
+                trace!(
+                    "Rejected directional timing: {} {completion:?}",
+                    reason.reason()
+                );
+            }
             let _ = self.measurements.send(completion);
         }
         let deadline = self
@@ -254,14 +284,41 @@ impl MeasurementEngine {
         result
     }
 
+    fn sync_clock(&mut self) -> anyhow::Result<()> {
+        if self.clock_steps.has_changed().map_err(|_| ChannelClosed)? {
+            let step = *self.clock_steps.borrow_and_update();
+            if let Some(step) = step {
+                self.integrity.local_clock_step(step.detected_at);
+                // Prepared ICMP packets already contain a realtime originate
+                // timestamp. Don't send one from before the detected change.
+                for target in self
+                    .plan
+                    .assignments
+                    .iter()
+                    .map(|a| a.target.clone())
+                    .collect::<Vec<_>>()
+                {
+                    self.discard(&target);
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn run_until_stop(&mut self) -> anyhow::Result<()> {
         let mut desired = self.desired.clone();
         let mut stop = self.stop.clone();
+        let mut clock_steps = self.clock_steps.clone();
         if *stop.borrow() {
             return Ok(());
         }
         loop {
             tokio::select! {
+                biased;
+                changed = clock_steps.changed() => {
+                    changed.map_err(|_| ChannelClosed)?;
+                    self.sync_clock()?;
+                },
                 changed = desired.changed() => {
                     changed.map_err(|_| ChannelClosed)?;
                     let plan = desired.borrow_and_update().clone();

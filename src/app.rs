@@ -101,6 +101,7 @@ impl App {
             applied_tx,
             measurement_tx,
             stop_rx,
+            runtime.clock_steps(),
         )?;
 
         let (metrics, exporter) = if settings.observability.enabled {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::model::{
-    MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayClock, OneWayLatency,
+    MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayLatency, OneWayStatus,
     SignedDuration,
 };
 use crate::settings::NetworkSettings;
@@ -464,6 +464,6 @@ fn map_one_way(sample: irtt_client::OneWayDelaySample) -> Option<OneWayLatency> 
         downlink: SignedDuration::from_nanos(
             i64::try_from(sample.server_to_client?.as_nanos()).ok()?,
         ),
-        clock: OneWayClock::Uncalibrated,
+        status: OneWayStatus::Usable,
     })
 }
