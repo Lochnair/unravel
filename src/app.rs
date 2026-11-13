@@ -5,29 +5,27 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::controller::Controller;
 use crate::diagnostics::CsvWriter;
 use crate::error::ChannelClosed;
 use crate::law::{Law, LawContext, SqmaLaw};
-use crate::measurement::icmp::IcmpEngine;
-#[cfg(feature = "irtt")]
-use crate::measurement::irtt::IrttEngine;
-use crate::measurement::model::MeasurementSource;
+use crate::measurement::{
+    engine::MeasurementEngine,
+    plan::{AppliedState, MeasurementPlan},
+};
 use crate::metrics::{Metric, Metrics, MetricsSender};
 use crate::platform::Platform;
-use crate::reflector_selector::ReflectorSelector;
-use crate::reflector_setup::{ReflectorSetup, setup_reflectors};
+use crate::reflector_manager::ReflectorManager;
 use crate::runtime::{Direction, Runtime};
-use crate::settings::{ReflectorProtocol, Settings};
+#[cfg(not(feature = "irtt"))]
+use crate::settings::ReflectorProtocol;
+use crate::settings::Settings;
 use ::log::{error, info};
 use anyhow::Context;
-use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{broadcast, mpsc, watch},
     task::{JoinError, JoinSet},
 };
 
@@ -35,15 +33,11 @@ const SINK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 type TaskResult = (&'static str, anyhow::Result<()>);
 
 struct PreparedWorkers {
-    icmp: IcmpEngine,
-    #[cfg(feature = "irtt")]
-    irtt: (irtt_client::managed::ManagedClientTask, IrttEngine),
-    controller: Controller,
-    initial_reflectors: Vec<SocketAddr>,
-    reflector_tx: mpsc::UnboundedSender<Vec<SocketAddr>>,
+    engine: MeasurementEngine,
+    engine_done: watch::Sender<bool>,
+    manager: ReflectorManager,
     law: Box<SqmaLaw>,
     law_ctx: LawContext,
-    selector: Option<ReflectorSelector>,
 }
 
 pub(crate) struct App {
@@ -53,13 +47,18 @@ pub(crate) struct App {
     csv_writer: Option<CsvWriter>,
     metrics: MetricsSender,
     dry_run: bool,
+    measurement_stop: watch::Sender<bool>,
+    measurement_done: watch::Receiver<bool>,
 }
 
 impl App {
     pub(crate) async fn prepare(settings: Settings) -> anyhow::Result<Self> {
         settings.validate()?;
         #[cfg(not(feature = "irtt"))]
-        if settings.advanced_settings.measurement_type == ReflectorProtocol::Irtt {
+        if settings
+            .protocol_preferences()
+            .contains(&ReflectorProtocol::Irtt)
+        {
             anyhow::bail!(
                 "IRTT measurement selected, but this binary was built without the `irtt` feature"
             );
@@ -69,26 +68,18 @@ impl App {
             info!("*** MONITORING MODE ACTIVE — qdisc rates will NOT be changed ***");
         }
 
-        let start_time = Instant::now();
-
-        let ReflectorSetup {
-            initial: initial_reflectors,
-            pool: reflector_pool,
-            reflectors,
-            reselection_enabled,
-        } = setup_reflectors(&settings)?;
-
-        let active_streams = Arc::new(RwLock::new(Vec::new()));
-        let endpoint_streams = Arc::new(RwLock::new(HashMap::new()));
         let interval = Duration::from_secs_f64(settings.advanced_settings.tick_interval);
 
-        let (control_snapshot_tx, control_snapshot_rx) = watch::channel(None);
-        let (icmp_binding_tx, icmp_binding_rx) = watch::channel(Vec::new());
-        #[cfg(feature = "irtt")]
-        let (irtt_binding_tx, irtt_binding_rx) = watch::channel(Vec::new());
-        let (measurement_tx, measurement_rx) = mpsc::unbounded_channel();
-        let (reflector_tx, reflector_rx) = mpsc::unbounded_channel();
-        let (reselect_tx, reselect_rx) = mpsc::channel(1);
+        let (plan_tx, plan_rx) = watch::channel(MeasurementPlan {
+            revision: 0,
+            active_interval: interval,
+            assignments: Vec::new(),
+        });
+        let (applied_tx, applied_rx) = watch::channel(AppliedState::default());
+        let (measurement_stop, stop_rx) = watch::channel(false);
+        let (engine_done, measurement_done) = watch::channel(false);
+        let (measurement_tx, measurement_rx) = broadcast::channel(256);
+        let manager_measurements = measurement_tx.subscribe();
         let (traffic_tx, traffic_rx) = watch::channel(None);
 
         let platform = Arc::new(Platform::default());
@@ -104,30 +95,14 @@ impl App {
 
         let runtime = Arc::new(Runtime::new(platform, settings.clone(), traffic_tx)?);
 
-        let source = match settings.advanced_settings.measurement_type {
-            ReflectorProtocol::IcmpEcho => MeasurementSource::IcmpEcho,
-            ReflectorProtocol::IcmpTimestamps => MeasurementSource::IcmpTimestamp,
-            ReflectorProtocol::Irtt => MeasurementSource::Irtt,
-        };
-        let controller = Controller::new(
-            reflector_rx,
-            icmp_binding_tx,
-            #[cfg(feature = "irtt")]
-            irtt_binding_tx,
-            reflectors,
-            Arc::clone(&active_streams),
-            Arc::clone(&endpoint_streams),
-            source,
-            interval,
-        );
-        let icmp_engine = IcmpEngine::new(
-            start_time,
+        let engine = MeasurementEngine::new(
             &settings.network,
-            measurement_tx.clone(),
-            icmp_binding_rx,
+            plan_rx,
+            applied_tx,
+            measurement_tx,
+            stop_rx,
+            runtime.clock_steps(),
         )?;
-        #[cfg(feature = "irtt")]
-        let irtt = IrttEngine::new(interval, &settings.network, measurement_tx, irtt_binding_rx)?;
 
         let (metrics, exporter) = if settings.observability.enabled {
             let dropped = Arc::new(AtomicU32::new(0));
@@ -142,51 +117,37 @@ impl App {
         };
 
         let (diagnostics, csv_writer) = CsvWriter::new(&settings.output).await?.unzip();
-        let law = Box::new(SqmaLaw::new(
-            settings.clone(),
-            control_snapshot_tx,
-            diagnostics,
-        ));
+        let law = Box::new(SqmaLaw::new(settings.clone(), diagnostics));
         let law_ctx = LawContext::new(
             measurement_rx,
             metrics.clone(),
-            reselect_tx,
             Arc::clone(&runtime),
-            active_streams,
+            applied_rx.clone(),
             traffic_rx,
         );
-        let selector = if reselection_enabled {
-            Some(ReflectorSelector {
-                settings: settings.clone(),
-                snapshot_rx: control_snapshot_rx,
-                reflector_peers_lock: Arc::new(RwLock::new(initial_reflectors.clone())),
-                reflector_pool,
-                endpoint_streams,
-                trigger_channel: reselect_rx,
-                metrics: metrics.clone(),
-                reflector_tx: reflector_tx.clone(),
-            })
-        } else {
-            None
-        };
+        let manager = ReflectorManager::new(
+            &settings,
+            plan_tx,
+            applied_rx,
+            manager_measurements,
+            metrics.clone(),
+        )?;
 
         Ok(Self {
             runtime,
             prepared: PreparedWorkers {
-                icmp: icmp_engine,
-                #[cfg(feature = "irtt")]
-                irtt,
-                controller,
-                initial_reflectors,
-                reflector_tx,
+                engine,
+                engine_done,
+                manager,
                 law,
                 law_ctx,
-                selector,
             },
             exporter,
             csv_writer,
             metrics,
             dry_run: settings.advanced_settings.dry_run,
+            measurement_stop,
+            measurement_done,
         })
     }
 
@@ -203,6 +164,8 @@ impl App {
             csv_writer,
             metrics,
             dry_run,
+            measurement_stop,
+            mut measurement_done,
         } = self;
         let mut workers = JoinSet::new();
         let mut sinks = JoinSet::new();
@@ -250,6 +213,13 @@ impl App {
                 }
             } => result,
         };
+        measurement_stop.send_replace(true);
+        // Allow the single measurement task to close its live sessions.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            measurement_done.wait_for(|done| *done),
+        )
+        .await;
         let cleanup = shutdown(
             &runtime,
             workers,
@@ -272,28 +242,20 @@ impl App {
 impl PreparedWorkers {
     fn start(self, runtime: Arc<Runtime>, workers: &mut JoinSet<TaskResult>) {
         let PreparedWorkers {
-            icmp,
-            #[cfg(feature = "irtt")]
-                irtt: (irtt_task, irtt_engine),
-            controller,
-            initial_reflectors,
-            reflector_tx,
+            engine,
+            engine_done,
+            manager,
             law,
             law_ctx,
-            selector,
         } = self;
         workers.spawn(async move { ("runtime sampler", runtime.run().await) });
-        workers.spawn(async move { ("ICMP engine", icmp.run().await) });
-        #[cfg(feature = "irtt")]
-        workers.spawn(async move { ("IRTT engine", irtt_engine.run(irtt_task).await) });
-        workers.spawn(async move { ("control law", law.run(law_ctx).await) });
         workers.spawn(async move {
-            let _reflector_keepalive = reflector_tx;
-            ("controller", controller.run(initial_reflectors).await)
+            let result = engine.run().await;
+            engine_done.send_replace(true);
+            ("measurement engine", result)
         });
-        if let Some(selector) = selector {
-            workers.spawn(async move { ("reflector selector", selector.run().await) });
-        }
+        workers.spawn(async move { ("control law", law.run(law_ctx).await) });
+        workers.spawn(async move { ("reflector manager", manager.run().await) });
     }
 }
 

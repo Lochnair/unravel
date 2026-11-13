@@ -22,5 +22,5 @@ If you're upgrading from v0.4.1, also check these changes:
 
 - UCI configuration belongs in `/etc/config/unravel`, rather than the Lua project's `/etc/config/sqm-autorate`.
 - Environment variables include the section name and double underscores, e.g. `SQMA_DOWNLOAD_INTERFACE` becomes `UNRAVEL__NETWORK__DOWNLOAD_INTERFACE`.
-- Reflector files use the protocol-aware CSV format in this repo's `reflectors.csv`. The old `reflectors-icmp.csv` isn't compatible. Set file paths through `reflectors.files`; `num_reflectors` and `peer_reselection_time` also belong under `reflectors` now.
+- Reflector files use the protocol-aware CSV format in this repo's `reflectors.csv`. The old `reflectors-icmp.csv` isn't compatible. Set file paths through `reflectors.files`; `num_reflectors` belongs under `reflectors`. Periodic reselection and `peer_reselection_time` have been replaced by continuous candidates: `num_candidates` (default 3) and `candidate_period` in seconds (default 3). Optional ordered `reflectors.protocol_preferences` enables hybrid fallback; omitting it preserves `advanced_settings.measurement_type`.
 - The ICMP echo protocol is named `icmp-echo`.

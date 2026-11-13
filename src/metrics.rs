@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::measurement::model::MeasurementSource;
 use crate::runtime::Direction;
+use crate::settings::ReflectorProtocol;
 use crate::settings::Settings;
 use crate::settings::{ObservabilityProtocol, ObservabilitySettings};
 use crate::time::{ClockSample, Realtime};
@@ -115,7 +115,7 @@ impl Transport {
 pub enum Metric {
     Ping {
         reflector: IpAddr,
-        measurement_type: MeasurementSource,
+        measurement_type: ReflectorProtocol,
         rtt: f64,
         up_time: f64,
         down_time: f64,

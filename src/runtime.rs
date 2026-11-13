@@ -13,6 +13,7 @@ use tokio::{sync::watch, time};
 use crate::{
     platform::{InterfaceStats, Platform},
     settings::Settings,
+    time::{CLOCK_SAMPLE_INTERVAL, ClockStep, ClockTracker},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +44,7 @@ pub struct Runtime {
     traffic_interface: String,
     sample_interval: Duration,
     traffic_tx: watch::Sender<Option<TrafficRates>>,
+    clock_steps_tx: watch::Sender<Option<ClockStep>>,
 
     download: Option<Shaper>,
     upload: Option<Shaper>,
@@ -65,6 +67,7 @@ impl Runtime {
             traffic_interface,
             sample_interval: Duration::from_secs_f64(settings.advanced_settings.tick_interval),
             traffic_tx,
+            clock_steps_tx: watch::channel(None).0,
             download: settings
                 .network
                 .download_interface()
@@ -86,6 +89,10 @@ impl Runtime {
 
     pub(super) async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let mut generation = 0u16;
+        let mut clock = ClockTracker::default();
+        clock.sample();
+        let mut clock_ticker = time::interval(CLOCK_SAMPLE_INTERVAL);
+        clock_ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
         let mut previous = self
             .platform
@@ -101,9 +108,25 @@ impl Runtime {
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
         loop {
-            ticker.tick().await;
-            self.sample_traffic(&mut previous, &mut generation);
+            tokio::select! {
+                _ = clock_ticker.tick() => {
+                    if let Some(step) = clock.sample() {
+                        warn!("Local clock stepped by {:.3} seconds", step.delta_secs);
+                        self.clock_steps_tx.send_replace(Some(step));
+                    }
+                }
+                _ = ticker.tick() => self.sample_traffic(&mut previous, &mut generation),
+            }
         }
+    }
+
+    pub(crate) fn clock_steps(&self) -> watch::Receiver<Option<ClockStep>> {
+        let mut receiver = self.clock_steps_tx.subscribe();
+        // A late subscriber must also handle an already-detected discontinuity.
+        if receiver.borrow().is_some() {
+            receiver.mark_changed();
+        }
+        receiver
     }
 
     pub fn restore_shaper(&self) -> anyhow::Result<()> {

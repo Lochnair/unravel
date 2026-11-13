@@ -165,7 +165,7 @@ Ctrl+C or SIGTERM stops the program and attempts to restore the enabled shapers 
 
 ## Reflectors and measurement protocols
 
-By default, the program uses ICMP timestamps and selects five reflectors, or fewer if there aren't enough candidates. Bootstrap hosts get priority at startup. When there are more candidates than needed, it periodically tries other hosts from the combined bootstrap and configured inventory, temporarily probing extra hosts during selection.
+By default, the program uses ICMP timestamps with five active reflectors and three continuously monitored candidates, limited by available inventory. Bootstrap hosts get priority at startup. Candidates need three fresh successful replies before they can replace a failed active reflector. Replacement keeps the active slot's timing; the candidate pool is replenished immediately. Health is independent of latency ranking: latency increases alone do not mean failure. Selection uses a median of up to nine successful RTT samples, with directional timestamp credibility and protocol preference breaking ties among similarly fast targets. Qualified targets compete within an RTT shortlist; an incumbent that survives the shortlist stays in place. Active health uses three consecutive periodic reply-age/readiness checks, rather than individual probe losses.
 
 If timestamps are blocked on your network, select `icmp-echo`. Echo uses round-trip measurements, so it can't separate upload and download delay the way timestamps or IRTT can. You can also select `irtt` to use IRTT servers. Set the protocol in UCI:
 
@@ -181,7 +181,22 @@ Or in TOML:
 measurement_type = "irtt"
 ```
 
-The choices are `icmp-timestamps` (default), `icmp-echo` and `irtt`. There's no automatic switch to echo if timestamps don't work. ICMP measurements use IPv4; IRTT supports IPv4 and IPv6, and its client is built into the default binary.
+The choices are `icmp-timestamps` (default), `icmp-echo` and `irtt`. With only `measurement_type` configured, selection stays within that protocol. To enable hybrid selection and fallback, supply ordered preferences:
+
+```toml
+[reflectors]
+protocol_preferences = ["irtt", "icmp-timestamps", "icmp-echo"]
+num_candidates = 3
+candidate_period = 3.0 # seconds; independent of advanced_settings.tick_interval
+```
+
+In UCI, use repeated `list protocol_preferences 'irtt'` entries under `config reflectors`, plus `option num_candidates '3'` and `option candidate_period '3.0'`. Preferences favor protocols with comparable measured RTT and credible timestamps; the recommended hybrid order is IRTT, ICMP timestamps, then echo. Healthy active targets change only for a sustained, material improvement. Each reflector's declared `protocols` still limits its available choices.
+
+`num_candidates` accepts zero, one, or larger pools as inventory and resources allow. Zero disables continuous standbys; active failures still start temporary candidate evaluation. Candidates keep their sparse cadence, while IRTT sessions negotiate the active interval so promotion can reuse the established session. Silently expired IRTT sessions recover after repeated protocol timeouts while keeping the configured probe grid.
+
+The manager gradually explores the oldest eligible candidate, balancing exploration across protocol inventories. Each newly assigned candidate qualifies from recent live measurements. Promotion preserves sessions and evidence; reconnects report readiness without introducing a new measurement identity. See [reflector selection policy](docs/reflector-selection.md) for ranking, exploration, clock-quality limitations, and timeout recommendations.
+
+ICMP measurements use IPv4; IRTT supports IPv4 and IPv6, and its client is built into the default binary.
 
 You can add your own reflectors with `[[reflectors.entries]]` in TOML or repeated `config reflector` sections in UCI:
 

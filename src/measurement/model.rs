@@ -2,83 +2,78 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::fmt::{self, Display};
+use crate::settings::ReflectorProtocol;
 use std::{
-    net::IpAddr,
-    time::{Duration, Instant},
+    fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Instant,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MeasurementStreamId(pub u64);
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MeasurementSource {
-    IcmpEcho,
-    IcmpTimestamp,
-    Irtt,
-    TcpSeqAck,
-    TcpTimestamp,
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MeasurementTarget {
+    IcmpEcho(Ipv4Addr),
+    IcmpTimestamps(Ipv4Addr),
+    Irtt {
+        endpoint: SocketAddr,
+        authentication: Option<Arc<str>>,
+    },
 }
 
-impl Display for MeasurementSource {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl MeasurementTarget {
+    pub fn peer(&self) -> IpAddr {
         match self {
-            MeasurementSource::IcmpEcho => write!(f, "icmp-echo"),
-            MeasurementSource::IcmpTimestamp => write!(f, "icmp-timestamps"),
-            MeasurementSource::Irtt => write!(f, "irtt"),
-            MeasurementSource::TcpSeqAck => write!(f, "tcp-seqack"),
-            MeasurementSource::TcpTimestamp => write!(f, "tcp-timestamp"),
+            Self::IcmpEcho(peer) | Self::IcmpTimestamps(peer) => (*peer).into(),
+            Self::Irtt { endpoint, .. } => endpoint.ip(),
+        }
+    }
+
+    pub fn protocol(&self) -> ReflectorProtocol {
+        match self {
+            Self::IcmpEcho(_) => ReflectorProtocol::IcmpEcho,
+            Self::IcmpTimestamps(_) => ReflectorProtocol::IcmpTimestamps,
+            Self::Irtt { .. } => ReflectorProtocol::Irtt,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MeasurementStream {
-    pub id: MeasurementStreamId,
-    pub peer: IpAddr,
-    pub source: MeasurementSource,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OneWayClock {
-    Uncalibrated,
-    Calibrated,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProbeSchedule {
-    pub period: Duration,
-    pub offset: Duration,
-}
-
-impl ProbeSchedule {
-    pub(crate) fn next_probe_at(&self, origin: Instant, now: Instant) -> Instant {
-        const NANOS_PER_SEC: u128 = 1_000_000_000;
-
-        let first = origin + self.offset;
-
-        if now < first {
-            return first;
+impl fmt::Debug for MeasurementTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Irtt { endpoint, .. } => write!(f, "irtt({endpoint})"),
+            _ => write!(f, "{}({})", self.protocol(), self.peer()),
         }
+    }
+}
 
-        let elapsed_ns = now.duration_since(first).as_nanos();
-        let period_ns = self.period.as_nanos();
-        let remainder = elapsed_ns % period_ns;
+/// Engine assessment of directional continuity, not absolute clock calibration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneWayStatus {
+    Usable,
+    /// Start new directional history before consuming this observation.
+    ReferenceChanged,
+    /// Raw values remain available for diagnostics; RTT is assessed independently.
+    Unusable(OneWayRejection),
+}
 
-        let until_next = if remainder == 0 {
-            period_ns
-        } else {
-            period_ns - remainder
-        };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneWayRejection {
+    InvalidRtt,
+    InconsistentTimestamps,
+    Discontinuity,
+    LocalClockStep,
+    OutOfOrder,
+}
 
-        let until_next = Duration::new(
-            (until_next / NANOS_PER_SEC) as u64,
-            (until_next % NANOS_PER_SEC) as u32,
-        );
-
-        now + until_next
+impl OneWayRejection {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::InvalidRtt => "invalid_rtt",
+            Self::InconsistentTimestamps => "inconsistent_timestamps",
+            Self::Discontinuity => "directional_discontinuity",
+            Self::LocalClockStep => "local_clock_step",
+            Self::OutOfOrder => "out_of_order",
+        }
     }
 }
 
@@ -112,48 +107,55 @@ impl SignedDuration {
 pub struct OneWayLatency {
     pub uplink: SignedDuration,
     pub downlink: SignedDuration,
-    pub clock: OneWayClock,
+    /// Finalized by MeasurementEngine before publication.
+    pub status: OneWayStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurementRole {
+    Active,
+    Candidate,
+}
+
+/// One completed measurement. Latencies belong only to successful replies.
+#[derive(Debug, Clone)]
+pub struct MeasurementEvent {
+    pub target: MeasurementTarget,
+    /// Local monotonic time at which the probe started.
+    pub started_at: Instant,
+    /// Local receive time for a reply; the producer-reported timeout time for
+    /// a loss. IRTT preserves its protocol timeout deadline, not delivery time.
+    pub completed_at: Instant,
+    pub outcome: MeasurementOutcome,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct MeasurementObservation {
-    pub stream: MeasurementStream,
-
-    /// Local monotonic time at which measurement started.
-    pub started_at: Instant,
-
-    /// Local monotonic time at which the result was observed.
-    pub observed_at: Instant,
-
-    /// Measured round-trip latency when it differs from elapsed local time.
-    pub round_trip: Option<SignedDuration>,
-
-    /// Directional timing, when the measurement mechanism can provide it.
-    pub one_way: Option<OneWayLatency>,
+pub enum MeasurementOutcome {
+    Reply {
+        /// Signed protocol RTT, when it differs from local elapsed time.
+        round_trip: Option<SignedDuration>,
+        one_way: Option<OneWayLatency>,
+    },
+    Loss,
 }
 
-impl MeasurementObservation {
-    pub fn rtt(&self) -> Duration {
-        self.observed_at.duration_since(self.started_at)
+impl MeasurementEvent {
+    /// Usable RTT in milliseconds. Raw protocol values remain in `outcome`.
+    /// Invalid RTTs and losses return None; directional rejection does not affect RTT.
+    pub fn rtt_ms(&self) -> Option<f64> {
+        match self.outcome {
+            MeasurementOutcome::Reply { round_trip, .. } => Some(
+                round_trip
+                    .map(SignedDuration::as_secs_f64)
+                    .unwrap_or_else(|| {
+                        self.completed_at
+                            .checked_duration_since(self.started_at)
+                            .map_or(f64::NAN, |d| d.as_secs_f64())
+                    })
+                    * 1000.0,
+            )
+            .filter(|rtt| rtt.is_finite() && *rtt >= 0.0),
+            MeasurementOutcome::Loss => None,
+        }
     }
-
-    pub fn rtt_ms(&self) -> f64 {
-        self.round_trip
-            .map(SignedDuration::as_secs_f64)
-            .unwrap_or_else(|| self.rtt().as_secs_f64())
-            * 1000.0
-    }
-}
-
-#[allow(dead_code)]
-pub struct MeasurementLoss {
-    pub stream: MeasurementStream,
-    pub started_at: Instant,
-    pub detected_at: Instant,
-}
-
-#[allow(dead_code)]
-pub enum MeasurementEvent {
-    Observation(MeasurementObservation),
-    Loss(MeasurementLoss),
 }
