@@ -16,7 +16,7 @@ use crate::{
     diagnostics::{DiagnosticRecord, DiagnosticsSender, DirectionStatistics, SpeedHistory},
     error::ChannelClosed,
     law::{Law, LawContext},
-    measurement::model::{MeasurementEvent, MeasurementObservation, MeasurementStream},
+    measurement::model::{MeasurementEvent, MeasurementOutcome, MeasurementStream, OneWayLatency},
     metrics::Metric,
     runtime::{Direction, Shaper},
     settings::{AdvancedSettings, Settings},
@@ -248,8 +248,21 @@ impl Law for SqmaLaw {
         loop {
             tokio::select! {
                 event = ctx.measurements.recv() => {
-                    let event = event.ok_or(ChannelClosed).context("Measurement channel closed")?;
-                    self.observe(event, &ctx)?;
+                    match event {
+                        Ok(event) => self.observe(event, &ctx)?,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            warn!("Control law missed {count} measurement events");
+                            ctx.metrics.send(Metric::Event {
+                                name: "measurement_lag",
+                                reason: "control_law",
+                                reflector: None,
+                                tags: &[],
+                            });
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return Err(ChannelClosed).context("Measurement channel closed");
+                        }
+                    }
                 }
 
                 _ = ticker.tick() => {
@@ -576,21 +589,20 @@ impl SqmaLaw {
     }
 
     fn observe(&mut self, event: MeasurementEvent, ctx: &super::LawContext) -> anyhow::Result<()> {
-        let observation = match event {
-            MeasurementEvent::Observation(reply) => reply,
-            MeasurementEvent::Loss(_) => return Ok(()),
+        let MeasurementOutcome::Reply { one_way, .. } = event.outcome else {
+            return Ok(());
         };
-
-        let sample = EwmaStats::from_reply(&observation);
+        let rtt_ms = event.rtt_ms().expect("a reply has an RTT");
+        let sample = EwmaStats::from_reply(rtt_ms, one_way);
         let (state, anomaly) = {
             let state = self
                 .reflectors
-                .entry(observation.stream)
-                .or_insert_with(|| ReflectorState::new(sample, observation.observed_at));
+                .entry(event.stream)
+                .or_insert_with(|| ReflectorState::new(sample, event.completed_at));
 
             let anomaly = state.update(
                 sample,
-                observation.observed_at,
+                event.completed_at,
                 self.slow_factor,
                 self.fast_factor,
             );
@@ -602,14 +614,14 @@ impl SqmaLaw {
             ctx.metrics.send(Metric::Event {
                 name: "reselection",
                 reason: "anomaly",
-                reflector: Some(observation.stream.peer),
+                reflector: Some(event.stream.peer),
                 tags: &[],
             });
 
             let _ = ctx.reselect_trigger.try_send(true);
         } else {
             ctx.metrics.send(Metric::Baseline {
-                reflector: observation.stream.peer,
+                reflector: event.stream.peer,
                 baseline_up_ewma: state.baseline.up,
                 baseline_down_ewma: state.baseline.down,
                 recent_up_ewma: state.recent.up,
@@ -622,17 +634,15 @@ impl SqmaLaw {
         }));
 
         ctx.metrics.send(Metric::Ping {
-            reflector: observation.stream.peer,
-            measurement_type: observation.stream.source,
-            rtt: observation.rtt_ms(),
-            up_time: observation
-                .one_way
+            reflector: event.stream.peer,
+            measurement_type: event.stream.source,
+            rtt: rtt_ms,
+            up_time: one_way
                 .map(|o| o.uplink.as_nanos() as f64 / 1000000.0)
-                .unwrap_or(observation.rtt_ms() / 2.0),
-            down_time: observation
-                .one_way
+                .unwrap_or(rtt_ms / 2.0),
+            down_time: one_way
                 .map(|o| o.downlink.as_nanos() as f64 / 1000000.0)
-                .unwrap_or(observation.rtt_ms() / 2.0),
+                .unwrap_or(rtt_ms / 2.0),
         });
 
         Ok(())
@@ -651,16 +661,14 @@ pub struct EwmaStats {
 }
 
 impl EwmaStats {
-    fn from_reply(reply: &MeasurementObservation) -> Self {
+    fn from_reply(rtt_ms: f64, one_way: Option<OneWayLatency>) -> Self {
         Self {
-            down: reply
-                .one_way
+            down: one_way
                 .map(|o| o.downlink.as_nanos() as f64 / 1000000.0)
-                .unwrap_or(reply.rtt_ms() / 2.0),
-            up: reply
-                .one_way
+                .unwrap_or(rtt_ms / 2.0),
+            up: one_way
                 .map(|o| o.uplink.as_nanos() as f64 / 1000000.0)
-                .unwrap_or(reply.rtt_ms() / 2.0),
+                .unwrap_or(rtt_ms / 2.0),
         }
     }
 

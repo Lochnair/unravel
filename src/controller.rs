@@ -12,13 +12,12 @@ use std::{
 use thiserror::Error;
 use tokio::sync::{mpsc::UnboundedReceiver, watch};
 
-#[cfg(feature = "irtt")]
-use crate::measurement::irtt::IrttBinding;
 use crate::{
     error::ChannelClosed,
     measurement::{
-        icmp::IcmpBinding,
-        model::{MeasurementSource, MeasurementStream, MeasurementStreamId, ProbeSchedule},
+        model::{MeasurementRole, MeasurementSource, MeasurementStream, MeasurementStreamId},
+        plan::{MeasurementAssignment, MeasurementPlan},
+        scheduler::{ProbeSchedule, evenly_spaced_offset},
     },
     settings::ReflectorDefinition,
 };
@@ -27,16 +26,11 @@ use crate::{
 pub enum ControllerError {
     #[error("ICMP channel error")]
     IcmpChannelError(#[source] ChannelClosed),
-    #[cfg(feature = "irtt")]
-    #[error("IRTT channel error")]
-    IrttChannelError(#[source] ChannelClosed),
 }
 
 pub struct Controller {
     reflector_rx: UnboundedReceiver<Vec<SocketAddr>>,
-    icmp_binding_tx: watch::Sender<Vec<IcmpBinding>>,
-    #[cfg(feature = "irtt")]
-    irtt_binding_tx: watch::Sender<Vec<IrttBinding>>,
+    plan_tx: watch::Sender<MeasurementPlan>,
     reflectors: HashMap<SocketAddr, ReflectorDefinition>,
     active_streams: Arc<RwLock<Vec<MeasurementStream>>>,
     endpoint_streams: Arc<RwLock<HashMap<SocketAddr, MeasurementStream>>>,
@@ -53,8 +47,7 @@ impl Controller {
     )]
     pub fn new(
         reflector_rx: UnboundedReceiver<Vec<SocketAddr>>,
-        icmp_binding_tx: watch::Sender<Vec<IcmpBinding>>,
-        #[cfg(feature = "irtt")] irtt_binding_tx: watch::Sender<Vec<IrttBinding>>,
+        plan_tx: watch::Sender<MeasurementPlan>,
         reflectors: HashMap<SocketAddr, ReflectorDefinition>,
         active_streams: Arc<RwLock<Vec<MeasurementStream>>>,
         endpoint_streams: Arc<RwLock<HashMap<SocketAddr, MeasurementStream>>>,
@@ -63,9 +56,7 @@ impl Controller {
     ) -> Self {
         Self {
             reflector_rx,
-            icmp_binding_tx,
-            #[cfg(feature = "irtt")]
-            irtt_binding_tx,
+            plan_tx,
             reflectors,
             active_streams,
             endpoint_streams,
@@ -103,16 +94,13 @@ impl Controller {
         endpoints: Vec<SocketAddr>,
     ) -> Result<(), ControllerError> {
         let count = endpoints.len();
-        let mut icmp = Vec::new();
-        #[cfg(feature = "irtt")]
-        let mut irtt = Vec::new();
+        let mut assignments = Vec::new();
         let mut streams = Vec::with_capacity(count);
         let mut endpoint_streams = HashMap::new();
         for (index, endpoint) in endpoints.into_iter().enumerate() {
             let Some(_definition) = self.reflectors.get(&endpoint) else {
                 continue;
             };
-            #[cfg(feature = "irtt")]
             let (port, hmac) = {
                 (
                     _definition.irtt_port.unwrap_or(2112),
@@ -124,16 +112,13 @@ impl Controller {
                 period: self.period,
                 offset: evenly_spaced_offset(self.period, index, count),
             };
-            match self.source {
-                MeasurementSource::IcmpEcho | MeasurementSource::IcmpTimestamp => {
-                    icmp.push(IcmpBinding::new(stream, schedule))
-                }
-                #[cfg(feature = "irtt")]
-                MeasurementSource::Irtt => irtt.push(IrttBinding::new(stream, port, hmac)),
-                #[cfg(not(feature = "irtt"))]
-                MeasurementSource::Irtt => unreachable!("IRTT feature is checked before startup"),
-                _ => unreachable!("unsupported reflector measurement source"),
-            }
+            assignments.push(MeasurementAssignment {
+                stream,
+                role: MeasurementRole::Active,
+                schedule,
+                irtt_port: port,
+                irtt_hmac: hmac,
+            });
             streams.push(stream);
             endpoint_streams.insert(endpoint, stream);
         }
@@ -145,21 +130,14 @@ impl Controller {
             .endpoint_streams
             .write()
             .expect("endpoint stream lock poisoned") = endpoint_streams;
-        self.icmp_binding_tx
-            .send(icmp)
+        let revision = self.plan_tx.borrow().revision + 1;
+        self.plan_tx
+            .send(MeasurementPlan {
+                revision,
+                active_interval: self.period,
+                assignments,
+            })
             .map_err(|_| ControllerError::IcmpChannelError(ChannelClosed))?;
-        #[cfg(feature = "irtt")]
-        self.irtt_binding_tx
-            .send(irtt)
-            .map_err(|_| ControllerError::IrttChannelError(ChannelClosed))?;
         Ok(())
     }
-}
-
-fn evenly_spaced_offset(period: Duration, index: usize, count: usize) -> Duration {
-    let nanos = period.as_nanos() * index as u128 / count as u128;
-    Duration::new(
-        (nanos / 1_000_000_000) as u64,
-        (nanos % 1_000_000_000) as u32,
-    )
 }

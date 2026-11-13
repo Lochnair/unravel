@@ -9,10 +9,10 @@ use crate::{
     metrics::MetricsSender,
     runtime::{Direction, Runtime, Shaper, TrafficRates},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 pub struct LawContext {
-    pub measurements: mpsc::UnboundedReceiver<MeasurementEvent>,
+    pub measurements: broadcast::Receiver<MeasurementEvent>,
     pub metrics: MetricsSender,
     pub reselect_trigger: mpsc::Sender<bool>,
     runtime: Arc<Runtime>,
@@ -22,7 +22,7 @@ pub struct LawContext {
 
 impl LawContext {
     pub fn new(
-        measurements: mpsc::UnboundedReceiver<MeasurementEvent>,
+        measurements: broadcast::Receiver<MeasurementEvent>,
         metrics: MetricsSender,
         reselect_trigger: mpsc::Sender<bool>,
         runtime: Arc<Runtime>,

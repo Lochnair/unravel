@@ -2,136 +2,70 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-    net::IpAddr,
-    time::{Duration, Instant, SystemTime},
-};
-
-use icmp_socket2::{
-    AsyncIcmpSocket, IcmpSocket4, Icmpv4Message, Icmpv4Packet,
-    packet::{IcmpPacketBuildError, WithEchoRequest, WithTimestampRequest},
-    tokio::AsyncIcmpV4Socket,
-};
-use log::debug;
-use thiserror::Error;
-use tokio::sync::{mpsc::UnboundedSender, watch};
-
 use crate::{
-    error::ChannelClosed,
     measurement::model::{
-        MeasurementEvent, MeasurementLoss, MeasurementObservation, MeasurementSource,
-        MeasurementStream, MeasurementStreamId, OneWayClock, OneWayLatency, ProbeSchedule,
-        SignedDuration,
+        MeasurementOutcome, MeasurementSource, MeasurementStream, MeasurementStreamId, OneWayClock,
+        OneWayLatency, ProbeCompletion, SignedDuration,
     },
     settings::NetworkSettings,
     time::{ClockSample, Realtime},
 };
+use icmp_socket2::{
+    IcmpSocket4, Icmpv4Message, Icmpv4Packet,
+    packet::{WithEchoRequest, WithTimestampRequest},
+    tokio::AsyncIcmpV4Socket,
+};
+use log::debug;
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    net::IpAddr,
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime},
+};
+use thiserror::Error;
 
-#[derive(Clone)]
-pub struct IcmpBinding {
-    pub stream: MeasurementStream,
-    pub schedule: ProbeSchedule,
-
-    next_probe_at: Instant,
-    next_sequence: u16,
-}
-
-impl IcmpBinding {
-    pub fn new(stream: MeasurementStream, schedule: ProbeSchedule) -> Self {
-        Self {
-            stream,
-            schedule,
-            next_probe_at: Instant::now(),
-            next_sequence: 0,
-        }
-    }
-}
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum IcmpError {
-    #[error("I/O error")]
+    #[error("I/O error: {0}")]
     Io(#[from] io::Error),
-
-    #[error("failed to build ICMP packet")]
-    PacketBuild(#[from] IcmpPacketBuildError),
-
     #[error("invalid ICMP packet: {0}")]
     InvalidPacket(String),
-
-    #[error("unsupported measurement source: {0:?}")]
-    UnsupportedSource(MeasurementSource),
-
-    #[error("probe interval must be non-zero for stream {0:?}")]
-    InvalidInterval(MeasurementStreamId),
-
-    #[error("probe offset must be less than the period for stream {0:?}")]
-    InvalidOffset(MeasurementStreamId),
-
-    #[error(
-        "no matching probe found for peer {:?}, source: {:?}, sequence: {}",
-        .0.0,
-        .0.1,
-        .0.2
-    )]
+    #[error("no matching probe: {0:?}")]
     NoMatchingProbe(InFlightProbeKey),
-
     #[error("wrong identifier: expected {expected}, found {found}")]
     WrongIdentifier { expected: u16, found: u16 },
-
-    #[error("unsupported ICMP peer address: {0}")]
-    UnsupportedPeer(IpAddr),
-
-    #[error("event channel closed")]
-    EventChannelClosed(#[source] ChannelClosed),
-
-    #[error("binding channel closed")]
-    BindingChannelClosed(#[source] ChannelClosed),
 }
 
 #[derive(Debug, Clone, Copy)]
 struct InFlightProbe {
     stream: MeasurementStream,
     sent_at: Instant,
+    correlation: u64,
 }
-
 type InFlightProbeKey = (IpAddr, MeasurementSource, u16);
-type InFlightProbes = HashMap<InFlightProbeKey, InFlightProbe>;
+struct PreparedProbe {
+    stream: MeasurementStream,
+    sequence: u16,
+    packet: Icmpv4Packet,
+    correlation: u64,
+}
 
-pub struct IcmpEngine {
+pub struct IcmpDriver {
     socket: AsyncIcmpV4Socket,
-
     identifier: u16,
-
-    bindings: HashMap<MeasurementStreamId, IcmpBinding>,
+    next_sequence: u16,
     inflight: HashMap<InFlightProbeKey, InFlightProbe>,
-
-    origin: Instant,
-
-    binding_rx: watch::Receiver<Vec<IcmpBinding>>,
-    observation_tx: UnboundedSender<MeasurementEvent>,
+    // Keep retired sequence leases until their original timeout too. Replacing
+    // a stream must never attribute its late reply to a new stream.
+    used: HashMap<InFlightProbeKey, Instant>,
+    prepared: HashMap<MeasurementStreamId, PreparedProbe>,
 }
 
-async fn wait_for_deadline(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-        }
-
-        None => {
-            std::future::pending::<()>().await;
-        }
-    }
-}
-
-impl IcmpEngine {
-    pub fn new(
-        origin: Instant,
-        #[allow(unused)] settings: &NetworkSettings,
-        observation_tx: UnboundedSender<MeasurementEvent>,
-        binding_rx: watch::Receiver<Vec<IcmpBinding>>,
-    ) -> Result<Self, IcmpError> {
+impl IcmpDriver {
+    pub fn new(#[allow(unused)] settings: &NetworkSettings) -> anyhow::Result<Self> {
         #[allow(unused_mut)]
         let mut socket = IcmpSocket4::new()?;
 
@@ -152,154 +86,180 @@ impl IcmpEngine {
 
         socket.enable_receive_metadata()?;
         let identifier = (std::process::id() & 0xffff) as u16;
-        let inflight: InFlightProbes = HashMap::new();
-
         Ok(Self {
             socket: socket.into_tokio()?,
             identifier,
-            bindings: HashMap::new(),
-            inflight,
-            origin,
-            binding_rx,
-            observation_tx,
+            next_sequence: 0,
+            inflight: HashMap::new(),
+            used: HashMap::new(),
+            prepared: HashMap::new(),
         })
     }
 
-    fn set_bindings(&mut self, desired: Vec<IcmpBinding>) -> Result<(), IcmpError> {
-        // Validate the complete desired state before mutating anything.
-        for binding in &desired {
-            if binding.schedule.period.is_zero() {
-                return Err(IcmpError::InvalidInterval(binding.stream.id));
-            }
-
-            if binding.schedule.offset >= binding.schedule.period {
-                return Err(IcmpError::InvalidOffset(binding.stream.id));
-            }
-
-            if !matches!(
-                binding.stream.source,
-                MeasurementSource::IcmpEcho | MeasurementSource::IcmpTimestamp
-            ) {
-                return Err(IcmpError::UnsupportedSource(binding.stream.source));
-            }
-        }
-
-        let now = Instant::now();
-        let desired_ids = desired
-            .iter()
-            .map(|binding| binding.stream.id)
-            .collect::<HashSet<_>>();
-
-        // Remove bindings that are no longer desired.
-        self.bindings.retain(|id, _| desired_ids.contains(id));
+    pub fn retain(&mut self, ids: &HashSet<MeasurementStreamId>) {
         self.inflight
-            .retain(|_, probe| desired_ids.contains(&probe.stream.id));
+            .retain(|_, probe| ids.contains(&probe.stream.id));
+        self.prepared.retain(|id, _| ids.contains(id));
+    }
 
-        for desired in desired {
-            match self.bindings.get_mut(&desired.stream.id) {
-                Some(current) if current.schedule == desired.schedule => {
-                    // Same schedule, so leave next_probe_at alone.
-                    current.stream = desired.stream;
-                }
+    pub fn discard(&mut self, id: MeasurementStreamId) {
+        self.prepared.remove(&id);
+    }
 
-                Some(current) => {
-                    // Same stream, but its schedule changed. Rejoin the new grid.
-                    current.stream = desired.stream;
-                    current.schedule = desired.schedule;
-                    current.next_probe_at = desired.schedule.next_probe_at(self.origin, now);
-                }
-
-                None => {
-                    // New stream. Join its configured schedule at the next
-                    // occurrence after now.
-                    let mut binding = desired;
-                    binding.next_probe_at = binding.schedule.next_probe_at(self.origin, now);
-
-                    self.bindings.insert(binding.stream.id, binding);
-                }
+    pub fn poll_send(
+        &mut self,
+        stream: MeasurementStream,
+        cx: &mut Context<'_>,
+    ) -> Poll<anyhow::Result<Instant>> {
+        if !self.prepared.contains_key(&stream.id) {
+            let result = self.prepare(stream);
+            if let Err(error) = result {
+                return Poll::Ready(Err(error));
             }
         }
-
-        Ok(())
-    }
-
-    async fn send_due_probes(&mut self, now: Instant) -> Result<(), IcmpError> {
-        let due = self
-            .bindings
-            .iter()
-            .filter_map(|(&stream_id, binding)| (binding.next_probe_at <= now).then_some(stream_id))
-            .collect::<Vec<_>>();
-
-        for stream_id in due {
-            self.send_probe(stream_id).await?;
-
-            let binding = self
-                .bindings
-                .get_mut(&stream_id)
-                .expect("due binding disappeared");
-
-            binding.next_probe_at = binding.schedule.next_probe_at(self.origin, now);
-        }
-
-        Ok(())
-    }
-
-    async fn send_probe(&mut self, stream_id: MeasurementStreamId) -> Result<(), IcmpError> {
-        let (stream, sequence) = {
-            let binding = self
-                .bindings
-                .get_mut(&stream_id)
-                .expect("binding disappeared");
-
-            let sequence = binding.next_sequence;
-            binding.next_sequence = binding.next_sequence.wrapping_add(1);
-
-            (binding.stream, sequence)
-        };
-
+        let prepared = &self.prepared[&stream.id];
         let IpAddr::V4(peer) = stream.peer else {
-            return Err(IcmpError::UnsupportedPeer(stream.peer));
+            unreachable!("plan validated IPv4");
         };
-
-        let packet = match stream.source {
-            MeasurementSource::IcmpEcho => {
-                Icmpv4Packet::with_echo_request(self.identifier, sequence, Vec::new())?
+        match self.socket.poll_send_to(cx, peer, &prepared.packet) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                self.discard(stream.id);
+                Poll::Ready(Err(error.into()))
             }
+            Poll::Ready(Ok(_accepted_bytes)) => {
+                let sent_at = Instant::now();
+                let prepared = self.prepared.remove(&stream.id).unwrap();
+                let key = (stream.peer, stream.source, prepared.sequence);
+                self.used.insert(key, sent_at + PROBE_TIMEOUT);
+                self.inflight.insert(
+                    key,
+                    InFlightProbe {
+                        stream: prepared.stream,
+                        sent_at,
+                        correlation: prepared.correlation,
+                    },
+                );
+                Poll::Ready(Ok(sent_at))
+            }
+        }
+    }
+
+    fn prepare(&mut self, stream: MeasurementStream) -> anyhow::Result<()> {
+        self.used.retain(|_, until| *until > Instant::now());
+        let sequence = (0..=u16::MAX)
+            .find_map(|_| {
+                let sequence = self.next_sequence;
+                self.next_sequence = sequence.wrapping_add(1);
+                (!self
+                    .used
+                    .contains_key(&(stream.peer, stream.source, sequence))
+                    && !self.prepared.values().any(|p| {
+                        p.stream.peer == stream.peer
+                            && p.stream.source == stream.source
+                            && p.sequence == sequence
+                    }))
+                .then_some(sequence)
+            })
+            .ok_or_else(|| anyhow::anyhow!("ICMP sequence space exhausted for {}", stream.peer))?;
+        let correlation = match stream.source {
             MeasurementSource::IcmpTimestamp => {
-                let originate = ClockSample::<Realtime>::now().as_time_since_midnight() as u32;
+                ClockSample::<Realtime>::now().as_time_since_midnight() as u64
+            }
+            _ => fastrand::u64(..),
+        };
+        let packet = match stream.source {
+            MeasurementSource::IcmpEcho => Icmpv4Packet::with_echo_request(
+                self.identifier,
+                sequence,
+                correlation.to_be_bytes().to_vec(),
+            )?,
+            MeasurementSource::IcmpTimestamp => {
+                let originate = correlation as u32;
                 Icmpv4Packet::with_timestamp_request(self.identifier, sequence, originate, 0, 0)?
             }
-            source => return Err(IcmpError::UnsupportedSource(source)),
+            _ => anyhow::bail!("invalid ICMP source"),
         };
-
-        let sent_at = Instant::now();
-        let key = (stream.peer, stream.source, sequence);
-
-        self.socket.send_to(peer, packet).await?;
-        self.inflight.insert(key, InFlightProbe { stream, sent_at });
-
+        self.prepared.insert(
+            stream.id,
+            PreparedProbe {
+                stream,
+                sequence,
+                packet,
+                correlation,
+            },
+        );
         Ok(())
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
-        self.bindings
+    pub fn poll_receive(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<anyhow::Result<Option<ProbeCompletion>>> {
+        match self.socket.poll_recv_from_with_meta(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                Poll::Ready(Ok(None))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+            Poll::Ready(Ok(result)) => {
+                let Some(peer) = result.peer.as_socket() else {
+                    return Poll::Ready(Ok(None));
+                };
+                match self.handle_reply(
+                    result.packet,
+                    peer.ip(),
+                    result.received_at,
+                    result.kernel_rx_timestamp,
+                ) {
+                    Ok(event) => Poll::Ready(Ok(Some(event))),
+                    Err(
+                        IcmpError::WrongIdentifier { .. }
+                        | IcmpError::NoMatchingProbe(..)
+                        | IcmpError::InvalidPacket(_),
+                    ) => Poll::Ready(Ok(None)),
+                    Err(error) => Poll::Ready(Err(error.into())),
+                }
+            }
+        }
+    }
+
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.inflight
             .values()
-            .map(|binding| binding.next_probe_at)
+            .map(|p| p.sent_at + PROBE_TIMEOUT)
             .min()
     }
 
+    pub fn expire(&mut self, now: Instant) -> Vec<ProbeCompletion> {
+        let mut events = Vec::new();
+        self.inflight.retain(|_, probe| {
+            let deadline = probe.sent_at + PROBE_TIMEOUT;
+            if deadline > now {
+                return true;
+            }
+            events.push(ProbeCompletion {
+                stream: probe.stream,
+                started_at: probe.sent_at,
+                completed_at: deadline,
+                outcome: MeasurementOutcome::Loss,
+            });
+            false
+        });
+        events
+    }
     fn handle_reply(
         &mut self,
         packet: Icmpv4Packet,
         peer: IpAddr,
         observed_at: Instant,
         kernel_rx_timestamp: Option<SystemTime>,
-    ) -> Result<MeasurementObservation, IcmpError> {
+    ) -> Result<ProbeCompletion, IcmpError> {
         match packet.message {
             Icmpv4Message::EchoReply {
                 identifier,
                 sequence,
-                ..
+                payload,
             } => {
                 if identifier != self.identifier {
                     return Err(IcmpError::WrongIdentifier {
@@ -309,6 +269,13 @@ impl IcmpEngine {
                 }
 
                 let key = (peer, MeasurementSource::IcmpEcho, sequence);
+                if self
+                    .inflight
+                    .get(&key)
+                    .is_none_or(|p| payload != p.correlation.to_be_bytes())
+                {
+                    return Err(IcmpError::NoMatchingProbe(key));
+                }
                 let probe = self
                     .inflight
                     .remove(&key)
@@ -328,12 +295,14 @@ impl IcmpEngine {
                     "N/A",
                 );
 
-                Ok(MeasurementObservation {
+                Ok(ProbeCompletion {
                     stream: probe.stream,
                     started_at: probe.sent_at,
-                    observed_at,
-                    round_trip: None,
-                    one_way: None,
+                    completed_at: observed_at,
+                    outcome: MeasurementOutcome::Reply {
+                        round_trip: None,
+                        one_way: None,
+                    },
                 })
             }
             Icmpv4Message::TimestampReply {
@@ -360,6 +329,13 @@ impl IcmpEngine {
                 }
 
                 let key = (peer, MeasurementSource::IcmpTimestamp, sequence);
+                if self
+                    .inflight
+                    .get(&key)
+                    .is_none_or(|p| p.correlation != originate as u64)
+                {
+                    return Err(IcmpError::NoMatchingProbe(key));
+                }
                 let probe = self
                     .inflight
                     .remove(&key)
@@ -388,16 +364,18 @@ impl IcmpEngine {
                     downlink_ms,
                 );
 
-                Ok(MeasurementObservation {
+                Ok(ProbeCompletion {
                     stream: probe.stream,
                     started_at: probe.sent_at,
-                    observed_at,
-                    round_trip: None,
-                    one_way: Some(OneWayLatency {
-                        uplink: SignedDuration::from_millis(uplink_ms),
-                        downlink: SignedDuration::from_millis(downlink_ms),
-                        clock: OneWayClock::Uncalibrated,
-                    }),
+                    completed_at: observed_at,
+                    outcome: MeasurementOutcome::Reply {
+                        round_trip: None,
+                        one_way: Some(OneWayLatency {
+                            uplink: SignedDuration::from_millis(uplink_ms),
+                            downlink: SignedDuration::from_millis(downlink_ms),
+                            clock: OneWayClock::Uncalibrated,
+                        }),
+                    },
                 })
             }
             _ => Err(IcmpError::InvalidPacket(
@@ -405,98 +383,7 @@ impl IcmpEngine {
             )),
         }
     }
-
-    async fn expire_inflight(&mut self, now: Instant) -> Result<(), IcmpError> {
-        const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-
-        let expired = {
-            let mut expired = Vec::new();
-
-            self.inflight.retain(|_, probe| {
-                if now.saturating_duration_since(probe.sent_at) >= PROBE_TIMEOUT {
-                    expired.push(*probe);
-                    false
-                } else {
-                    true
-                }
-            });
-
-            expired
-        };
-
-        for probe in expired {
-            self.observation_tx
-                .send(MeasurementEvent::Loss(MeasurementLoss {
-                    stream: probe.stream,
-                    started_at: probe.sent_at,
-                    detected_at: now,
-                }))
-                .map_err(|_| IcmpError::EventChannelClosed(ChannelClosed))?;
-        }
-
-        Ok(())
-    }
-
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        const HOUSEKEEPING_INTERVAL: Duration = Duration::from_millis(500);
-
-        let mut housekeeping = tokio::time::interval_at(
-            tokio::time::Instant::now() + HOUSEKEEPING_INTERVAL,
-            HOUSEKEEPING_INTERVAL,
-        );
-
-        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            let deadline = self.next_deadline();
-
-            tokio::select! {
-                bindings = self.binding_rx.changed() => {
-                    bindings.map_err(|_| IcmpError::BindingChannelClosed(ChannelClosed))?;
-
-                    let bindings = self.binding_rx.borrow_and_update().clone();
-                    self.set_bindings(bindings)?;
-                }
-
-                _ = wait_for_deadline(deadline) => {
-                    self.send_due_probes(Instant::now()).await?;
-                }
-
-                result = self.socket.rcv_from_with_meta() => {
-                    let result = result?;
-
-                    match self.handle_reply(
-                        result.packet,
-                        result.peer.as_socket().unwrap().ip(),
-                        result.received_at,
-                        result.kernel_rx_timestamp,
-                    ) {
-                        Ok(observation) => {
-                            self.observation_tx
-                                .send(MeasurementEvent::Observation(observation))
-                                .map_err(|_| IcmpError::EventChannelClosed(ChannelClosed))?;
-                        }
-
-                        Err(
-                            IcmpError::WrongIdentifier { .. }
-                            | IcmpError::NoMatchingProbe { .. }
-                            | IcmpError::InvalidPacket(_),
-                        ) => {
-                            // Not ours, malformed, or late.
-                        }
-
-                       Err(err) => return Err(err.into())
-                    }
-                }
-
-                _ = housekeeping.tick() => {
-                    self.expire_inflight(Instant::now()).await?;
-                }
-            }
-        }
-    }
 }
-
 const MS_PER_DAY: i64 = 86_400_000;
 
 fn timestamp_delta(later: i64, earlier: i64) -> i64 {

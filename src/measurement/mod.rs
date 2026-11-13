@@ -6,3 +6,7 @@ pub(crate) mod icmp;
 #[cfg(feature = "irtt")]
 pub(crate) mod irtt;
 pub(crate) mod model;
+
+pub(crate) mod engine;
+pub(crate) mod plan;
+pub(crate) mod scheduler;
