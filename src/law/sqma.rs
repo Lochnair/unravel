@@ -15,18 +15,20 @@ use crate::{
     diagnostics::{DiagnosticRecord, DiagnosticsSender, DirectionStatistics, SpeedHistory},
     error::ChannelClosed,
     law::{Law, LawContext},
-    measurement::model::{MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayLatency},
+    measurement::model::{
+        MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayLatency, OneWayRejection,
+        OneWayStatus,
+    },
     metrics::Metric,
     runtime::{Direction, Shaper},
     settings::{AdvancedSettings, Settings},
 };
 
-const ANOMALY_THRESHOLD_MS: f64 = 5_000.0;
 const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
 const RECENT_HALF_LIFE_SECS: f64 = 0.4;
 const STALE_AFTER: Duration = Duration::from_secs(30);
 // Give outstanding queues a chance to drain before learning a new clock reference.
-const CLOCK_STEP_SETTLE_TIME: Duration = Duration::from_secs(5);
+const MEASUREMENT_SETTLE_TIME: Duration = Duration::from_secs(5);
 
 // With history_file set, the recorded safe rates are saved there so a
 // service restart does not throw them away.
@@ -253,7 +255,7 @@ impl Law for SqmaLaw {
                     if let Some(step) = step {
                         warn!("SQMA resetting after local clock step of {:.3}s detected {:?} ago",
                             step.delta_secs, step.detected_at.elapsed());
-                        self.recover_clock(&ctx)?;
+                        self.recover_measurements(&ctx, "local_clock_step", None)?;
                     }
                 }
 
@@ -269,7 +271,7 @@ impl Law for SqmaLaw {
                     }
 
                     self.reflectors.retain(|_, state| {
-                        Instant::now().saturating_duration_since(state.last_receive_at) <= STALE_AFTER
+                        Instant::now().saturating_duration_since(state.last_usable_at) <= STALE_AFTER
                     });
                 }
 
@@ -278,6 +280,7 @@ impl Law for SqmaLaw {
                         Ok(event) => self.observe(event, &ctx)?,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                             warn!("Control law missed {count} measurement events");
+                            self.recover_measurements(&ctx, "measurement_lag", None)?;
                             ctx.metrics.send(Metric::Event {
                                 name: "measurement_lag",
                                 reason: "control_law",
@@ -388,7 +391,12 @@ impl SqmaLaw {
         }
     }
 
-    fn recover_clock(&mut self, ctx: &LawContext) -> anyhow::Result<()> {
+    fn recover_measurements(
+        &mut self,
+        ctx: &LawContext,
+        reason: &'static str,
+        reflector: Option<std::net::IpAddr>,
+    ) -> anyhow::Result<()> {
         self.reflectors.clear();
         for (direction, state) in [
             (Direction::Download, self.download.as_mut()),
@@ -402,11 +410,11 @@ impl SqmaLaw {
             }
         }
         // Start the hold after lowering both rates, not when Runtime detected the step.
-        self.measurements_after = Some(Instant::now() + CLOCK_STEP_SETTLE_TIME);
+        self.measurements_after = Some(Instant::now() + MEASUREMENT_SETTLE_TIME);
         ctx.metrics.send(Metric::Event {
-            name: "clock_step",
-            reason: "baseline_reset",
-            reflector: None,
+            name: "measurement_recovery",
+            reason,
+            reflector,
             tags: &[],
         });
         Ok(())
@@ -463,7 +471,7 @@ impl SqmaLaw {
                 continue;
             };
 
-            if !state.valid || now.saturating_duration_since(state.last_receive_at) >= max_age {
+            if !state.valid || now.saturating_duration_since(state.last_usable_at) >= max_age {
                 continue;
             }
 
@@ -632,60 +640,110 @@ impl SqmaLaw {
     }
 
     fn observe(&mut self, event: MeasurementEvent, ctx: &super::LawContext) -> anyhow::Result<()> {
+        let MeasurementOutcome::Reply { one_way, .. } = event.outcome else {
+            return Ok(());
+        };
+        if !ctx.applied.borrow().is_active(&event.target) {
+            // Demoted targets can still have retained history. Consume their
+            // reference invalidations without changing the active shaper rates.
+            if let Some(state) = self.reflectors.get(&event.target)
+                && event.started_at > state.last_started_at
+                && (one_way.is_some_and(|o| o.status == OneWayStatus::ReferenceChanged)
+                    || one_way.is_some() != (state.mode == MeasurementMode::Directional))
+            {
+                self.reflectors.remove(&event.target);
+            }
+            return Ok(());
+        }
+        // Diagnostics retain raw signed values, including rejected OWDs and
+        // observations arriving during the recovery hold.
+        if let Some(rtt_ms) = event.rtt_ms() {
+            ctx.metrics.send(Metric::Ping {
+                reflector: event.target.peer(),
+                measurement_type: event.target.protocol(),
+                rtt: rtt_ms,
+                up_time: one_way
+                    .map(|o| o.uplink.as_secs_f64() * 1000.0)
+                    .unwrap_or(rtt_ms / 2.0),
+                down_time: one_way
+                    .map(|o| o.downlink.as_secs_f64() * 1000.0)
+                    .unwrap_or(rtt_ms / 2.0),
+            });
+        }
+        if let Some(OneWayLatency {
+            status: OneWayStatus::Unusable(reason),
+            ..
+        }) = one_way
+        {
+            // A delayed observation must not invalidate more recent history.
+            if reason != OneWayRejection::OutOfOrder
+                && let Some(state) = self.reflectors.get_mut(&event.target)
+                && event.started_at > state.last_started_at
+            {
+                state.valid = false;
+                state.last_started_at = event.started_at;
+            }
+            ctx.metrics.send(Metric::Event {
+                name: "directional_rejected",
+                reason: reason.reason(),
+                reflector: Some(event.target.peer()),
+                tags: &[],
+            });
+            return Ok(());
+        }
+        let Some(rtt_ms) = event.rtt_ms() else {
+            return Ok(());
+        };
         if self
             .measurements_after
             .is_some_and(|after| event.started_at < after)
         {
             return Ok(());
         }
-        if !ctx.applied.borrow().is_active(&event.target) {
-            return Ok(());
+        let mode = if one_way.is_some() {
+            MeasurementMode::Directional
+        } else {
+            MeasurementMode::Rtt
+        };
+        if let Some(state) = self.reflectors.get(&event.target) {
+            if event.started_at <= state.last_started_at {
+                return Ok(());
+            }
+            let changed = one_way.is_some_and(|o| o.status == OneWayStatus::ReferenceChanged);
+            if changed || state.mode != mode {
+                self.recover_measurements(
+                    ctx,
+                    if changed {
+                        "directional_reference_changed"
+                    } else {
+                        "measurement_mode_changed"
+                    },
+                    Some(event.target.peer()),
+                )?;
+                return Ok(());
+            }
         }
-        let MeasurementOutcome::Reply { one_way, .. } = event.outcome else {
-            return Ok(());
-        };
-        let Some(rtt_ms) = event.rtt_ms().filter(|rtt| rtt.is_finite() && *rtt >= 0.0) else {
-            return Ok(());
-        };
         let sample = EwmaStats::from_reply(rtt_ms, one_way);
-        let (state, anomaly) = {
-            let state = self
-                .reflectors
-                .entry(event.target.clone())
-                .or_insert_with(|| ReflectorState::new(sample, event.completed_at));
-
-            let anomaly = state.update(
-                sample,
-                event.completed_at,
-                self.slow_factor,
-                self.fast_factor,
-            );
-
-            (*state, anomaly)
-        };
-
-        if !anomaly {
-            ctx.metrics.send(Metric::Baseline {
-                reflector: event.target.peer(),
-                baseline_up_ewma: state.baseline.up,
-                baseline_down_ewma: state.baseline.down,
-                recent_up_ewma: state.recent.up,
-                recent_down_ewma: state.recent.down,
+        let state = self
+            .reflectors
+            .entry(event.target.clone())
+            .or_insert_with(|| {
+                ReflectorState::new(sample, event.started_at, event.completed_at, mode)
             });
-        }
-
-        ctx.metrics.send(Metric::Ping {
+        state.update(
+            sample,
+            event.started_at,
+            event.completed_at,
+            self.slow_factor,
+            self.fast_factor,
+        );
+        ctx.metrics.send(Metric::Baseline {
             reflector: event.target.peer(),
-            measurement_type: event.target.protocol(),
-            rtt: rtt_ms,
-            up_time: one_way
-                .map(|o| o.uplink.as_nanos() as f64 / 1000000.0)
-                .unwrap_or(rtt_ms / 2.0),
-            down_time: one_way
-                .map(|o| o.downlink.as_nanos() as f64 / 1000000.0)
-                .unwrap_or(rtt_ms / 2.0),
+            baseline_up_ewma: state.baseline.up,
+            baseline_down_ewma: state.baseline.down,
+            recent_up_ewma: state.recent.up,
+            recent_down_ewma: state.recent.down,
         });
-
         Ok(())
     }
 }
@@ -714,56 +772,57 @@ impl EwmaStats {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MeasurementMode {
+    Directional,
+    Rtt,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ReflectorState {
     pub baseline: EwmaStats,
     pub recent: EwmaStats,
-    /// Last response, including rejected measurements.
-    pub last_receive_at: Instant,
-    /// Whether the retained EWMAs are usable after the latest response.
+    /// Freshness of usable data, independent of raw reply liveness.
+    pub last_usable_at: Instant,
+    last_started_at: Instant,
+    mode: MeasurementMode,
     pub valid: bool,
 }
 
 impl ReflectorState {
-    fn new(sample: EwmaStats, received_at: Instant) -> Self {
+    fn new(
+        sample: EwmaStats,
+        started_at: Instant,
+        received_at: Instant,
+        mode: MeasurementMode,
+    ) -> Self {
         Self {
             baseline: sample,
             recent: sample,
-            last_receive_at: received_at,
+            last_usable_at: received_at,
+            last_started_at: started_at,
+            mode,
             valid: true,
         }
-    }
-
-    fn reset(&mut self, sample: EwmaStats, received_at: Instant) {
-        *self = Self::new(sample, received_at);
     }
 
     fn update(
         &mut self,
         sample: EwmaStats,
+        started_at: Instant,
         received_at: Instant,
         slow_factor: f64,
         fast_factor: f64,
-    ) -> bool {
-        if received_at.saturating_duration_since(self.last_receive_at) > STALE_AFTER {
-            self.reset(sample, received_at);
+    ) {
+        if received_at.saturating_duration_since(self.last_usable_at) > STALE_AFTER {
+            *self = Self::new(sample, started_at, received_at, self.mode);
         }
-        self.last_receive_at = received_at;
-
-        if sample.up > self.baseline.up + ANOMALY_THRESHOLD_MS
-            || sample.down > self.baseline.down + ANOMALY_THRESHOLD_MS
-        {
-            self.valid = false;
-            return true;
-        }
-
+        self.last_usable_at = received_at;
+        self.last_started_at = started_at;
         self.baseline.update(sample, slow_factor);
         self.recent.update(sample, fast_factor);
-
         self.baseline.down = self.baseline.down.min(self.recent.down);
         self.baseline.up = self.baseline.up.min(self.recent.up);
         self.valid = true;
-
-        false
     }
 }
