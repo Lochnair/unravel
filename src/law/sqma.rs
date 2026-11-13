@@ -18,7 +18,7 @@ use crate::{
     measurement::model::{MeasurementEvent, MeasurementObservation, MeasurementStream},
     metrics::Metric,
     runtime::{Direction, Shaper},
-    settings::Settings,
+    settings::{AdvancedSettings, Settings},
 };
 
 const ANOMALY_THRESHOLD_MS: f64 = 5_000.0;
@@ -51,7 +51,7 @@ impl RateState {
         traffic_kbps: f64,
         deltas: &[f64],
         delay_threshold_ms: f64,
-        high_load_level: f64,
+        advanced: &AdvancedSettings,
         rng: &mut fastrand::Rng,
     ) -> f64 {
         let mut next_kbps = self.current_kbps;
@@ -62,7 +62,7 @@ impl RateState {
             if delta > 0.0 {
                 let load = traffic_kbps / self.current_kbps;
 
-                if delta < delay_threshold_ms && load > high_load_level {
+                if delta < delay_threshold_ms && load > advanced.high_load_level {
                     self.safe_rates.pop_front();
                     self.safe_rates.push_back(traffic_kbps.floor());
 
@@ -80,6 +80,12 @@ impl RateState {
                 if delta > delay_threshold_ms {
                     let rnd_rate = self.safe_rates[rng.usize(..self.safe_rates.len())];
                     next_kbps = rnd_rate.min(0.9 * traffic_kbps);
+
+                    // At low load, each cut can take the rate no lower than
+                    // low_load_cut_floor times the current rate.
+                    if advanced.low_load_cut_floor > 0.0 && load <= advanced.low_load_level {
+                        next_kbps = next_kbps.max(self.current_kbps * advanced.low_load_cut_floor);
+                    }
                 }
             }
         }
@@ -323,7 +329,7 @@ impl SqmaLaw {
                 traffic_kbps,
                 deltas,
                 delay_ms,
-                self.settings.advanced_settings.high_load_level,
+                &self.settings.advanced_settings,
                 &mut self.rng,
             );
 
