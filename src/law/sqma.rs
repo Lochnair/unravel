@@ -29,6 +29,9 @@ const STALE_AFTER: Duration = Duration::from_secs(30);
 struct RateState {
     current_kbps: f64,
     safe_rates: VecDeque<f64>,
+    /// How many safe rates are recorded rather than startup placeholders.
+    /// Recorded rates sit at the back.
+    observed: usize,
 }
 
 impl RateState {
@@ -42,6 +45,7 @@ impl RateState {
         Self {
             current_kbps: base_speed,
             safe_rates: rates,
+            observed: 0,
         }
     }
 
@@ -58,13 +62,13 @@ impl RateState {
 
         if !deltas.is_empty() {
             let delta = deltas[deltas.len() / 2];
+            let load = traffic_kbps / self.current_kbps;
 
             if delta > 0.0 {
-                let load = traffic_kbps / self.current_kbps;
-
                 if delta < delay_threshold_ms && load > advanced.high_load_level {
                     self.safe_rates.pop_front();
                     self.safe_rates.push_back(traffic_kbps.floor());
+                    self.observed = (self.observed + 1).min(self.safe_rates.len());
 
                     let max_rate = self
                         .safe_rates
@@ -86,6 +90,29 @@ impl RateState {
                     if advanced.low_load_cut_floor > 0.0 && load <= advanced.low_load_level {
                         next_kbps = next_kbps.max(self.current_kbps * advanced.low_load_cut_floor);
                     }
+                }
+            }
+
+            // With the delay at or under the threshold and the link not
+            // busy, step towards the median of the safe-rate history. This
+            // sits outside the delta > 0 check, as the median delta on an
+            // idle link can be exactly 0. Only recorded rates count: the
+            // startup placeholders would pull an idle link towards about 85%
+            // of the base rate after every restart.
+            if advanced.idle_recovery_percent > 0.0
+                && self.observed > 0
+                && delta <= delay_threshold_ms
+                && load <= advanced.low_load_level
+            {
+                let skip = self.safe_rates.len() - self.observed;
+                let mut rates: Vec<f64> = self.safe_rates.iter().skip(skip).copied().collect();
+                rates.sort_by(f64::total_cmp);
+                let target = rates[rates.len() / 2].max(shaper.min_kbps);
+                let step = shaper.base_kbps * advanced.idle_recovery_percent / 100.0;
+                if self.current_kbps < target {
+                    next_kbps = (self.current_kbps + step).min(target);
+                } else if self.current_kbps > target {
+                    next_kbps = (self.current_kbps - step).max(target);
                 }
             }
         }

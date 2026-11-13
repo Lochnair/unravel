@@ -454,8 +454,13 @@ pub(crate) struct AdvancedSettings {
     /// At or below low_load_level, each cut can take the rate no lower than
     /// this fraction of the current rate (0 = off, the upstream behaviour).
     pub(crate) low_load_cut_floor: f64,
-    /// Load at or below which low_load_cut_floor acts. Above it, cuts are
-    /// unchanged from upstream.
+    /// When the delay is under the threshold and load is at or below
+    /// low_load_level, step the rate towards the median of the recorded
+    /// safe rates by this percentage of the base rate per evaluation
+    /// (0 = off, the upstream behaviour).
+    pub(crate) idle_recovery_percent: f64,
+    /// Load at or below which low_load_cut_floor and idle_recovery_percent
+    /// act. Above it, the decision is unchanged from upstream.
     pub(crate) low_load_level: f64,
 }
 
@@ -471,6 +476,7 @@ impl Default for AdvancedSettings {
             upload_delay_ms: 15.0,
             dry_run: false,
             low_load_cut_floor: 0.0,
+            idle_recovery_percent: 0.0,
             low_load_level: 0.3,
         }
     }

@@ -379,6 +379,13 @@ impl AdvancedSettings {
             );
         }
 
+        if !(0.0..=100.0).contains(&self.idle_recovery_percent) {
+            report.error(
+                "advanced_settings.idle_recovery_percent",
+                "must be between 0 and 100",
+            );
+        }
+
         if !(0.0..=1.0).contains(&self.low_load_level) {
             report.error(
                 "advanced_settings.low_load_level",
