@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use super::{
-    model::{MeasurementRole, MeasurementSource, MeasurementStream},
+    model::{MeasurementRole, MeasurementTarget},
     scheduler::ProbeSchedule,
 };
 use std::{
@@ -13,14 +13,12 @@ use std::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasurementAssignment {
-    pub stream: MeasurementStream,
+    pub target: MeasurementTarget,
     pub role: MeasurementRole,
     pub schedule: ProbeSchedule,
-    pub irtt_port: u16,
-    pub irtt_hmac: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasurementPlan {
     pub revision: u64,
     /// Both active and candidate IRTT sessions negotiate this interval.
@@ -34,30 +32,34 @@ impl MeasurementPlan {
             !self.active_interval.is_zero(),
             "active interval must be nonzero"
         );
-        let mut ids = HashSet::new();
+        anyhow::ensure!(
+            Instant::now().checked_add(self.active_interval).is_some(),
+            "active interval overflows monotonic clock"
+        );
         let mut endpoints = HashSet::new();
         for assignment in &self.assignments {
             assignment.schedule.validate()?;
+            anyhow::ensure!(
+                assignment.role != MeasurementRole::Active
+                    || assignment.schedule.period == self.active_interval,
+                "active assignment must use the active interval"
+            );
             anyhow::ensure!(
                 Instant::now()
                     .checked_add(assignment.schedule.period)
                     .is_some(),
                 "probe period overflows monotonic clock"
             );
-            anyhow::ensure!(
-                ids.insert(assignment.stream.id),
-                "duplicate measurement stream ID"
-            );
-            let port = if assignment.stream.source == MeasurementSource::Irtt {
-                anyhow::ensure!(cfg!(feature = "irtt"), "IRTT feature is disabled");
-                anyhow::ensure!(assignment.irtt_port != 0, "IRTT port must be nonzero");
-                assignment.irtt_port
-            } else {
-                anyhow::ensure!(assignment.stream.peer.is_ipv4(), "ICMP requires IPv4");
-                0
+            let endpoint = match &assignment.target {
+                MeasurementTarget::Irtt { endpoint, .. } => {
+                    anyhow::ensure!(cfg!(feature = "irtt"), "IRTT feature is disabled");
+                    anyhow::ensure!(endpoint.port() != 0, "IRTT port must be nonzero");
+                    *endpoint
+                }
+                _ => std::net::SocketAddr::new(assignment.target.peer(), 0),
             };
             anyhow::ensure!(
-                endpoints.insert((assignment.stream.peer, assignment.stream.source, port)),
+                endpoints.insert((endpoint, assignment.target.protocol())),
                 "duplicate measurement target"
             );
         }
@@ -65,37 +67,32 @@ impl MeasurementPlan {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionPhase {
-    Establishing,
-    Ready,
-    Failed,
-    Retiring,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamExecution {
+pub struct AppliedTarget {
     pub assignment: MeasurementAssignment,
-    pub phase: ExecutionPhase,
-    pub failures: u64,
-    pub generation: u64,
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppliedState {
     pub revision: u64,
-    pub streams: Vec<StreamExecution>,
+    pub targets: Vec<AppliedTarget>,
     pub rejected_revision: Option<u64>,
 }
 
 impl AppliedState {
-    pub fn active_streams(&self) -> Vec<MeasurementStream> {
-        self.streams
+    pub fn is_active(&self, target: &MeasurementTarget) -> bool {
+        self.targets.iter().any(|s| {
+            &s.assignment.target == target
+                && s.assignment.role == MeasurementRole::Active
+                && s.ready
+        })
+    }
+    pub fn active_targets(&self) -> Vec<MeasurementTarget> {
+        self.targets
             .iter()
-            .filter(|s| {
-                s.assignment.role == MeasurementRole::Active && s.phase == ExecutionPhase::Ready
-            })
-            .map(|s| s.assignment.stream)
+            .filter(|s| s.assignment.role == MeasurementRole::Active && s.ready)
+            .map(|s| s.assignment.target.clone())
             .collect()
     }
 }

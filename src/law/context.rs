@@ -2,21 +2,20 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::{
-    measurement::model::{MeasurementEvent, MeasurementStream},
+    measurement::{model::MeasurementEvent, plan::AppliedState},
     metrics::MetricsSender,
     runtime::{Direction, Runtime, Shaper, TrafficRates},
 };
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, watch};
 
 pub struct LawContext {
     pub measurements: broadcast::Receiver<MeasurementEvent>,
     pub metrics: MetricsSender,
-    pub reselect_trigger: mpsc::Sender<bool>,
     runtime: Arc<Runtime>,
-    pub targets: Arc<RwLock<Vec<MeasurementStream>>>,
+    pub applied: watch::Receiver<AppliedState>,
     pub traffic: watch::Receiver<Option<TrafficRates>>,
 }
 
@@ -24,17 +23,15 @@ impl LawContext {
     pub fn new(
         measurements: broadcast::Receiver<MeasurementEvent>,
         metrics: MetricsSender,
-        reselect_trigger: mpsc::Sender<bool>,
         runtime: Arc<Runtime>,
-        targets: Arc<RwLock<Vec<MeasurementStream>>>,
+        applied: watch::Receiver<AppliedState>,
         traffic: watch::Receiver<Option<TrafficRates>>,
     ) -> Self {
         Self {
             measurements,
             metrics,
-            reselect_trigger,
             runtime,
-            targets,
+            applied,
             traffic,
         }
     }

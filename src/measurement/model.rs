@@ -2,41 +2,115 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::fmt::{self, Display};
-use std::{net::IpAddr, time::Instant};
+use serde::Deserialize;
+use std::str::FromStr;
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
+    time::Instant,
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct MeasurementStreamId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MeasurementSource {
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum MeasurementProtocol {
     IcmpEcho,
-    IcmpTimestamp,
+    IcmpTimestamps,
     Irtt,
 }
 
-impl Display for MeasurementSource {
+impl fmt::Display for MeasurementProtocol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MeasurementSource::IcmpEcho => write!(f, "icmp-echo"),
-            MeasurementSource::IcmpTimestamp => write!(f, "icmp-timestamps"),
-            MeasurementSource::Irtt => write!(f, "irtt"),
+            MeasurementProtocol::IcmpEcho => write!(f, "icmp-echo"),
+            MeasurementProtocol::IcmpTimestamps => write!(f, "icmp-timestamps"),
+            MeasurementProtocol::Irtt => write!(f, "irtt"),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MeasurementStream {
-    pub id: MeasurementStreamId,
-    pub peer: IpAddr,
-    pub source: MeasurementSource,
+impl FromStr for MeasurementProtocol {
+    type Err = ParseMeasurementProtocolError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "icmp-echo" => Ok(MeasurementProtocol::IcmpEcho),
+            "icmp-timestamps" => Ok(MeasurementProtocol::IcmpTimestamps),
+            "irtt" => Ok(MeasurementProtocol::Irtt),
+            _ => Err(ParseMeasurementProtocolError(s.to_owned())),
+        }
+    }
 }
 
-#[allow(dead_code)]
+#[derive(Debug, thiserror::Error)]
+#[error("invalid measurement protocol: {0}")]
+pub struct ParseMeasurementProtocolError(String);
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MeasurementTarget {
+    IcmpEcho(Ipv4Addr),
+    IcmpTimestamps(Ipv4Addr),
+    Irtt {
+        endpoint: SocketAddr,
+        authentication: Option<Arc<str>>,
+    },
+}
+
+impl MeasurementTarget {
+    pub fn peer(&self) -> IpAddr {
+        match self {
+            Self::IcmpEcho(peer) | Self::IcmpTimestamps(peer) => (*peer).into(),
+            Self::Irtt { endpoint, .. } => endpoint.ip(),
+        }
+    }
+
+    pub fn protocol(&self) -> MeasurementProtocol {
+        match self {
+            Self::IcmpEcho(_) => MeasurementProtocol::IcmpEcho,
+            Self::IcmpTimestamps(_) => MeasurementProtocol::IcmpTimestamps,
+            Self::Irtt { .. } => MeasurementProtocol::Irtt,
+        }
+    }
+}
+
+impl fmt::Debug for MeasurementTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Irtt { endpoint, .. } => write!(f, "irtt({endpoint})"),
+            _ => write!(f, "{}({})", self.protocol(), self.peer()),
+        }
+    }
+}
+
+/// Engine assessment of directional continuity, not absolute clock calibration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OneWayClock {
-    Uncalibrated,
-    Calibrated,
+pub enum OneWayStatus {
+    Usable,
+    /// Start new directional history before consuming this observation.
+    ReferenceChanged,
+    /// Raw values remain available for diagnostics; RTT is assessed independently.
+    Unusable(OneWayRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneWayRejection {
+    InvalidRtt,
+    InconsistentTimestamps,
+    Discontinuity,
+    LocalClockStep,
+    OutOfOrder,
+}
+
+impl OneWayRejection {
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::InvalidRtt => "invalid_rtt",
+            Self::InconsistentTimestamps => "inconsistent_timestamps",
+            Self::Discontinuity => "directional_discontinuity",
+            Self::LocalClockStep => "local_clock_step",
+            Self::OutOfOrder => "out_of_order",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -69,7 +143,8 @@ impl SignedDuration {
 pub struct OneWayLatency {
     pub uplink: SignedDuration,
     pub downlink: SignedDuration,
-    pub clock: OneWayClock,
+    /// Finalized by MeasurementEngine before publication.
+    pub status: OneWayStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,10 +154,9 @@ pub enum MeasurementRole {
 }
 
 /// One completed measurement. Latencies belong only to successful replies.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MeasurementEvent {
-    pub stream: MeasurementStream,
-    pub role: MeasurementRole,
+    pub target: MeasurementTarget,
     /// Local monotonic time at which the probe started.
     pub started_at: Instant,
     /// Local receive time for a reply; the producer-reported timeout time for
@@ -102,7 +176,8 @@ pub enum MeasurementOutcome {
 }
 
 impl MeasurementEvent {
-    /// RTT in milliseconds for a reply; timeout detection is never an RTT.
+    /// Usable RTT in milliseconds. Raw protocol values remain in `outcome`.
+    /// Invalid RTTs and losses return None; directional rejection does not affect RTT.
     pub fn rtt_ms(&self) -> Option<f64> {
         match self.outcome {
             MeasurementOutcome::Reply { round_trip, .. } => Some(
@@ -110,20 +185,13 @@ impl MeasurementEvent {
                     .map(SignedDuration::as_secs_f64)
                     .unwrap_or_else(|| {
                         self.completed_at
-                            .duration_since(self.started_at)
-                            .as_secs_f64()
+                            .checked_duration_since(self.started_at)
+                            .map_or(f64::NAN, |d| d.as_secs_f64())
                     })
                     * 1000.0,
-            ),
+            )
+            .filter(|rtt| rtt.is_finite() && *rtt >= 0.0),
             MeasurementOutcome::Loss => None,
         }
     }
-}
-
-/// Protocol completion before the engine attaches its currently applied role.
-pub struct ProbeCompletion {
-    pub stream: MeasurementStream,
-    pub started_at: Instant,
-    pub completed_at: Instant,
-    pub outcome: MeasurementOutcome,
 }

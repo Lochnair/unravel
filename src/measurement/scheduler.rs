@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use super::model::MeasurementStreamId;
+use super::model::MeasurementTarget;
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -45,7 +45,7 @@ fn duration_from_nanos(nanos: u128) -> Duration {
     )
 }
 
-struct ScheduledStream {
+struct ScheduledTarget {
     schedule: ProbeSchedule,
     next: Instant,
     pending: Option<Instant>,
@@ -56,40 +56,41 @@ struct ScheduledStream {
 /// is a lease on one grid slot, not a send. Only socket acceptance commits it.
 pub struct ProbeScheduler {
     epoch: Instant,
-    streams: BTreeMap<MeasurementStreamId, ScheduledStream>,
-    cursor: Option<MeasurementStreamId>,
+    targets: BTreeMap<MeasurementTarget, ScheduledTarget>,
+    cursor: Option<MeasurementTarget>,
 }
 
 impl ProbeScheduler {
     pub fn new(epoch: Instant) -> Self {
         Self {
             epoch,
-            streams: BTreeMap::new(),
+            targets: BTreeMap::new(),
             cursor: None,
         }
     }
 
-    /// Returns streams whose uncommitted protocol preparation must be discarded.
+    /// Returns targets whose uncommitted protocol preparation must be discarded.
     /// The engine validates the complete plan before calling this method.
     pub fn reconcile(
         &mut self,
-        assignments: &[(MeasurementStreamId, ProbeSchedule)],
+        assignments: &[(MeasurementTarget, ProbeSchedule)],
         now: Instant,
-    ) -> Vec<MeasurementStreamId> {
+    ) -> Vec<MeasurementTarget> {
         let mut withdrawn = Vec::new();
-        self.streams.retain(|id, state| {
-            let keep = assignments.iter().any(|(wanted, _)| wanted == id);
+        self.targets.retain(|target, state| {
+            let keep = assignments.iter().any(|(wanted, _)| wanted == target);
             if !keep && state.pending.is_some() {
-                withdrawn.push(*id);
+                withdrawn.push(target.clone());
             }
             keep
         });
-        for &(id, schedule) in assignments {
-            match self.streams.get_mut(&id) {
+        for (target, schedule) in assignments {
+            let schedule = *schedule;
+            match self.targets.get_mut(target) {
                 Some(state) if state.schedule == schedule => {}
                 Some(state) => {
                     if state.pending.take().is_some() {
-                        withdrawn.push(id);
+                        withdrawn.push(target.clone());
                     }
                     let mut next = schedule.next_probe_at(self.epoch, now);
                     if let Some(last) = state.last_committed {
@@ -104,9 +105,9 @@ impl ProbeScheduler {
                     state.next = next;
                 }
                 None => {
-                    self.streams.insert(
-                        id,
-                        ScheduledStream {
+                    self.targets.insert(
+                        target.clone(),
+                        ScheduledTarget {
                             schedule,
                             next: schedule.next_probe_at(self.epoch, now),
                             pending: None,
@@ -119,52 +120,62 @@ impl ProbeScheduler {
         withdrawn
     }
 
-    /// Skips missed grid slots; at most one opportunity survives per stream.
-    /// Coincident deadlines are served in rotating stream order.
+    /// Skips missed grid slots; at most one opportunity survives per target.
+    /// Coincident deadlines are served in rotating target order.
     pub fn opportunities(
         &mut self,
         now: Instant,
-    ) -> (Vec<MeasurementStreamId>, Vec<MeasurementStreamId>) {
+    ) -> (Vec<MeasurementTarget>, Vec<MeasurementTarget>) {
         let mut due = Vec::new();
         let mut withdrawn = Vec::new();
-        for (&id, state) in &mut self.streams {
+        for (target, state) in &mut self.targets {
             if now >= state.next {
                 if state.pending.take().is_some() {
-                    withdrawn.push(id);
+                    withdrawn.push(target.clone());
                 }
                 let next = state.schedule.next_probe_at(self.epoch, now);
                 state.pending = Some(next - state.schedule.period);
                 state.next = next;
             }
             if state.pending.is_some() {
-                due.push(id);
+                due.push(target.clone());
             }
         }
-        if let Some(cursor) = self.cursor {
-            let split = due.partition_point(|id| *id <= cursor);
+        if let Some(cursor) = &self.cursor {
+            let split = due.partition_point(|target| target <= cursor);
             due.rotate_left(split);
         }
-        if let Some(&first) = due.first() {
-            self.cursor = Some(first);
+        if let Some(first) = due.first() {
+            self.cursor = Some(first.clone());
         }
         (due, withdrawn)
     }
 
-    pub fn committed(&mut self, id: MeasurementStreamId, accepted_at: Instant) {
-        if let Some(state) = self.streams.get_mut(&id) {
+    pub fn committed(&mut self, target: &MeasurementTarget, accepted_at: Instant) {
+        if let Some(state) = self.targets.get_mut(target) {
             state.pending = None;
             state.last_committed = Some(accepted_at);
             state.next = state.schedule.next_probe_at(self.epoch, accepted_at);
+            // Normal reactor jitter stays on the grid. If a blocked submission
+            // consumed most of its slot, skip the following deadline instead
+            // of sending a catch-up pair nearly back-to-back. This bound does
+            // not shift the epoch or accumulate delay in subsequent periods.
+            let earliest = accepted_at + state.schedule.period / 2;
+            if state.next < earliest {
+                state.next = state
+                    .schedule
+                    .next_probe_at(self.epoch, earliest - Duration::from_nanos(1));
+            }
         }
     }
 
-    pub fn withdraw(&mut self, id: MeasurementStreamId) {
-        if let Some(state) = self.streams.get_mut(&id) {
+    pub fn withdraw(&mut self, target: &MeasurementTarget) {
+        if let Some(state) = self.targets.get_mut(target) {
             state.pending = None;
         }
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.streams.values().map(|s| s.next).min()
+        self.targets.values().map(|s| s.next).min()
     }
 }

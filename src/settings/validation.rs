@@ -210,11 +210,25 @@ impl ReflectorSettings {
         if self.num_reflectors == 0 {
             report.error("reflectors.num_reflectors", "must be greater than 0");
         }
-
-        if self.peer_reselection_time == 0 {
-            report.error("reflectors.peer_reselection_time", "must be greater than 0");
+        // Switching needs two candidates qualified at once (see the manager's
+        // MIN_SWITCH_CANDIDATES); one slot can replace failed reflectors of the
+        // current class but never change class.
+        if self.num_candidates == 1 && self.num_reflectors >= 2 {
+            report.warning(
+                "reflectors.num_candidates",
+                "a single candidate cannot switch between directional and RTT-only \
+                 measurement; use 0 for a static set or at least 2",
+            );
         }
 
+        if !std::time::Duration::try_from_secs_f64(self.candidate_period).is_ok_and(|period| {
+            !period.is_zero() && std::time::Instant::now().checked_add(period).is_some()
+        }) {
+            report.error(
+                "reflectors.candidate_period",
+                "must be a nonzero representable duration",
+            );
+        }
         if self.files.is_empty() && self.entries.is_empty() && self.bootstrap.is_empty() {
             report.error(
                 "reflectors",
@@ -366,11 +380,14 @@ impl AdvancedSettings {
             );
         }
 
-        validate_greater_than_zero_f64(
-            report,
-            "advanced_settings.tick_interval",
-            self.tick_interval,
-        );
+        if !std::time::Duration::try_from_secs_f64(self.tick_interval).is_ok_and(|period| {
+            !period.is_zero() && std::time::Instant::now().checked_add(period).is_some()
+        }) {
+            report.error(
+                "advanced_settings.tick_interval",
+                "must be a nonzero representable duration",
+            );
+        }
 
         if !(0.0..1.0).contains(&self.low_load_cut_floor) {
             report.error(
