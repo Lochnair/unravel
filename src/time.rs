@@ -4,10 +4,72 @@
 
 use std::{
     marker::PhantomData,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rustix::time::{ClockId, clock_gettime};
+
+/// A discontinuity in local realtime relative to monotonic time.
+/// This says nothing about remote clocks or whether a queue has drained.
+#[derive(Clone, Copy, Debug)]
+pub struct ClockStep {
+    pub detected_at: Instant,
+    /// Positive when realtime advanced relative to monotonic time.
+    pub delta_secs: f64,
+}
+
+pub(crate) const CLOCK_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const CLOCK_STEP_THRESHOLD_SECS: f64 = 0.1;
+const MAX_CLOCK_SAMPLE_SPAN: Duration = Duration::from_millis(5);
+
+/// Bracket realtime with monotonic reads so descheduling cannot look like a step.
+struct ClockPair {
+    at: Instant,
+    realtime: SystemTime,
+}
+
+#[derive(Default)]
+pub(crate) struct ClockTracker {
+    previous: Option<ClockPair>,
+}
+
+impl ClockTracker {
+    pub(crate) fn sample(&mut self) -> Option<ClockStep> {
+        let before = Instant::now();
+        let realtime = SystemTime::now();
+        let after = Instant::now();
+        self.observe(before, realtime, after)
+    }
+
+    fn observe(
+        &mut self,
+        before: Instant,
+        realtime: SystemTime,
+        after: Instant,
+    ) -> Option<ClockStep> {
+        let span = after.duration_since(before);
+        if span > MAX_CLOCK_SAMPLE_SPAN {
+            // Keep the last reliable pair so a real step isn't lost with this read.
+            return None;
+        }
+        let current = ClockPair {
+            at: before + span / 2,
+            realtime,
+        };
+        let previous = self.previous.replace(current)?;
+        let current = self.previous.as_ref().unwrap();
+        let elapsed = match current.realtime.duration_since(previous.realtime) {
+            Ok(elapsed) => elapsed.as_secs_f64(),
+            Err(error) => -error.duration().as_secs_f64(),
+        };
+        let delta_secs = elapsed - current.at.duration_since(previous.at).as_secs_f64();
+        // Compare adjacent reliable samples, rather than accumulating slow slew.
+        (delta_secs.abs() >= CLOCK_STEP_THRESHOLD_SECS).then_some(ClockStep {
+            detected_at: after,
+            delta_secs,
+        })
+    }
+}
 
 pub trait Clock {
     const ID: ClockId;

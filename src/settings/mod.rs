@@ -2,10 +2,11 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::measurement::model::MeasurementProtocol;
 use config::{Config, ConfigError, Environment};
 use log::Level;
 use serde::{Deserialize, Deserializer, de};
-use std::fmt::{self, Display};
+use std::fmt::Display;
 use std::str::FromStr;
 use uci_derive::{UciConfig, UciSection};
 
@@ -99,39 +100,6 @@ where
     deserializer.deserialize_any(FlexiBoolVisitor)
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "kebab-case")]
-pub enum ReflectorProtocol {
-    IcmpEcho = 1,
-    IcmpTimestamps,
-    Irtt,
-}
-
-impl Display for ReflectorProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ReflectorProtocol::IcmpEcho => write!(f, "icmp-echo"),
-            ReflectorProtocol::IcmpTimestamps => write!(f, "icmp-timestamps"),
-            ReflectorProtocol::Irtt => write!(f, "irtt"),
-        }
-    }
-}
-
-impl FromStr for ReflectorProtocol {
-    type Err = ConfigError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "icmp-echo" => Ok(ReflectorProtocol::IcmpEcho),
-            "icmp-timestamps" => Ok(ReflectorProtocol::IcmpTimestamps),
-            "irtt" => Ok(ReflectorProtocol::Irtt),
-            _ => Err(ConfigError::Message(format!(
-                "invalid measurement type: {s}"
-            ))),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum ObservabilityProtocol {
     Udp,
@@ -156,7 +124,7 @@ impl FromStr for ObservabilityProtocol {
 pub(crate) struct ReflectorDefinition {
     pub(crate) host: String,
     pub(crate) country: Option<String>,
-    pub(crate) protocols: Vec<ReflectorProtocol>,
+    pub(crate) protocols: Vec<MeasurementProtocol>,
     pub(crate) irtt_port: Option<u16>,
     #[allow(dead_code)]
     pub(crate) irtt_hmac: Option<String>,
@@ -296,7 +264,8 @@ pub(crate) struct ReflectorSettings {
     pub(crate) bootstrap: Vec<ReflectorDefinition>,
 
     pub(crate) num_reflectors: u8,
-    pub(crate) peer_reselection_time: u64,
+    pub(crate) num_candidates: usize,
+    pub(crate) candidate_period: f64,
 }
 
 impl ReflectorSettings {
@@ -311,8 +280,9 @@ impl ReflectorSettings {
                     .split(['|', ';'])
                     .map(str::trim)
                     .filter(|protocol| !protocol.is_empty())
-                    .map(ReflectorProtocol::from_str)
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .map(MeasurementProtocol::from_str)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| ConfigError::Message(error.to_string()))?;
                 if protocols.is_empty() {
                     return Err(ConfigError::Message(format!(
                         "reflector row in {path} has no protocols"
@@ -338,8 +308,8 @@ impl Default for ReflectorSettings {
             host: host.to_owned(),
             country: None,
             protocols: vec![
-                ReflectorProtocol::IcmpEcho,
-                ReflectorProtocol::IcmpTimestamps,
+                MeasurementProtocol::IcmpEcho,
+                MeasurementProtocol::IcmpTimestamps,
             ],
             irtt_port: None,
             irtt_hmac: None,
@@ -348,7 +318,7 @@ impl Default for ReflectorSettings {
         let irtt = |host: &str, country: Option<&str>| ReflectorDefinition {
             host: host.to_owned(),
             country: country.map(str::to_owned),
-            protocols: vec![ReflectorProtocol::Irtt],
+            protocols: vec![MeasurementProtocol::Irtt],
             irtt_port: Some(2112),
             irtt_hmac: None,
         };
@@ -358,20 +328,14 @@ impl Default for ReflectorSettings {
             countries: Vec::new(),
             entries: Vec::new(),
             bootstrap: vec![
-                icmp("9.9.9.9"),
-                icmp("8.238.120.14"),
-                icmp("74.82.42.42"),
-                icmp("194.242.2.2"),
-                icmp("208.67.222.222"),
-                icmp("94.140.14.14"),
                 irtt("global.irtt.lochnair.net", None),
-                irtt("uk-cov1.irtt.lochnair.net", Some("GB")),
-                irtt("uk-cov2.irtt.lochnair.net", Some("GB")),
-                irtt("de-fra.irtt.lochnair.net", Some("DE")),
-                irtt("nl-ams1.irtt.lochnair.net", Some("NL")),
+                icmp("9.9.9.9"),
+                icmp("94.140.14.14"),
+                icmp("74.82.42.42"),
             ],
             num_reflectors: 5,
-            peer_reselection_time: 15,
+            num_candidates: 3,
+            candidate_period: 3.0,
         }
     }
 }
@@ -444,8 +408,6 @@ pub(crate) struct AdvancedSettings {
     pub(crate) download_delay_ms: f64,
     pub(crate) high_load_level: f64,
     pub(crate) min_change_interval: f64,
-    #[serde(deserialize_with = "deserialize_from_str")]
-    pub(crate) measurement_type: ReflectorProtocol,
     pub(crate) speed_hist_size: u32,
     pub(crate) tick_interval: f64,
     pub(crate) upload_delay_ms: f64,
@@ -474,7 +436,6 @@ impl Default for AdvancedSettings {
             download_delay_ms: 15.0,
             high_load_level: 0.8,
             min_change_interval: 0.5,
-            measurement_type: ReflectorProtocol::IcmpTimestamps,
             speed_hist_size: 100,
             tick_interval: 0.5,
             upload_delay_ms: 15.0,
