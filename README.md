@@ -4,7 +4,7 @@ unRAVEL adjusts CAKE traffic shaping rates to keep latency under control on conn
 
 If your internet connection changes speed throughout the day, finding a good bandwidth setting for CAKE can be a bit of a pain. Set it too high and latency goes up when the connection slows down. Set it too low and you're giving up bandwidth when there's more available. unRAVEL watches traffic load and latency measurements from remote hosts (reflectors), then adjusts upload and download rates as conditions change.
 
-This project started as a Rust port of [sqm-autorate](https://github.com/sqm-autorate/sqm-autorate), the original Lua project. The runtime separates measurement from rate control, with ICMP and IRTT measurement engines and a control law based on sqm-autorate. You don't need the Lua program installed, and you'll need to configure this version separately if you're moving over from it.
+This project started as a Rust port of [sqm-autorate](https://github.com/sqm-autorate/sqm-autorate), the original Lua project.
 
 ## Before you start
 
@@ -165,23 +165,13 @@ Ctrl+C or SIGTERM stops the program and attempts to restore the enabled shapers 
 
 ## Reflectors and measurement protocols
 
-By default, the program uses ICMP timestamps and selects five reflectors, or fewer if there aren't enough candidates. Bootstrap hosts get priority at startup. When there are more candidates than needed, it periodically tries other hosts from the combined bootstrap and configured inventory, temporarily probing extra hosts during selection.
+unRAVEL selects reflectors and protocols automatically, preferring IRTT and ICMP timestamps so it can measure upload and download delay separately. If there aren't enough healthy directional reflectors, it can fall back to ICMP echo and switch back when they recover. Echo uses round-trip measurements, so it can't separate upload and download delay.
 
-If timestamps are blocked on your network, select `icmp-echo`. Echo uses round-trip measurements, so it can't separate upload and download delay the way timestamps or IRTT can. You can also select `irtt` to use IRTT servers. Set the protocol in UCI:
+The built-in bootstrap hosts provide the initial set. After that, the reflector manager tries hosts from the combined bootstrap and configured inventory, replacing failed reflectors and looking for better ones. By default it uses up to five active reflectors and probes three candidates in the background, each every three seconds. Only active reflectors feed rate control.
 
-```uci
-config advanced_settings
-    option measurement_type 'irtt'
-```
+You can change these with `num_reflectors`, `num_candidates` and `candidate_period` under `reflectors` (`config reflectors` in UCI). `candidate_period` is in seconds. Set `num_candidates` to `0` to keep the startup set fixed; this also disables automatic fallback. Otherwise, use at least two candidate slots so protocol switching can work with multiple active reflectors.
 
-Or in TOML:
-
-```toml
-[advanced_settings]
-measurement_type = "irtt"
-```
-
-The choices are `icmp-timestamps` (default), `icmp-echo` and `irtt`. There's no automatic switch to echo if timestamps don't work. ICMP measurements use IPv4; IRTT supports IPv4 and IPv6, and its client is built into the default binary.
+Reflector entries declare their supported protocols: `icmp-timestamps`, `icmp-echo` or `irtt`. ICMP measurements use IPv4; IRTT supports IPv4 and IPv6, and its client is built into the default binary.
 
 You can add your own reflectors with `[[reflectors.entries]]` in TOML or repeated `config reflector` sections in UCI:
 
@@ -194,6 +184,8 @@ config reflector
 This adds to the CSV inventory. To skip file loading and use the built-in bootstrap hosts plus any inline entries, use `[reflectors]` with `files = []` in TOML, or a `config reflectors` section with `option files 'none'` in UCI. UCI drops empty string options, so `option files ''` won't disable file loading.
 
 To load a different CSV file in UCI, use `list files '/path/to/reflectors.csv'` under `config reflectors`. For IRTT entries, absent or blank `irtt_hmac` values use unauthenticated sessions.
+
+The measurement engine checks directional timestamps before rate control uses them. If the router's clock jumps, the controller drops to your configured minimum rates for five seconds while queues drain, then rebuilds its delay baselines. A reflector timing reference change only resets that reflector's baseline.
 
 ## Logs and statistics
 
