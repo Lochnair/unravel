@@ -27,7 +27,7 @@ use crate::{
 const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
 const RECENT_HALF_LIFE_SECS: f64 = 0.4;
 const STALE_AFTER: Duration = Duration::from_secs(30);
-// Give outstanding queues a chance to drain before learning a new clock reference.
+// Let queues drain before rebuilding all baselines after a local clock step.
 const MEASUREMENT_SETTLE_TIME: Duration = Duration::from_secs(5);
 
 // With history_file set, the recorded safe rates are saved there so a
@@ -255,7 +255,7 @@ impl Law for SqmaLaw {
                     if let Some(step) = step {
                         warn!("SQMA resetting after local clock step of {:.3}s detected {:?} ago",
                             step.delta_secs, step.detected_at.elapsed());
-                        self.recover_measurements(&ctx, "local_clock_step", None)?;
+                        self.recover_after_clock_step(&ctx)?;
                     }
                 }
 
@@ -280,7 +280,6 @@ impl Law for SqmaLaw {
                         Ok(event) => self.observe(event, &ctx)?,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                             warn!("Control law missed {count} measurement events");
-                            self.recover_measurements(&ctx, "measurement_lag", None)?;
                             ctx.metrics.send(Metric::Event {
                                 name: "measurement_lag",
                                 reason: "control_law",
@@ -391,12 +390,7 @@ impl SqmaLaw {
         }
     }
 
-    fn recover_measurements(
-        &mut self,
-        ctx: &LawContext,
-        reason: &'static str,
-        reflector: Option<std::net::IpAddr>,
-    ) -> anyhow::Result<()> {
+    fn recover_after_clock_step(&mut self, ctx: &LawContext) -> anyhow::Result<()> {
         self.reflectors.clear();
         for (direction, state) in [
             (Direction::Download, self.download.as_mut()),
@@ -413,8 +407,8 @@ impl SqmaLaw {
         self.measurements_after = Some(Instant::now() + MEASUREMENT_SETTLE_TIME);
         ctx.metrics.send(Metric::Event {
             name: "measurement_recovery",
-            reason,
-            reflector,
+            reason: "local_clock_step",
+            reflector: None,
             tags: &[],
         });
         Ok(())
@@ -711,16 +705,19 @@ impl SqmaLaw {
             }
             let changed = one_way.is_some_and(|o| o.status == OneWayStatus::ReferenceChanged);
             if changed || state.mode != mode {
-                self.recover_measurements(
-                    ctx,
-                    if changed {
+                // Rebuild only this target from its accepted new reference,
+                // as for a newly active target. Other reflectors remain usable.
+                self.reflectors.remove(&event.target);
+                ctx.metrics.send(Metric::Event {
+                    name: "measurement_recovery",
+                    reason: if changed {
                         "directional_reference_changed"
                     } else {
                         "measurement_mode_changed"
                     },
-                    Some(event.target.peer()),
-                )?;
-                return Ok(());
+                    reflector: Some(event.target.peer()),
+                    tags: &[],
+                });
             }
         }
         let sample = EwmaStats::from_reply(rtt_ms, one_way);
