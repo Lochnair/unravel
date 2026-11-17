@@ -326,7 +326,9 @@ impl UciSource {
                 let destination_key = if let Some(mapping) = repeated_option {
                     mapping.config_field.to_owned()
                 } else if repeated_mapping.is_some() {
-                    option_name.to_owned()
+                    return Err(SourceError::Message(format!(
+                        "UCI option {uci_key} is not recognised"
+                    )));
                 } else if let Some(mapping) = singleton {
                     if let Some(option) = mapping
                         .options
