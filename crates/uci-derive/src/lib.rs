@@ -15,6 +15,19 @@ use syn::{Data, DeriveInput, Field, Fields, FieldsNamed, LitStr, Token, parse_ma
 /// Rust field name -> UCI option name
 /// Rust field name -> config-rs field name
 /// ```
+///
+/// `#[uci(rename = "...")]` on a field changes the UCI option name only.
+///
+/// Container attributes:
+///
+/// ```ignore
+/// // Options read by something else (the init script, LuCI); repeatable.
+/// #[uci(external = "use_syslog")]
+///
+/// // The named field's value selects a sub-table, and every option the
+/// // schema does not know is passed through to it.
+/// #[uci(passthrough_key = "name")]
+/// ```
 #[proc_macro_derive(UciSection, attributes(uci))]
 pub fn derive_uci_section(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -56,10 +69,13 @@ fn expand_uci_section(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
     let struct_name = &input.ident;
     let fields = require_named_fields(input)?;
 
+    let container = parse_section_container(input)?;
     let mut mappings = Vec::with_capacity(fields.named.len());
+    let mut field_names = Vec::with_capacity(fields.named.len());
 
     for field in &fields.named {
-        if parse_skip(field)? {
+        let attributes = parse_field(field)?;
+        if attributes.skip {
             continue;
         }
 
@@ -69,15 +85,31 @@ fn expand_uci_section(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
             .expect("named fields always have identifiers");
 
         let field_name = field_ident.unraw().to_string();
-        let field_name = LitStr::new(&field_name, field_ident.span());
+        let uci_option = attributes
+            .rename
+            .unwrap_or_else(|| LitStr::new(&field_name, field_ident.span()));
+        let config_field = LitStr::new(&field_name, field_ident.span());
+        field_names.push(field_name);
 
         mappings.push(quote! {
             crate::settings::uci_schema::UciOptionMapping {
-                uci_option: #field_name,
-                config_field: #field_name,
+                uci_option: #uci_option,
+                config_field: #config_field,
             }
         });
     }
+
+    let external = &container.external;
+    let passthrough_key = match &container.passthrough_key {
+        Some(key) if field_names.contains(&key.value()) => quote! { Some(#key) },
+        Some(key) => {
+            return Err(syn::Error::new(
+                key.span(),
+                "`passthrough_key` must name a field of this struct that is not skipped",
+            ));
+        }
+        None => quote! { None },
+    };
 
     let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
 
@@ -94,12 +126,24 @@ fn expand_uci_section(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
             ] = &[
                 #(#mappings),*
             ];
+
+            const UCI_EXTERNAL_OPTIONS: &'static [&'static str] = &[
+                #(#external),*
+            ];
+
+            const UCI_PASSTHROUGH_KEY: Option<&'static str> = #passthrough_key;
         }
     })
 }
 
-fn parse_skip(field: &Field) -> syn::Result<bool> {
-    let mut skip = false;
+#[derive(Default)]
+struct FieldAttributes {
+    skip: bool,
+    rename: Option<LitStr>,
+}
+
+fn parse_field(field: &Field) -> syn::Result<FieldAttributes> {
+    let mut attributes = FieldAttributes::default();
 
     for attribute in &field.attrs {
         if !attribute.path().is_ident("uci") {
@@ -107,18 +151,84 @@ fn parse_skip(field: &Field) -> syn::Result<bool> {
         }
 
         attribute.parse_nested_meta(|meta| {
-            if !meta.path.is_ident("skip") {
-                return Err(meta.error("expected `skip`"));
+            if meta.path.is_ident("skip") {
+                if attributes.skip {
+                    return Err(meta.error("duplicate `skip` attribute"));
+                }
+                attributes.skip = true;
+                return Ok(());
             }
-            if skip {
-                return Err(meta.error("duplicate `skip` attribute"));
+
+            if meta.path.is_ident("rename") {
+                if attributes.rename.is_some() {
+                    return Err(meta.error("duplicate `rename` attribute"));
+                }
+                attributes.rename = Some(parse_non_empty(&meta, "rename")?);
+                return Ok(());
             }
-            skip = true;
-            Ok(())
+
+            Err(meta.error("expected `skip` or `rename = \"...\"`"))
         })?;
     }
 
-    Ok(skip)
+    if attributes.skip && attributes.rename.is_some() {
+        return Err(syn::Error::new_spanned(
+            field,
+            "`skip` and `rename` cannot be combined",
+        ));
+    }
+
+    Ok(attributes)
+}
+
+#[derive(Default)]
+struct SectionContainerAttributes {
+    external: Vec<LitStr>,
+    passthrough_key: Option<LitStr>,
+}
+
+fn parse_section_container(input: &DeriveInput) -> syn::Result<SectionContainerAttributes> {
+    let mut attributes = SectionContainerAttributes::default();
+
+    for attribute in &input.attrs {
+        if !attribute.path().is_ident("uci") {
+            continue;
+        }
+
+        attribute.parse_nested_meta(|meta| {
+            if meta.path.is_ident("external") {
+                attributes
+                    .external
+                    .push(parse_non_empty(&meta, "external")?);
+                return Ok(());
+            }
+
+            if meta.path.is_ident("passthrough_key") {
+                if attributes.passthrough_key.is_some() {
+                    return Err(meta.error("duplicate `passthrough_key` attribute"));
+                }
+                attributes.passthrough_key = Some(parse_non_empty(&meta, "passthrough_key")?);
+                return Ok(());
+            }
+
+            Err(meta.error("expected `external = \"...\"` or `passthrough_key = \"...\"`"))
+        })?;
+    }
+
+    Ok(attributes)
+}
+
+fn parse_non_empty(meta: &syn::meta::ParseNestedMeta<'_>, name: &str) -> syn::Result<LitStr> {
+    let value: LitStr = meta.value()?.parse()?;
+
+    if value.value().is_empty() {
+        return Err(syn::Error::new(
+            value.span(),
+            format!("`{name}` cannot be empty"),
+        ));
+    }
+
+    Ok(value)
 }
 
 fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
@@ -149,6 +259,14 @@ fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                     #field_type as
                     crate::settings::uci_schema::UciSectionSchema
                 >::UCI_OPTIONS,
+                external: <
+                    #field_type as
+                    crate::settings::uci_schema::UciSectionSchema
+                >::UCI_EXTERNAL_OPTIONS,
+                passthrough_key: <
+                    #field_type as
+                    crate::settings::uci_schema::UciSectionSchema
+                >::UCI_PASSTHROUGH_KEY,
             }
         });
     }

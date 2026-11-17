@@ -17,6 +17,15 @@ pub(crate) struct UciSectionMapping {
     pub(crate) config_section: &'static str,
 
     pub(crate) options: &'static [UciOptionMapping],
+
+    /// Options in this section that something other than unRAVEL reads, such
+    /// as the init script. They are skipped without a warning.
+    pub(crate) external: &'static [&'static str],
+
+    /// Config field whose value names a sub-table. When set, every option the
+    /// schema does not know is passed through to
+    /// `<config_section>.<value>.<option>`.
+    pub(crate) passthrough_key: Option<&'static str>,
 }
 
 #[cfg(all(feature = "uci", unix))]
@@ -33,6 +42,8 @@ pub(crate) struct UciRepeatedSectionMapping {
 
 pub(crate) trait UciSectionSchema {
     const UCI_OPTIONS: &'static [UciOptionMapping];
+    const UCI_EXTERNAL_OPTIONS: &'static [&'static str];
+    const UCI_PASSTHROUGH_KEY: Option<&'static str>;
 }
 
 pub(crate) trait UciConfigSchema {

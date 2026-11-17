@@ -170,9 +170,13 @@ pub(crate) struct Settings {
     pub(crate) advanced_settings: AdvancedSettings,
 }
 
+// In UCI the law is chosen with `option type`, and the rest of the `law`
+// section is that law's own configuration.
 #[derive(Clone, Debug, Deserialize, UciSection)]
 #[serde(default)]
+#[uci(passthrough_key = "name")]
 pub(crate) struct LawSettings {
+    #[uci(rename = "type")]
     pub(crate) name: String,
 
     /// The selected law's own table, `law.<name>`, left for the law to read.
@@ -377,8 +381,11 @@ impl Default for ReflectorSettings {
     }
 }
 
+// `use_syslog` is read by the OpenWrt init script, which uses it to decide
+// whether procd sends stdout and stderr to syslog.
 #[derive(Clone, Debug, Deserialize, UciSection)]
 #[serde(default)]
+#[uci(external = "use_syslog")]
 pub(crate) struct OutputSettings {
     #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) log_level: Level,

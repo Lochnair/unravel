@@ -131,30 +131,53 @@ impl UciSource {
         }
     }
 
-    fn mapped_config_key(
-        &self,
-        selector: &SectionSelector<'_>,
-        uci_option: &str,
-    ) -> Option<String> {
-        let section_type = match selector {
-            SectionSelector::Anonymous {
-                section_type,
-                index,
-            } if *index == 0 => *section_type,
+    /// Without any schema the source maps every option to
+    /// `<package>.<section>.<option>` and has nothing to check options against.
+    fn has_schema(&self) -> bool {
+        !self.schema.is_empty() || !self.repeated_schema.is_empty()
+    }
 
-            SectionSelector::Anonymous { .. } | SectionSelector::Named(_) => return None,
+    /// Value of the option that selects a passthrough section's sub-table.
+    fn passthrough_table(
+        mapping: &UciSectionMapping,
+        key_field: &str,
+        entries: &[(String, UciValue)],
+        section: &str,
+    ) -> Result<Option<String>, SourceError> {
+        let key_option = mapping
+            .options
+            .iter()
+            .find(|option| option.config_field == key_field)
+            .map_or(key_field, |option| option.uci_option);
+
+        let Some((_, value)) = entries.iter().find(|(name, _)| name == key_option) else {
+            return Ok(None);
         };
 
-        self.schema
-            .iter()
-            .filter(|section| section.uci_section == section_type)
-            .find_map(|section| {
-                section
-                    .options
-                    .iter()
-                    .find(|option| option.uci_option == uci_option)
-                    .map(|option| format!("{}.{}", section.config_section, option.config_field,))
-            })
+        let table = match value {
+            UciValue::String(table) => table,
+            UciValue::List(_) => {
+                return Err(SourceError::Message(format!(
+                    "UCI option {section}.{key_option} must be a single value, not a list"
+                )));
+            }
+        };
+
+        let valid = !table.is_empty()
+            && table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && mapping
+                .options
+                .iter()
+                .all(|option| option.config_field != table);
+        if !valid {
+            return Err(SourceError::Message(format!(
+                "UCI option {section}.{key_option} has unusable value {table:?}: \
+                 expected letters, digits and underscores, and not the name of an \
+                 option of this section"
+            )));
+        }
+
+        Ok(Some(table.clone()))
     }
 
     fn collect_package(
@@ -185,25 +208,69 @@ impl UciSource {
                     section.type_()
                 ))
             })?;
+            let section_key = format!("{package_name}.{selector}");
+
+            let mut singleton = None;
+            if repeated_mapping.is_none() && self.has_schema() {
+                let Some(mapping) = self
+                    .schema
+                    .iter()
+                    .find(|mapping| mapping.uci_section == section.type_())
+                else {
+                    warn(format_args!(
+                        "UCI section {section_key} has unrecognised type {:?} and is ignored",
+                        section.type_()
+                    ));
+                    continue;
+                };
+
+                if !matches!(selector, SectionSelector::Anonymous { index: 0, .. }) {
+                    warn(format_args!(
+                        "UCI section {section_key} is ignored: only the first anonymous \
+                         {:?} section is used",
+                        section.type_()
+                    ));
+                    continue;
+                }
+
+                singleton = Some(mapping);
+            }
 
             let options = section.options().map_err(|e| {
                 SourceError::Message(format!(
                     "failed to retrieve options from UCI section \
-                     {package_name}.{selector}: {e}"
+                     {section_key}: {e}"
                 ))
             })?;
 
+            let mut entries = Vec::new();
             for option in options {
-                let option_name = option.name();
+                let option_name = option.name().to_owned();
+                let Some(value) = option.get().map_err(|e| {
+                    SourceError::Message(format!(
+                        "failed to retrieve UCI option \
+                         {section_key}.{option_name}: {e}"
+                    ))
+                })?
+                else {
+                    continue;
+                };
+                entries.push((option_name, value));
+            }
 
-                let uci_relative_key = format!("{selector}.{option_name}");
+            let passthrough_table = match singleton {
+                Some(mapping) => match mapping.passthrough_key {
+                    Some(key_field) => {
+                        Self::passthrough_table(mapping, key_field, &entries, &section_key)?
+                    }
+                    None => None,
+                },
+                None => None,
+            };
 
-                let config_relative_key =
-                    format!("{}.{option_name}", Self::config_selector(&selector),);
-
-                let uci_key = format!("{package_name}.{uci_relative_key}");
-
-                let source_key = format!("{package_name}.{config_relative_key}");
+            for (option_name, value) in entries {
+                let option_name = option_name.as_str();
+                let uci_key = format!("{section_key}.{option_name}");
 
                 let repeated_option = repeated_mapping.and_then(|mapping| {
                     mapping
@@ -216,19 +283,35 @@ impl UciSource {
                     mapping.config_field.to_owned()
                 } else if repeated_mapping.is_some() {
                     option_name.to_owned()
+                } else if let Some(mapping) = singleton {
+                    if let Some(option) = mapping
+                        .options
+                        .iter()
+                        .find(|option| option.uci_option == option_name)
+                    {
+                        format!("{}.{}", mapping.config_section, option.config_field)
+                    } else if mapping.external.contains(&option_name) {
+                        continue;
+                    } else if mapping.passthrough_key.is_some() {
+                        let Some(table) = &passthrough_table else {
+                            return Err(SourceError::Message(format!(
+                                "UCI option {uci_key} cannot be placed: section \
+                                 {section_key} does not say which {} it configures",
+                                mapping.config_section
+                            )));
+                        };
+                        format!("{}.{table}.{option_name}", mapping.config_section)
+                    } else {
+                        warn(format_args!(
+                            "UCI option {uci_key} is not recognised and is ignored"
+                        ));
+                        continue;
+                    }
                 } else {
-                    self.mapped_config_key(&selector, option_name)
-                        .unwrap_or(source_key)
-                };
-
-                let Some(value) = option.get().map_err(|e| {
-                    SourceError::Message(format!(
-                        "failed to retrieve UCI option \
-                         {uci_key}: {e}"
-                    ))
-                })?
-                else {
-                    continue;
+                    format!(
+                        "{package_name}.{}.{option_name}",
+                        Self::config_selector(&selector)
+                    )
                 };
 
                 let origin = format!("UCI option {uci_key}");
@@ -271,6 +354,11 @@ impl UciSource {
 
         Ok(())
     }
+}
+
+/// Reported before the log level is known, like other configuration warnings.
+fn warn(args: std::fmt::Arguments<'_>) {
+    crate::log::message(format_args!("warning: {args}"));
 }
 
 impl Source for UciSource {
