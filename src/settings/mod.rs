@@ -142,6 +142,10 @@ struct ReflectorRow {
 #[derive(Clone, Debug, Deserialize, UciConfig)]
 #[uci(package = "unravel")]
 pub(crate) struct Settings {
+    #[serde(default)]
+    #[uci(section)]
+    pub(crate) law: LawSettings,
+
     #[uci(section)]
     pub(crate) network: NetworkSettings,
 
@@ -160,6 +164,20 @@ pub(crate) struct Settings {
     #[serde(default)]
     #[uci(section)]
     pub(crate) advanced_settings: AdvancedSettings,
+}
+
+#[derive(Clone, Debug, Deserialize, UciSection)]
+#[serde(default)]
+pub(crate) struct LawSettings {
+    pub(crate) name: String,
+}
+
+impl Default for LawSettings {
+    fn default() -> Self {
+        Self {
+            name: "sqma".to_owned(),
+        }
+    }
 }
 
 impl Settings {

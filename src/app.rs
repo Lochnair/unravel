@@ -7,7 +7,7 @@
 
 use crate::diagnostics::CsvWriter;
 use crate::error::ChannelClosed;
-use crate::law::{Law, LawContext, SqmaLaw};
+use crate::law::{self, Law, LawContext};
 use crate::measurement::{
     engine::MeasurementEngine,
     plan::{AppliedState, MeasurementPlan},
@@ -34,7 +34,7 @@ struct PreparedWorkers {
     engine: MeasurementEngine,
     engine_done: watch::Sender<bool>,
     manager: ReflectorManager,
-    law: Box<SqmaLaw>,
+    law: Box<dyn Law>,
     law_ctx: LawContext,
 }
 
@@ -105,7 +105,7 @@ impl App {
         };
 
         let (diagnostics, csv_writer) = CsvWriter::new(&settings.output).await?.unzip();
-        let law = Box::new(SqmaLaw::new(settings.clone(), diagnostics));
+        let law = law::build(&settings, diagnostics)?;
         let law_ctx = LawContext::new(
             measurement_rx,
             metrics.clone(),
