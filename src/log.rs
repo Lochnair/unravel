@@ -23,6 +23,9 @@ enum Message {
 
 struct SimpleLogger {
     sender: mpsc::SyncSender<Message>,
+    /// `[name] ` for a named instance, so instances sharing syslog can be
+    /// told apart. Empty for the unnamed instance.
+    prefix: String,
 }
 
 impl log::Log for SimpleLogger {
@@ -53,7 +56,8 @@ impl log::Log for SimpleLogger {
 pub(crate) fn message(args: fmt::Arguments<'_>) {
     if let Some(logger) = LOGGER.get() {
         // Full and disconnected queues both discard the incoming message.
-        let _ = logger.sender.try_send(Message::Line(format!("{args}\n")));
+        let line = format!("{}{args}\n", logger.prefix);
+        let _ = logger.sender.try_send(Message::Line(line));
     }
 }
 
@@ -63,7 +67,8 @@ pub(crate) fn finish(error: Option<&anyhow::Error>) {
     let deadline = Instant::now() + Duration::from_secs(2);
     let Some(logger) = LOGGER.get() else { return };
     let (done, completion) = mpsc::sync_channel(1);
-    let mut message = Message::Finish(error.map(|error| format!("Error: {error:#}\n")), done);
+    let error = error.map(|error| format!("{}Error: {error:#}\n", logger.prefix));
+    let mut message = Message::Finish(error, done);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -83,7 +88,7 @@ pub(crate) fn finish(error: Option<&anyhow::Error>) {
     let _ = completion.recv_timeout(deadline.saturating_duration_since(Instant::now()));
 }
 
-pub(crate) fn init() -> anyhow::Result<()> {
+pub(crate) fn init(instance: Option<&str>) -> anyhow::Result<()> {
     let (sender, receiver) = mpsc::sync_channel::<Message>(1024);
     let worker = thread::Builder::new()
         .name("unravel-logger".to_owned())
@@ -115,7 +120,10 @@ pub(crate) fn init() -> anyhow::Result<()> {
     // finish() may time out; the worker is never joined.
     drop(worker);
 
-    log::set_logger(LOGGER.get_or_init(|| SimpleLogger { sender }))?;
+    let prefix = instance
+        .map(|name| format!("[{name}] "))
+        .unwrap_or_default();
+    log::set_logger(LOGGER.get_or_init(|| SimpleLogger { sender, prefix }))?;
     log::set_max_level(LevelFilter::Error);
     Ok(())
 }

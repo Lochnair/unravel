@@ -31,15 +31,15 @@ const DEFAULT_INSTANCE: &str = "default";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
-    // Initialization errors return before any shaper can be modified.
-    log::init()?;
+    // Initialization errors return before any shaper can be modified. The
+    // arguments are parsed first so every log line carries the instance; a
+    // parse error is reported once the logger is up.
+    let instance = parse_args(std::env::args().skip(1));
+    log::init(instance.as_ref().ok().and_then(Option::as_deref))?;
     log::message(format_args!("Starting unRAVEL version {}", VERSION));
 
     let result = async {
-        let instance = parse_args(std::env::args().skip(1))?;
-        if let Some(name) = &instance {
-            log::message(format_args!("Instance {name}"));
-        }
+        let instance = instance?;
         let settings = Settings::load(instance.as_deref())?;
         ::log::set_max_level(settings.output.log_level.to_level_filter());
         warn_platform_limitations();
