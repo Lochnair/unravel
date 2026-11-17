@@ -246,7 +246,7 @@ impl App {
         )
         .await;
         let cleanup = shutdown(
-            &runtime,
+            runtime,
             workers,
             sinks,
             metrics,
@@ -285,7 +285,7 @@ impl PreparedWorkers {
 }
 
 async fn shutdown(
-    runtime: &Runtime,
+    runtime: Arc<Runtime>,
     mut workers: JoinSet<TaskResult>,
     mut sinks: JoinSet<TaskResult>,
     metrics: MetricsSender,
@@ -310,7 +310,10 @@ async fn shutdown(
 
     let reason = if signal_teardown { "signal" } else { "error" };
     metrics.send(Metric::event("stopping", reason, None));
+    // The exporter stops once every sender is gone. The workers' senders went
+    // with their tasks; the runtime's goes with the last Arc, held here.
     drop(metrics);
+    drop(runtime);
     let drained = tokio::time::timeout(SINK_DRAIN_TIMEOUT, async {
         while let Some(completed) = sinks.join_next().await {
             if let Err(error) = shutdown_completion(completed, false) {
