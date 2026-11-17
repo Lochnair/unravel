@@ -18,6 +18,10 @@ use syn::{Data, DeriveInput, Field, Fields, FieldsNamed, LitStr, Token, parse_ma
 ///
 /// `#[uci(rename = "...")]` on a field changes the UCI option name only.
 ///
+/// `#[uci(sections = "...")]` on a `Vec<T>` field collects every section of
+/// that type, named or anonymous, into the field. `T` must derive
+/// `UciSection` too.
+///
 /// Container attributes:
 ///
 /// ```ignore
@@ -79,6 +83,7 @@ fn expand_uci_section(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 
     let container = parse_section_container(input)?;
     let mut mappings = Vec::with_capacity(fields.named.len());
+    let mut repeated = Vec::new();
     let mut field_names = Vec::with_capacity(fields.named.len());
 
     for field in &fields.named {
@@ -93,6 +98,25 @@ fn expand_uci_section(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
             .expect("named fields always have identifiers");
 
         let field_name = field_ident.unraw().to_string();
+
+        if let Some(uci_section) = attributes.sections {
+            let element = vec_element(&field.ty).ok_or_else(|| {
+                syn::Error::new_spanned(&field.ty, "`sections` requires a `Vec<T>` field")
+            })?;
+            let config_field = LitStr::new(&field_name, field_ident.span());
+            repeated.push(quote! {
+                crate::settings::uci_schema::UciRepeatedSectionMapping {
+                    uci_section: #uci_section,
+                    field: #config_field,
+                    options: <
+                        #element as
+                        crate::settings::uci_schema::UciSectionSchema
+                    >::UCI_OPTIONS,
+                }
+            });
+            continue;
+        }
+
         let uci_option = attributes
             .rename
             .unwrap_or_else(|| LitStr::new(&field_name, field_ident.span()));
@@ -140,6 +164,12 @@ fn expand_uci_section(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
             ];
 
             const UCI_PASSTHROUGH_KEY: Option<&'static str> = #passthrough_key;
+
+            const UCI_REPEATED: &'static [
+                crate::settings::uci_schema::UciRepeatedSectionMapping
+            ] = &[
+                #(#repeated),*
+            ];
         }
     })
 }
@@ -148,6 +178,25 @@ fn expand_uci_section(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStre
 struct FieldAttributes {
     skip: bool,
     rename: Option<LitStr>,
+    sections: Option<LitStr>,
+}
+
+/// `T` of a `Vec<T>` type, as written.
+fn vec_element(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(path) = ty else {
+        return None;
+    };
+    let segment = path.path.segments.last()?;
+    if segment.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return None;
+    };
+    match arguments.args.first()? {
+        syn::GenericArgument::Type(element) if arguments.args.len() == 1 => Some(element),
+        _ => None,
+    }
 }
 
 fn parse_field(field: &Field) -> syn::Result<FieldAttributes> {
@@ -175,14 +224,27 @@ fn parse_field(field: &Field) -> syn::Result<FieldAttributes> {
                 return Ok(());
             }
 
-            Err(meta.error("expected `skip` or `rename = \"...\"`"))
+            if meta.path.is_ident("sections") {
+                if attributes.sections.is_some() {
+                    return Err(meta.error("duplicate `sections` attribute"));
+                }
+                attributes.sections = Some(parse_non_empty(&meta, "sections")?);
+                return Ok(());
+            }
+
+            Err(meta.error("expected `skip`, `rename = \"...\"` or `sections = \"...\"`"))
         })?;
     }
 
-    if attributes.skip && attributes.rename.is_some() {
+    let set = [
+        attributes.skip,
+        attributes.rename.is_some(),
+        attributes.sections.is_some(),
+    ];
+    if set.iter().filter(|&&set| set).count() > 1 {
         return Err(syn::Error::new_spanned(
             field,
-            "`skip` and `rename` cannot be combined",
+            "`skip`, `rename` and `sections` cannot be combined",
         ));
     }
 
@@ -286,6 +348,10 @@ fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
                     #field_type as
                     crate::settings::uci_schema::UciSectionSchema
                 >::UCI_PASSTHROUGH_KEY,
+                repeated: <
+                    #field_type as
+                    crate::settings::uci_schema::UciSectionSchema
+                >::UCI_REPEATED,
             }
         });
     }

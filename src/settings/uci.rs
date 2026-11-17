@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::settings::uci_schema::{UciConfigSchema, UciRepeatedSectionMapping, UciSectionMapping};
+use crate::settings::uci_schema::{UciConfigSchema, UciSectionMapping};
 use config::{ConfigError as SourceError, Map, Source, Value, ValueKind};
 
 use rust_uci::config::{
@@ -43,7 +43,6 @@ pub(crate) struct UciSource {
     instance: Option<String>,
     required: bool,
     schema: &'static [UciSectionMapping],
-    repeated_schema: &'static [UciRepeatedSectionMapping],
     config_dir: Option<PathBuf>,
     save_dir: Option<PathBuf>,
 }
@@ -55,7 +54,6 @@ impl UciSource {
             instance: None,
             required: true,
             schema: &[],
-            repeated_schema: &[],
             config_dir: None,
             save_dir: None,
         }
@@ -97,17 +95,6 @@ impl UciSource {
 
     pub(crate) fn with_schema(mut self, schema: &'static [UciSectionMapping]) -> Self {
         self.schema = schema;
-        self
-    }
-
-    /// Registers section types collected as arrays of tables at their config paths.
-    /// Absent section types leave the destination unset for Serde/source defaults.
-    #[allow(dead_code)]
-    pub(crate) fn with_repeated_schema(
-        mut self,
-        schema: &'static [UciRepeatedSectionMapping],
-    ) -> Self {
-        self.repeated_schema = schema;
         self
     }
 
@@ -163,7 +150,7 @@ impl UciSource {
     /// Without any schema the source maps every option to
     /// `<package>.<section>.<option>` and has nothing to check options against.
     fn has_schema(&self) -> bool {
-        !self.schema.is_empty() || !self.repeated_schema.is_empty()
+        !self.schema.is_empty()
     }
 
     /// Value of the option that selects a passthrough section's sub-table.
@@ -234,10 +221,17 @@ impl UciSource {
         let mut mapped = Vec::new();
 
         for section in sections {
-            let repeated_mapping = self
-                .repeated_schema
-                .iter()
-                .find(|mapping| mapping.uci_section == section.type_());
+            // A repeated section goes to `<parent section>.<field>`.
+            let repeated_mapping = self.schema.iter().find_map(|parent| {
+                let mapping = parent
+                    .repeated
+                    .iter()
+                    .find(|mapping| mapping.uci_section == section.type_())?;
+                Some((
+                    format!("{}.{}", parent.config_section, mapping.field),
+                    mapping,
+                ))
+            });
             let mut section_values = Map::new();
 
             let selector = section.selector().ok_or_else(|| {
@@ -322,7 +316,7 @@ impl UciSource {
                 let option_name = option_name.as_str();
                 let uci_key = format!("{section_key}.{option_name}");
 
-                let repeated_option = repeated_mapping.and_then(|mapping| {
+                let repeated_option = repeated_mapping.as_ref().and_then(|(_, mapping)| {
                     mapping
                         .options
                         .iter()
@@ -406,10 +400,10 @@ impl UciSource {
                 }
             }
 
-            if let Some(mapping) = repeated_mapping {
+            if let Some((config_path, _)) = repeated_mapping {
                 let origin = format!("UCI section {package_name}.{selector}");
                 repeated_values
-                    .entry(mapping.config_path.to_owned())
+                    .entry(config_path)
                     .or_default()
                     .push(Value::new(Some(&origin), ValueKind::Table(section_values)));
             } else if let Some(mapping) = singleton {

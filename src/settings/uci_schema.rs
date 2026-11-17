@@ -26,20 +26,22 @@ pub(crate) struct UciSectionMapping {
     /// as the init script. They are skipped without a warning.
     pub(crate) external: &'static [&'static str],
 
+    /// Fields of this section collecting every section of another type.
+    pub(crate) repeated: &'static [UciRepeatedSectionMapping],
+
     /// Config field whose value names a sub-table. When set, every option the
     /// schema does not know is passed through to
     /// `<config_section>.<value>.<option>`.
     pub(crate) passthrough_key: Option<&'static str>,
 }
 
-#[cfg(all(feature = "uci", unix))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct UciRepeatedSectionMapping {
     /// UCI section type, for both named and anonymous sections.
     pub(crate) uci_section: &'static str,
 
-    /// Config-rs / Serde path receiving an array of section tables.
-    pub(crate) config_path: &'static str,
+    /// Field of the parent section receiving an array of section tables.
+    pub(crate) field: &'static str,
 
     pub(crate) options: &'static [UciOptionMapping],
 }
@@ -48,6 +50,7 @@ pub(crate) trait UciSectionSchema {
     const UCI_OPTIONS: &'static [UciOptionMapping];
     const UCI_EXTERNAL_OPTIONS: &'static [&'static str];
     const UCI_PASSTHROUGH_KEY: Option<&'static str>;
+    const UCI_REPEATED: &'static [UciRepeatedSectionMapping];
 }
 
 pub(crate) trait UciConfigSchema {

@@ -209,18 +209,6 @@ impl Settings {
         let builder = builder.add_source(
             UciSource::from_schema::<Self>()
                 .with_instance(instance)
-                .with_repeated_schema(&[
-                    uci_schema::UciRepeatedSectionMapping {
-                        uci_section: "reflector",
-                        config_path: "reflectors.entries",
-                        options: <ReflectorDefinition as uci_schema::UciSectionSchema>::UCI_OPTIONS,
-                    },
-                    uci_schema::UciRepeatedSectionMapping {
-                        uci_section: "bootstrap_reflector",
-                        config_path: "reflectors.bootstrap",
-                        options: <ReflectorDefinition as uci_schema::UciSectionSchema>::UCI_OPTIONS,
-                    },
-                ])
                 .required(false),
         );
 
@@ -314,10 +302,10 @@ pub(crate) struct ReflectorSettings {
     pub(crate) files: Vec<String>,
     pub(crate) countries: Vec<String>,
 
-    #[uci(skip)]
+    #[uci(sections = "reflector")]
     pub(crate) entries: Vec<ReflectorDefinition>,
 
-    #[uci(skip)]
+    #[uci(sections = "bootstrap_reflector")]
     pub(crate) bootstrap: Vec<ReflectorDefinition>,
 
     pub(crate) num_reflectors: u8,
