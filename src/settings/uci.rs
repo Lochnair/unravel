@@ -217,20 +217,18 @@ impl UciSource {
                     .iter()
                     .find(|mapping| mapping.uci_section == section.type_())
                 else {
-                    warn(format_args!(
-                        "UCI section {section_key} has unrecognised type {:?} and is ignored",
+                    return Err(SourceError::Message(format!(
+                        "UCI section {section_key} has unrecognised type {:?}",
                         section.type_()
-                    ));
-                    continue;
+                    )));
                 };
 
                 if !matches!(selector, SectionSelector::Anonymous { index: 0, .. }) {
-                    warn(format_args!(
-                        "UCI section {section_key} is ignored: only the first anonymous \
-                         {:?} section is used",
+                    return Err(SourceError::Message(format!(
+                        "UCI section {section_key} is not supported: only one anonymous \
+                         {:?} section is read",
                         section.type_()
-                    ));
-                    continue;
+                    )));
                 }
 
                 singleton = Some(mapping);
@@ -302,10 +300,9 @@ impl UciSource {
                         };
                         format!("{}.{table}.{option_name}", mapping.config_section)
                     } else {
-                        warn(format_args!(
-                            "UCI option {uci_key} is not recognised and is ignored"
-                        ));
-                        continue;
+                        return Err(SourceError::Message(format!(
+                            "UCI option {uci_key} is not recognised"
+                        )));
                     }
                 } else {
                     format!(
@@ -354,11 +351,6 @@ impl UciSource {
 
         Ok(())
     }
-}
-
-/// Reported before the log level is known, like other configuration warnings.
-fn warn(args: std::fmt::Arguments<'_>) {
-    crate::log::message(format_args!("warning: {args}"));
 }
 
 impl Source for UciSource {
