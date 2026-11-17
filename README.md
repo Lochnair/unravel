@@ -189,7 +189,7 @@ The measurement engine checks directional timestamps before rate control uses th
 
 ## Logs and statistics
 
-The default log level is `error`; the examples use `info` so you can see more of what's happening during setup. Logs go to stdout.
+The default log level is `info`. Logs go to stdout.
 
 CSV statistics are enabled by default and are independent of network metrics export:
 

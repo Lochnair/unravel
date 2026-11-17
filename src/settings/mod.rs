@@ -398,7 +398,7 @@ pub(crate) struct OutputSettings {
 impl Default for OutputSettings {
     fn default() -> Self {
         Self {
-            log_level: Level::Error,
+            log_level: Level::Info,
             speed_hist_file: "/tmp/unravel-speedhist.csv".to_owned(),
             stats_file: "/tmp/unravel.csv".to_owned(),
             suppress_statistics: false,
