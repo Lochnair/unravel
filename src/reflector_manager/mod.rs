@@ -407,12 +407,11 @@ impl ReflectorManager {
             let next = self.candidates[candidate].take().unwrap().enter(now);
             let peer = self.inventory[next.inventory].target.peer();
             info!("Promoting {peer} into active slot {slot}: {}", REASON[tier]);
-            self.metrics.send(Metric::Event {
-                name: "reflector_promoted",
-                reason: REASON[tier],
-                reflector: Some(peer),
-                tags: &[],
-            });
+            self.metrics.send(Metric::event(
+                "reflector_promoted",
+                REASON[tier],
+                Some(peer),
+            ));
             // A healthy incumbent of this class stays under measurement.
             let keep = active[slot]
                 .as_ref()
@@ -446,12 +445,11 @@ impl ReflectorManager {
                     entry.peer(),
                     entry.protocol()
                 );
-                self.metrics.send(Metric::Event {
-                    name: "reflector_explored",
-                    reason: "inventory",
-                    reflector: Some(entry.peer()),
-                    tags: &[],
-                });
+                self.metrics.send(Metric::event(
+                    "reflector_explored",
+                    "inventory",
+                    Some(entry.peer()),
+                ));
                 self.candidates[slot] = Some(Live::new(target, now));
             }
         }
@@ -584,12 +582,7 @@ impl ReflectorManager {
                     Ok(event) => self.observe(event),
                     Err(broadcast::error::RecvError::Lagged(count)) => {
                         warn!("Reflector manager missed {count} measurements");
-                        self.metrics.send(Metric::Event {
-                            name: "measurement_lag",
-                            reason: "reflector_manager",
-                            reflector: None,
-                            tags: &[],
-                        });
+                        self.metrics.send(Metric::event("measurement_lag", "reflector_manager", None));
                     }
                     Err(broadcast::error::RecvError::Closed) => return Err(ChannelClosed.into()),
                 },

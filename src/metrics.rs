@@ -134,14 +134,37 @@ pub enum Metric {
         recent_down_ewma: f64,
     },
     Event {
-        name: &'static str,
-        reason: &'static str,
+        name: String,
+        reason: String,
         reflector: Option<IpAddr>,
-        tags: &'static [(&'static str, &'static str)],
+        tags: Vec<(String, String)>,
     },
     Dropped {
         count: u32,
     },
+}
+
+impl Metric {
+    pub fn event(
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        reflector: Option<IpAddr>,
+    ) -> Self {
+        Metric::Event {
+            name: name.into(),
+            reason: reason.into(),
+            reflector,
+            tags: Vec::new(),
+        }
+    }
+
+    /// Adds a tag to an event; other metrics are returned unchanged.
+    pub fn tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        if let Metric::Event { tags, .. } = &mut self {
+            tags.push((key.into(), value.into()));
+        }
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -394,7 +417,7 @@ impl Metrics {
                     write!(tag_str, ",reason={reason}").unwrap_or(());
                 }
 
-                for (k, v) in *tags {
+                for (k, v) in tags {
                     write!(tag_str, ",{k}={v}").unwrap_or(());
                 }
 

@@ -198,11 +198,11 @@ impl App {
         if let Some(writer) = csv_writer {
             sinks.spawn(async move { ("CSV diagnostics", writer.run().await) });
         }
-        metrics.send(Metric::Event {
-            name: "starting",
-            reason: "",
-            reflector: None,
-            tags: if dry_run { &[("dry_run", "true")] } else { &[] },
+        let starting = Metric::event("starting", "", None);
+        metrics.send(if dry_run {
+            starting.tag("dry_run", "true")
+        } else {
+            starting
         });
 
         let mut restore_required = false;
@@ -306,12 +306,8 @@ async fn shutdown(
         }
     }
 
-    metrics.send(Metric::Event {
-        name: "stopping",
-        reason: if signal_teardown { "signal" } else { "error" },
-        reflector: None,
-        tags: &[],
-    });
+    let reason = if signal_teardown { "signal" } else { "error" };
+    metrics.send(Metric::event("stopping", reason, None));
     drop(metrics);
     let drained = tokio::time::timeout(SINK_DRAIN_TIMEOUT, async {
         while let Some(completed) = sinks.join_next().await {

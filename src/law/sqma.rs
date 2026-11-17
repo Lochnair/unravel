@@ -428,12 +428,7 @@ impl Law for SqmaLaw {
                         Ok(event) => self.observe(event, &ctx)?,
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                             warn!("Control law missed {count} measurement events");
-                            ctx.metrics.send(Metric::Event {
-                                name: "measurement_lag",
-                                reason: "control_law",
-                                reflector: None,
-                                tags: &[],
-                            });
+                            ctx.metrics.send(Metric::event("measurement_lag", "control_law", None));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return Err(ChannelClosed).context("Measurement channel closed");
@@ -554,12 +549,11 @@ impl SqmaLaw {
         }
         // Start the hold after lowering both rates, not when Runtime detected the step.
         self.measurements_after = Some(Instant::now() + MEASUREMENT_SETTLE_TIME);
-        ctx.metrics.send(Metric::Event {
-            name: "measurement_recovery",
-            reason: "local_clock_step",
-            reflector: None,
-            tags: &[],
-        });
+        ctx.metrics.send(Metric::event(
+            "measurement_recovery",
+            "local_clock_step",
+            None,
+        ));
         Ok(())
     }
 
@@ -669,12 +663,8 @@ impl SqmaLaw {
                 warn!("No reflector data available, dropping to minimum rates");
                 self.warned_no_deltas = true;
             }
-            ctx.metrics.send(Metric::Event {
-                name: "reflector_unavailable",
-                reason: "",
-                reflector: None,
-                tags: &[],
-            });
+            ctx.metrics
+                .send(Metric::event("reflector_unavailable", "", None));
 
             for (direction, state) in [
                 (Direction::Download, self.download.as_mut()),
@@ -697,12 +687,8 @@ impl SqmaLaw {
 
         let Some(traffic) = *ctx.traffic.borrow() else {
             // No traffic sample available. Retain current rates.
-            ctx.metrics.send(Metric::Event {
-                name: "traffic_sample_unavailable",
-                reason: "",
-                reflector: None,
-                tags: &[],
-            });
+            ctx.metrics
+                .send(Metric::event("traffic_sample_unavailable", "", None));
             return Ok(());
         };
 
@@ -838,12 +824,11 @@ impl SqmaLaw {
                 state.valid = false;
                 state.last_started_at = event.started_at;
             }
-            ctx.metrics.send(Metric::Event {
-                name: "directional_rejected",
-                reason: reason.reason(),
-                reflector: Some(event.target.peer()),
-                tags: &[],
-            });
+            ctx.metrics.send(Metric::event(
+                "directional_rejected",
+                reason.reason(),
+                Some(event.target.peer()),
+            ));
             return Ok(());
         }
         let Some(rtt_ms) = event.rtt_ms() else {
@@ -869,16 +854,16 @@ impl SqmaLaw {
                 // Rebuild only this target from its accepted new reference,
                 // as for a newly active target. Other reflectors remain usable.
                 self.reflectors.remove(&event.target);
-                ctx.metrics.send(Metric::Event {
-                    name: "measurement_recovery",
-                    reason: if changed {
-                        "directional_reference_changed"
-                    } else {
-                        "measurement_mode_changed"
-                    },
-                    reflector: Some(event.target.peer()),
-                    tags: &[],
-                });
+                let reason = if changed {
+                    "directional_reference_changed"
+                } else {
+                    "measurement_mode_changed"
+                };
+                ctx.metrics.send(Metric::event(
+                    "measurement_recovery",
+                    reason,
+                    Some(event.target.peer()),
+                ));
             }
         }
         let sample = EwmaStats::from_reply(rtt_ms, one_way);
