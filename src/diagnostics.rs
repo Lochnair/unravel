@@ -3,17 +3,19 @@
 // SPDX-License-Identifier: MPL-2.0
 
 //! Best-effort CSV diagnostics, independent of the metrics exporter.
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    path::Path,
+    time::{Duration, Instant, SystemTime},
+};
 
 use anyhow::Context;
 use tokio::{fs::File, io::AsyncWriteExt, sync::mpsc};
 
-use crate::{
-    settings::OutputSettings,
-    time::{ClockSample, Realtime},
-};
+use crate::time::{ClockSample, Realtime};
 
 const QUEUE_CAPACITY: usize = 64;
+const STATS_FILE: &str = "stats.csv";
+const HISTORY_FILE: &str = "speedhist.csv";
 const HISTORY_INTERVAL: Duration = Duration::from_secs(300);
 const STATS_HEADER: &str = "times,timens,rxload,txload,deltadelaydown,deltadelayup,dlrate,uprate\n";
 const HISTORY_HEADER: &str = "time,counter,upspeed,downspeed\n";
@@ -77,13 +79,11 @@ pub(crate) struct CsvWriter {
 }
 
 impl CsvWriter {
-    /// Creates both CSV files, replacing those of the previous run.
-    pub async fn open(
-        output: &OutputSettings,
-        rx: mpsc::Receiver<DiagnosticRecord>,
-    ) -> anyhow::Result<Self> {
-        let history = create(&output.speed_hist_file, HISTORY_HEADER).await?;
-        let stats = create(&output.stats_file, STATS_HEADER).await?;
+    /// Creates both CSV files in the instance folder, replacing those of the
+    /// previous run.
+    pub async fn open(folder: &Path, rx: mpsc::Receiver<DiagnosticRecord>) -> anyhow::Result<Self> {
+        let history = create(&folder.join(HISTORY_FILE), HISTORY_HEADER).await?;
+        let stats = create(&folder.join(STATS_FILE), STATS_HEADER).await?;
         Ok(Self { history, stats, rx })
     }
 
@@ -119,10 +119,10 @@ impl CsvWriter {
     }
 }
 
-async fn create(path: &str, header: &str) -> anyhow::Result<File> {
+async fn create(path: &Path, header: &str) -> anyhow::Result<File> {
     let mut file = File::create(path)
         .await
-        .with_context(|| format!("Creating CSV diagnostics {path}"))?;
+        .with_context(|| format!("Creating CSV diagnostics {}", path.display()))?;
     file.write_all(header.as_bytes()).await?;
     file.flush().await?;
     Ok(file)

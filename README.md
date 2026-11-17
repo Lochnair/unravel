@@ -193,10 +193,10 @@ The default log level is `info`. Logs go to stdout.
 
 CSV statistics are enabled by default and are independent of network metrics export:
 
-- `/tmp/unravel.csv` contains traffic load, delay above baseline and shaping rates.
-- `/tmp/unravel-speedhist.csv` contains the speed history snapshots.
+- `/tmp/unravel/default/stats.csv` contains traffic load, delay above baseline and shaping rates.
+- `/tmp/unravel/default/speedhist.csv` contains the speed history snapshots.
 
-These files are recreated on startup. You can change their paths with `output.stats_file` and `output.speed_hist_file`, or disable both with `output.suppress_statistics = true`.
+These files are recreated on startup. You can change the folder with `output.folder` (default `/tmp/unravel`), or disable both files with `output.suppress_statistics = true`. The control law keeps its own files in a subfolder named after it, such as `/tmp/unravel/default/sqma/`.
 
 To send metrics to a collector accepting InfluxDB line protocol, add this to your TOML configuration (change the host to yours):
 

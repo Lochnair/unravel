@@ -4,7 +4,6 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -15,14 +14,17 @@ use serde::Deserialize;
 use crate::{
     diagnostics::{DiagnosticRecord, DiagnosticsSender, DirectionStatistics, SpeedHistory},
     error::ChannelClosed,
-    law::{Cadence, Law, LawContext},
+    law::{Cadence, Law, LawContext, LawStore},
     measurement::model::{
         MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayLatency, OneWayRejection,
         OneWayStatus,
     },
     metrics::Metric,
     runtime::{Direction, Shaper},
-    settings::{ValidationReport, validate_greater_than_zero_f64, validate_zero_or_greater_f64},
+    settings::{
+        ValidationReport, deserialize_flex_bool, validate_greater_than_zero_f64,
+        validate_zero_or_greater_f64,
+    },
 };
 
 const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
@@ -31,8 +33,9 @@ const STALE_AFTER: Duration = Duration::from_secs(30);
 // Let queues drain before rebuilding all baselines after a local clock step.
 const MEASUREMENT_SETTLE_TIME: Duration = Duration::from_secs(5);
 
-// With history_file set, the recorded safe rates are saved there so a
-// service restart does not throw them away.
+// With save_history set, the recorded safe rates are saved in the law's store
+// so a service restart does not throw them away.
+const HISTORY_FILE: &str = "history.txt";
 const HISTORY_SAVE_EVERY: Duration = Duration::from_secs(30);
 const HISTORY_MAX_AGE_SECS: u64 = 6 * 3600;
 const HISTORY_HEADER: &str = "unravel-history 1";
@@ -59,10 +62,11 @@ pub(crate) struct SqmaSettings {
     /// Load at or below which low_load_cut_floor and idle_recovery_percent
     /// act. Above it, the decision is unchanged from upstream.
     pub(crate) low_load_level: f64,
-    /// File to keep the recorded safe rates in across a service restart.
-    /// Read at startup if under 6 h old and saved with the same
-    /// speed_hist_size and base rate. Unset = off, the upstream behaviour.
-    pub(crate) history_file: Option<String>,
+    /// Keep the recorded safe rates across a service restart. They are read
+    /// at startup if under 6 h old and saved with the same speed_hist_size
+    /// and base rate. Off by default, the upstream behaviour.
+    #[serde(deserialize_with = "deserialize_flex_bool")]
+    pub(crate) save_history: bool,
 }
 
 impl Default for SqmaSettings {
@@ -77,7 +81,7 @@ impl Default for SqmaSettings {
             low_load_cut_floor: 0.0,
             idle_recovery_percent: 0.0,
             low_load_level: 0.3,
-            history_file: None,
+            save_history: false,
         }
     }
 }
@@ -143,13 +147,6 @@ impl SqmaSettings {
 
         if !(0.0..=1.0).contains(&self.low_load_level) {
             report.error("law.sqma.low_load_level", "must be between 0 and 1");
-        }
-
-        if let Some(path) = self.history_file.as_deref().map(str::trim)
-            && !path.is_empty()
-            && !path.starts_with('/')
-        {
-            report.error("law.sqma.history_file", "must be an absolute path");
         }
 
         if self.speed_hist_size == 0 {
@@ -366,8 +363,7 @@ pub(crate) struct SqmaLaw {
     rng: fastrand::Rng,
     diagnostics: Option<DiagnosticsSender>,
 
-    // Restart-proof safe-rate history (None = off).
-    history_path: Option<PathBuf>,
+    // Restart-proof safe-rate history, when save_history is on.
     history_saved_at: Option<Instant>,
     history_saved_body: String,
 
@@ -457,12 +453,6 @@ impl SqmaLaw {
     ) -> anyhow::Result<Self> {
         let settings = SqmaSettings::from_config(config)?;
         let tick = settings.tick_interval;
-        let history_path = settings
-            .history_file
-            .as_deref()
-            .map(str::trim)
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from);
 
         Ok(Self {
             settings,
@@ -474,7 +464,6 @@ impl SqmaLaw {
             slow_factor: (0.5_f64.ln() / (BASELINE_HALF_LIFE_SECS / tick)).exp(),
             rng: fastrand::Rng::new(),
             diagnostics,
-            history_path,
             history_saved_at: None,
             history_saved_body: String::new(),
             warned_few_deltas: false,
@@ -483,19 +472,27 @@ impl SqmaLaw {
     }
 
     /// Put back the recorded rates saved before a restart.
-    async fn restore_history(&self, name: &str, base_kbps: f64, state: &mut RateState) {
-        let Some(path) = &self.history_path else {
+    async fn restore_history(
+        &self,
+        store: &LawStore,
+        name: &str,
+        base_kbps: f64,
+        state: &mut RateState,
+    ) {
+        if !self.settings.save_history {
             return;
-        };
-        let Ok(text) = tokio::fs::read_to_string(path).await else {
-            return;
+        }
+        let text = match store.read(HISTORY_FILE).await {
+            Ok(Some(text)) => text,
+            Ok(None) => return,
+            Err(error) => {
+                warn!("Not restoring saved history: {error:#}");
+                return;
+            }
         };
         let size = state.safe_rates.len();
         let Some(dirs) = parse_history(&text, unix_now(), size) else {
-            warn!(
-                "Ignoring {}: unreadable, stale or a different history size",
-                path.display()
-            );
+            warn!("Ignoring saved history: unreadable, stale or a different history size");
             return;
         };
         let Some((_, saved_base, rates)) = dirs.iter().find(|(n, _, _)| n == name) else {
@@ -510,10 +507,10 @@ impl SqmaLaw {
     }
 
     /// Write the recorded rates out, at most every 30 s and only if they changed.
-    async fn save_history(&mut self, now: Instant) {
-        let Some(path) = &self.history_path else {
+    async fn save_history(&mut self, store: &LawStore, now: Instant) {
+        if !self.settings.save_history {
             return;
-        };
+        }
         if self
             .history_saved_at
             .is_some_and(|t| now.saturating_duration_since(t) < HISTORY_SAVE_EVERY)
@@ -536,15 +533,9 @@ impl SqmaLaw {
             return;
         }
         let text = format!("{HISTORY_HEADER}\nsaved {}\n{body}", unix_now());
-        let tmp = path.with_extension("tmp");
-        let result: std::io::Result<()> = async {
-            tokio::fs::write(&tmp, text).await?;
-            tokio::fs::rename(&tmp, path).await
-        }
-        .await;
-        match result {
+        match store.write(HISTORY_FILE, &text).await {
             Ok(()) => self.history_saved_body = body,
-            Err(error) => warn!("Could not save {}: {error}", path.display()),
+            Err(error) => warn!("Could not save history: {error:#}"),
         }
     }
 
@@ -586,7 +577,7 @@ impl SqmaLaw {
 
             let mut state = RateState::new(shaper.base_kbps, size, &mut self.rng);
             state.current_kbps = initial;
-            self.restore_history("download", shaper.base_kbps, &mut state)
+            self.restore_history(ctx.store(), "download", shaper.base_kbps, &mut state)
                 .await;
 
             self.download = Some(state);
@@ -603,7 +594,7 @@ impl SqmaLaw {
 
             let mut state = RateState::new(shaper.base_kbps, size, &mut self.rng);
             state.current_kbps = initial;
-            self.restore_history("upload", shaper.base_kbps, &mut state)
+            self.restore_history(ctx.store(), "upload", shaper.base_kbps, &mut state)
                 .await;
 
             self.upload = Some(state);
@@ -772,7 +763,7 @@ impl SqmaLaw {
             });
         }
 
-        self.save_history(now).await;
+        self.save_history(ctx.store(), now).await;
 
         if let Some(diagnostics) = &mut self.diagnostics {
             diagnostics.publish(now, |history_due| DiagnosticRecord {

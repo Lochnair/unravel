@@ -41,7 +41,7 @@ impl FromStr for FlexiBool {
     }
 }
 
-fn deserialize_flex_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+pub(crate) fn deserialize_flex_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -389,8 +389,9 @@ impl Default for ReflectorSettings {
 pub(crate) struct OutputSettings {
     #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) log_level: Level,
-    pub(crate) speed_hist_file: String,
-    pub(crate) stats_file: String,
+    /// Holds a folder per instance, with the CSV statistics and each law's
+    /// saved state.
+    pub(crate) folder: String,
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) suppress_statistics: bool,
 }
@@ -399,8 +400,7 @@ impl Default for OutputSettings {
     fn default() -> Self {
         Self {
             log_level: Level::Info,
-            speed_hist_file: "/tmp/unravel-speedhist.csv".to_owned(),
-            stats_file: "/tmp/unravel.csv".to_owned(),
+            folder: "/tmp/unravel".to_owned(),
             suppress_statistics: false,
         }
     }

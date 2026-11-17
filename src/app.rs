@@ -7,7 +7,7 @@
 
 use crate::diagnostics::{self, CsvWriter};
 use crate::error::ChannelClosed;
-use crate::law::{self, Law, LawContext};
+use crate::law::{self, Law, LawContext, LawStore};
 use crate::measurement::{
     engine::MeasurementEngine,
     plan::{AppliedState, MeasurementPlan},
@@ -19,6 +19,7 @@ use crate::runtime::{Direction, Runtime};
 use crate::settings::Settings;
 use ::log::{error, info};
 use anyhow::Context;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
@@ -28,6 +29,7 @@ use tokio::{
 };
 
 const SINK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_INSTANCE: &str = "default";
 type TaskResult = (&'static str, anyhow::Result<()>);
 
 struct PreparedWorkers {
@@ -84,8 +86,15 @@ impl App {
                 settings.law.name,
             );
         }
+        // Only one instance runs for now; --instance will name the folder.
+        let folder = Path::new(settings.output.folder.trim()).join(DEFAULT_INSTANCE);
         let csv_writer = match records {
-            Some(records) => Some(CsvWriter::open(&settings.output, records).await?),
+            Some(records) => {
+                tokio::fs::create_dir_all(&folder)
+                    .await
+                    .with_context(|| format!("Creating output folder {}", folder.display()))?;
+                Some(CsvWriter::open(&folder, records).await?)
+            }
             None => None,
         };
 
@@ -136,6 +145,7 @@ impl App {
             applied_rx.clone(),
             traffic_rx,
             settings.reflectors.num_reflectors as usize,
+            LawStore::new(folder.join(&settings.law.name)),
         );
         let manager = ReflectorManager::new(
             &settings,

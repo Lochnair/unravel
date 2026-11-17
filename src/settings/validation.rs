@@ -274,32 +274,8 @@ impl ReflectorSettings {
 
 impl OutputSettings {
     fn validate(&self, report: &mut ValidationReport) {
-        if self.suppress_statistics {
-            return;
-        }
-
-        let speed_hist_file = self.speed_hist_file.trim();
-        let stats_file = self.stats_file.trim();
-
-        if speed_hist_file.is_empty() {
-            report.error(
-                "output.speed_hist_file",
-                "must not be empty when statistics are enabled",
-            );
-        }
-
-        if stats_file.is_empty() {
-            report.error(
-                "output.stats_file",
-                "must not be empty when statistics are enabled",
-            );
-        }
-
-        if !speed_hist_file.is_empty() && !stats_file.is_empty() && speed_hist_file == stats_file {
-            report.error(
-                "output.stats_file",
-                "must not refer to the same file as output.speed_hist_file",
-            );
+        if self.folder.trim().is_empty() {
+            report.error("output.folder", "must not be empty");
         }
     }
 }

@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use super::LawStore;
 use crate::{
     measurement::{model::MeasurementEvent, plan::AppliedState},
     metrics::MetricsSender,
@@ -23,6 +24,7 @@ pub struct LawContext {
     /// is an invalidation signal, not a log of corrections to sum together.
     pub clock_steps: watch::Receiver<Option<ClockStep>>,
     num_reflectors: usize,
+    store: LawStore,
 }
 
 impl LawContext {
@@ -33,6 +35,7 @@ impl LawContext {
         applied: watch::Receiver<AppliedState>,
         traffic: watch::Receiver<Option<TrafficRates>>,
         num_reflectors: usize,
+        store: LawStore,
     ) -> Self {
         Self {
             clock_steps: runtime.clock_steps(),
@@ -42,12 +45,18 @@ impl LawContext {
             applied,
             traffic,
             num_reflectors,
+            store,
         }
     }
 
     /// Configured number of active reflectors.
     pub fn num_reflectors(&self) -> usize {
         self.num_reflectors
+    }
+
+    /// The law's own files, kept across restarts.
+    pub fn store(&self) -> &LawStore {
+        &self.store
     }
 
     pub fn set_rate(&self, direction: Direction, rate_kbps: f64) -> anyhow::Result<()> {

@@ -4,8 +4,10 @@
 
 mod context;
 mod sqma;
+mod store;
 
 pub(crate) use context::LawContext;
+pub(crate) use store::LawStore;
 
 use std::time::Duration;
 
