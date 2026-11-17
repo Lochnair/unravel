@@ -55,6 +55,7 @@ impl Runtime {
     pub(super) fn new(
         platform: Arc<Platform>,
         settings: Settings,
+        sample_interval: Duration,
         traffic_tx: watch::Sender<Option<TrafficRates>>,
     ) -> anyhow::Result<Self> {
         let traffic_interface = settings
@@ -65,7 +66,7 @@ impl Runtime {
         Ok(Runtime {
             platform,
             traffic_interface,
-            sample_interval: Duration::from_secs_f64(settings.advanced_settings.tick_interval),
+            sample_interval,
             traffic_tx,
             clock_steps_tx: watch::channel(None).0,
             download: settings

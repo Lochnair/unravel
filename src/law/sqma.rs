@@ -10,18 +10,19 @@ use std::{
 
 use anyhow::Context;
 use log::{debug, info, warn};
+use serde::Deserialize;
 
 use crate::{
     diagnostics::{DiagnosticRecord, DiagnosticsSender, DirectionStatistics, SpeedHistory},
     error::ChannelClosed,
-    law::{Law, LawContext},
+    law::{Cadence, Law, LawContext},
     measurement::model::{
         MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayLatency, OneWayRejection,
         OneWayStatus,
     },
     metrics::Metric,
     runtime::{Direction, Shaper},
-    settings::{AdvancedSettings, Settings},
+    settings::{ValidationReport, validate_greater_than_zero_f64, validate_zero_or_greater_f64},
 };
 
 const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
@@ -35,6 +36,145 @@ const MEASUREMENT_SETTLE_TIME: Duration = Duration::from_secs(5);
 const HISTORY_SAVE_EVERY: Duration = Duration::from_secs(30);
 const HISTORY_MAX_AGE_SECS: u64 = 6 * 3600;
 const HISTORY_HEADER: &str = "unravel-history 1";
+
+/// SQMA's own configuration, read from `law.sqma`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct SqmaSettings {
+    pub(crate) download_delay_ms: f64,
+    pub(crate) high_load_level: f64,
+    pub(crate) min_change_interval: f64,
+    pub(crate) speed_hist_size: u32,
+    /// Probe and traffic sampling period, in seconds.
+    pub(crate) tick_interval: f64,
+    pub(crate) upload_delay_ms: f64,
+    /// At or below low_load_level, each cut can take the rate no lower than
+    /// this fraction of the current rate (0 = off, the upstream behaviour).
+    pub(crate) low_load_cut_floor: f64,
+    /// When the delay is under the threshold and load is at or below
+    /// low_load_level, step the rate towards the median of the recorded
+    /// safe rates by this percentage of the base rate per evaluation
+    /// (0 = off, the upstream behaviour).
+    pub(crate) idle_recovery_percent: f64,
+    /// Load at or below which low_load_cut_floor and idle_recovery_percent
+    /// act. Above it, the decision is unchanged from upstream.
+    pub(crate) low_load_level: f64,
+    /// File to keep the recorded safe rates in across a service restart.
+    /// Read at startup if under 6 h old and saved with the same
+    /// speed_hist_size and base rate. Unset = off, the upstream behaviour.
+    pub(crate) history_file: Option<String>,
+}
+
+impl Default for SqmaSettings {
+    fn default() -> Self {
+        Self {
+            download_delay_ms: 15.0,
+            high_load_level: 0.8,
+            min_change_interval: 0.5,
+            speed_hist_size: 100,
+            tick_interval: 0.5,
+            upload_delay_ms: 15.0,
+            low_load_cut_floor: 0.0,
+            idle_recovery_percent: 0.0,
+            low_load_level: 0.3,
+            history_file: None,
+        }
+    }
+}
+
+impl SqmaSettings {
+    /// Reads the `law.sqma` table; an absent table means all defaults.
+    fn from_config(config: Option<config::Value>) -> anyhow::Result<Self> {
+        let settings = match config {
+            Some(value) => value
+                .try_deserialize::<Self>()
+                .context("Reading law.sqma settings")?,
+            None => Self::default(),
+        };
+        let mut report = ValidationReport::default();
+        settings.validate(&mut report);
+        report.finish()?;
+        Ok(settings)
+    }
+
+    fn validate(&self, report: &mut ValidationReport) {
+        validate_zero_or_greater_f64(report, "law.sqma.download_delay_ms", self.download_delay_ms);
+
+        validate_zero_or_greater_f64(report, "law.sqma.upload_delay_ms", self.upload_delay_ms);
+
+        let high_load_level_valid =
+            validate_zero_or_greater_f64(report, "law.sqma.high_load_level", self.high_load_level);
+
+        if validate_greater_than_zero_f64(
+            report,
+            "law.sqma.min_change_interval",
+            self.min_change_interval,
+        ) && !Duration::try_from_secs_f64(self.min_change_interval)
+            .is_ok_and(|interval| !interval.is_zero())
+        {
+            report.error(
+                "law.sqma.min_change_interval",
+                "must convert to a nonzero representable duration",
+            );
+        }
+
+        if !Duration::try_from_secs_f64(self.tick_interval)
+            .is_ok_and(|period| !period.is_zero() && Instant::now().checked_add(period).is_some())
+        {
+            report.error(
+                "law.sqma.tick_interval",
+                "must be a nonzero representable duration",
+            );
+        }
+
+        if !(0.0..1.0).contains(&self.low_load_cut_floor) {
+            report.error(
+                "law.sqma.low_load_cut_floor",
+                "must be at least 0 and below 1",
+            );
+        }
+
+        if !(0.0..=100.0).contains(&self.idle_recovery_percent) {
+            report.error(
+                "law.sqma.idle_recovery_percent",
+                "must be between 0 and 100",
+            );
+        }
+
+        if !(0.0..=1.0).contains(&self.low_load_level) {
+            report.error("law.sqma.low_load_level", "must be between 0 and 1");
+        }
+
+        if let Some(path) = self.history_file.as_deref().map(str::trim)
+            && !path.is_empty()
+            && !path.starts_with('/')
+        {
+            report.error("law.sqma.history_file", "must be an absolute path");
+        }
+
+        if self.speed_hist_size == 0 {
+            report.error("law.sqma.speed_hist_size", "must be greater than 0");
+        }
+
+        if high_load_level_valid {
+            if self.high_load_level == 0.0 {
+                report.warning(
+                    "law.sqma.high_load_level",
+                    "0 causes any positive load to be treated as high load",
+                );
+            } else if self.high_load_level > 1.0 {
+                report.warning(
+                    "law.sqma.high_load_level",
+                    format!(
+                        "{} requires utilisation to exceed the current shaper rate \
+                         before the high-load threshold is reached",
+                        self.high_load_level,
+                    ),
+                );
+            }
+        }
+    }
+}
 
 struct RateState {
     current_kbps: f64,
@@ -144,7 +284,7 @@ impl RateState {
         traffic_kbps: f64,
         deltas: &[f64],
         delay_threshold_ms: f64,
-        advanced: &AdvancedSettings,
+        settings: &SqmaSettings,
         rng: &mut fastrand::Rng,
     ) -> f64 {
         let mut next_kbps = self.current_kbps;
@@ -154,7 +294,7 @@ impl RateState {
             let load = traffic_kbps / self.current_kbps;
 
             if delta > 0.0 {
-                if delta < delay_threshold_ms && load > advanced.high_load_level {
+                if delta < delay_threshold_ms && load > settings.high_load_level {
                     self.safe_rates.pop_front();
                     self.safe_rates.push_back(traffic_kbps.floor());
                     self.observed = (self.observed + 1).min(self.safe_rates.len());
@@ -176,8 +316,8 @@ impl RateState {
 
                     // At low load, each cut can take the rate no lower than
                     // low_load_cut_floor times the current rate.
-                    if advanced.low_load_cut_floor > 0.0 && load <= advanced.low_load_level {
-                        next_kbps = next_kbps.max(self.current_kbps * advanced.low_load_cut_floor);
+                    if settings.low_load_cut_floor > 0.0 && load <= settings.low_load_level {
+                        next_kbps = next_kbps.max(self.current_kbps * settings.low_load_cut_floor);
                     }
                 }
             }
@@ -188,16 +328,16 @@ impl RateState {
             // idle link can be exactly 0. Only recorded rates count: the
             // startup placeholders would pull an idle link towards about 85%
             // of the base rate after every restart.
-            if advanced.idle_recovery_percent > 0.0
+            if settings.idle_recovery_percent > 0.0
                 && self.observed > 0
                 && delta <= delay_threshold_ms
-                && load <= advanced.low_load_level
+                && load <= settings.low_load_level
             {
                 let skip = self.safe_rates.len() - self.observed;
                 let mut rates: Vec<f64> = self.safe_rates.iter().skip(skip).copied().collect();
                 rates.sort_by(f64::total_cmp);
                 let target = rates[rates.len() / 2].max(shaper.min_kbps);
-                let step = shaper.base_kbps * advanced.idle_recovery_percent / 100.0;
+                let step = shaper.base_kbps * settings.idle_recovery_percent / 100.0;
                 if self.current_kbps < target {
                     next_kbps = (self.current_kbps + step).min(target);
                 } else if self.current_kbps > target {
@@ -211,7 +351,7 @@ impl RateState {
 }
 
 pub(crate) struct SqmaLaw {
-    settings: Settings,
+    settings: SqmaSettings,
 
     reflectors: HashMap<MeasurementTarget, ReflectorState>,
     /// Also retained after settling to exclude late replies to older probes.
@@ -234,8 +374,16 @@ pub(crate) struct SqmaLaw {
 
 #[async_trait::async_trait]
 impl Law for SqmaLaw {
+    fn cadence(&self) -> Cadence {
+        let tick = Duration::from_secs_f64(self.settings.tick_interval);
+        Cadence {
+            probe: tick,
+            traffic: tick,
+        }
+    }
+
     async fn run(mut self: Box<Self>, mut ctx: LawContext) -> anyhow::Result<()> {
-        let interval = Duration::from_secs_f64(self.settings.advanced_settings.min_change_interval);
+        let interval = Duration::from_secs_f64(self.settings.min_change_interval);
 
         let mut ticker = tokio::time::interval_at(
             tokio::time::Instant::now() + Duration::from_secs(10),
@@ -298,17 +446,21 @@ impl Law for SqmaLaw {
 }
 
 impl SqmaLaw {
-    pub fn new(settings: Settings, diagnostics: Option<DiagnosticsSender>) -> Self {
-        let tick = settings.advanced_settings.tick_interval;
+    /// `config` is the `law.sqma` table, if the configuration has one.
+    pub fn new(
+        config: Option<config::Value>,
+        diagnostics: Option<DiagnosticsSender>,
+    ) -> anyhow::Result<Self> {
+        let settings = SqmaSettings::from_config(config)?;
+        let tick = settings.tick_interval;
         let history_path = settings
-            .advanced_settings
             .history_file
             .as_deref()
             .map(str::trim)
             .filter(|path| !path.is_empty())
             .map(PathBuf::from);
 
-        Self {
+        Ok(Self {
             settings,
             reflectors: HashMap::new(),
             measurements_after: None,
@@ -321,7 +473,7 @@ impl SqmaLaw {
             history_path,
             history_saved_at: None,
             history_saved_body: String::new(),
-        }
+        })
     }
 
     /// Put back the recorded rates saved before a restart.
@@ -415,7 +567,7 @@ impl SqmaLaw {
     }
 
     async fn initialize(&mut self, ctx: &super::LawContext) -> anyhow::Result<()> {
-        let size = self.settings.advanced_settings.speed_hist_size;
+        let size = self.settings.speed_hist_size;
 
         if let Some(shaper) = ctx.shaper(Direction::Download) {
             let initial = if self.measurements_after.is_some() {
@@ -458,7 +610,7 @@ impl SqmaLaw {
         let mut down = Vec::with_capacity(targets.len());
         let mut up = Vec::with_capacity(targets.len());
 
-        let max_age = Duration::from_secs_f64(self.settings.advanced_settings.tick_interval * 2.0);
+        let max_age = Duration::from_secs_f64(self.settings.tick_interval * 2.0);
 
         for target in targets {
             let Some(state) = self.reflectors.get(target) else {
@@ -499,8 +651,7 @@ impl SqmaLaw {
             (down, up, targets.len())
         };
 
-        let num_reflectors = self.settings.reflectors.num_reflectors as usize;
-        let minimum = num_reflectors.min(target_count);
+        let minimum = ctx.num_reflectors().min(target_count);
         if target_count == 0 || down_deltas.len() < minimum || up_deltas.len() < minimum {
             warn!(
                 "Not enough active delta values (D: {}, U: {}, need {})",
@@ -565,14 +716,14 @@ impl SqmaLaw {
                 self.download.as_mut(),
                 down_deltas.as_slice(),
                 traffic.rx_kbps,
-                self.settings.advanced_settings.download_delay_ms,
+                self.settings.download_delay_ms,
             ),
             (
                 Direction::Upload,
                 self.upload.as_mut(),
                 up_deltas.as_slice(),
                 traffic.tx_kbps,
-                self.settings.advanced_settings.upload_delay_ms,
+                self.settings.upload_delay_ms,
             ),
         ] {
             let (Some(state), Some(shaper)) = (state, ctx.shaper(direction)) else {
@@ -585,7 +736,7 @@ impl SqmaLaw {
                 traffic_kbps,
                 deltas,
                 delay_ms,
-                &self.settings.advanced_settings,
+                &self.settings,
                 &mut self.rng,
             );
 

@@ -20,6 +20,10 @@ pub mod uci;
 pub(crate) mod uci_schema;
 mod validation;
 
+pub(crate) use validation::{
+    ValidationReport, validate_greater_than_zero_f64, validate_zero_or_greater_f64,
+};
+
 struct FlexiBool(bool);
 
 impl FromStr for FlexiBool {
@@ -170,12 +174,18 @@ pub(crate) struct Settings {
 #[serde(default)]
 pub(crate) struct LawSettings {
     pub(crate) name: String,
+
+    /// The selected law's own table, `law.<name>`, left for the law to read.
+    #[serde(skip)]
+    #[uci(skip)]
+    pub(crate) config: Option<config::Value>,
 }
 
 impl Default for LawSettings {
     fn default() -> Self {
         Self {
             name: "sqma".to_owned(),
+            config: None,
         }
     }
 }
@@ -214,8 +224,17 @@ impl Settings {
                 .with_list_parse_key("reflectors.files")
                 .with_list_parse_key("reflectors.countries"),
         );
-        let mut settings: Self = builder.build()?.try_deserialize()?;
+        Self::from_config(builder.build()?)
+    }
 
+    fn from_config(config: Config) -> Result<Self, ConfigError> {
+        let mut settings: Self = config.clone().try_deserialize()?;
+
+        settings.law.config = match config.get(&format!("law.{}", settings.law.name)) {
+            Ok(value) => Some(value),
+            Err(ConfigError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
         settings.reflectors.load_files()?;
 
         Ok(settings)
@@ -420,50 +439,13 @@ impl Default for ObservabilitySettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, UciSection)]
-#[serde(default)]
+// The control law's tuning lives under `law.<name>`; keys that used to be
+// here are rejected rather than silently ignored.
+#[derive(Clone, Debug, Default, Deserialize, UciSection)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct AdvancedSettings {
-    pub(crate) download_delay_ms: f64,
-    pub(crate) high_load_level: f64,
-    pub(crate) min_change_interval: f64,
-    pub(crate) speed_hist_size: u32,
-    pub(crate) tick_interval: f64,
-    pub(crate) upload_delay_ms: f64,
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) dry_run: bool,
-    /// At or below low_load_level, each cut can take the rate no lower than
-    /// this fraction of the current rate (0 = off, the upstream behaviour).
-    pub(crate) low_load_cut_floor: f64,
-    /// When the delay is under the threshold and load is at or below
-    /// low_load_level, step the rate towards the median of the recorded
-    /// safe rates by this percentage of the base rate per evaluation
-    /// (0 = off, the upstream behaviour).
-    pub(crate) idle_recovery_percent: f64,
-    /// Load at or below which low_load_cut_floor and idle_recovery_percent
-    /// act. Above it, the decision is unchanged from upstream.
-    pub(crate) low_load_level: f64,
-    /// File to keep the recorded safe rates in across a service restart.
-    /// Read at startup if under 6 h old and saved with the same
-    /// speed_hist_size and base rate. Unset = off, the upstream behaviour.
-    pub(crate) history_file: Option<String>,
-}
-
-impl Default for AdvancedSettings {
-    fn default() -> Self {
-        Self {
-            download_delay_ms: 15.0,
-            high_load_level: 0.8,
-            min_change_interval: 0.5,
-            speed_hist_size: 100,
-            tick_interval: 0.5,
-            upload_delay_ms: 15.0,
-            dry_run: false,
-            low_load_cut_floor: 0.0,
-            idle_recovery_percent: 0.0,
-            low_load_level: 0.3,
-            history_file: None,
-        }
-    }
 }
 
 fn default_min_percent() -> f64 {

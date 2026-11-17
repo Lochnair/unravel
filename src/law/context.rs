@@ -22,6 +22,7 @@ pub struct LawContext {
     /// then acknowledge with `borrow_and_update()`. Updates may coalesce: this
     /// is an invalidation signal, not a log of corrections to sum together.
     pub clock_steps: watch::Receiver<Option<ClockStep>>,
+    num_reflectors: usize,
 }
 
 impl LawContext {
@@ -31,6 +32,7 @@ impl LawContext {
         runtime: Arc<Runtime>,
         applied: watch::Receiver<AppliedState>,
         traffic: watch::Receiver<Option<TrafficRates>>,
+        num_reflectors: usize,
     ) -> Self {
         Self {
             clock_steps: runtime.clock_steps(),
@@ -39,7 +41,13 @@ impl LawContext {
             runtime,
             applied,
             traffic,
+            num_reflectors,
         }
+    }
+
+    /// Configured number of active reflectors.
+    pub fn num_reflectors(&self) -> usize {
+        self.num_reflectors
     }
 
     pub fn set_rate(&self, direction: Direction, rate_kbps: f64) -> anyhow::Result<()> {

@@ -4,7 +4,7 @@
 
 use crate::settings::ReflectorSettings;
 
-use super::{AdvancedSettings, NetworkSettings, ObservabilitySettings, OutputSettings, Settings};
+use super::{NetworkSettings, ObservabilitySettings, OutputSettings, Settings};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
@@ -31,7 +31,7 @@ pub(crate) struct ValidationReport {
 }
 
 impl ValidationReport {
-    fn warning(&mut self, path: &'static str, message: impl Into<String>) {
+    pub(crate) fn warning(&mut self, path: &'static str, message: impl Into<String>) {
         self.issues.push(ValidationIssue {
             severity: ValidationSeverity::Warning,
             path,
@@ -39,7 +39,7 @@ impl ValidationReport {
         });
     }
 
-    fn error(&mut self, path: &'static str, message: impl Into<String>) {
+    pub(crate) fn error(&mut self, path: &'static str, message: impl Into<String>) {
         self.issues.push(ValidationIssue {
             severity: ValidationSeverity::Error,
             path,
@@ -47,7 +47,7 @@ impl ValidationReport {
         });
     }
 
-    fn finish(self) -> Result<(), Self> {
+    pub(crate) fn finish(self) -> Result<(), Self> {
         let mut errors = Vec::new();
 
         for issue in self.issues {
@@ -92,7 +92,6 @@ impl Settings {
         self.reflectors.validate(&mut report);
         self.output.validate(&mut report);
         self.observability.validate(&mut report);
-        self.advanced_settings.validate(&mut report);
 
         report.finish()
     }
@@ -347,104 +346,7 @@ impl ObservabilitySettings {
     }
 }
 
-impl AdvancedSettings {
-    fn validate(&self, report: &mut ValidationReport) {
-        validate_zero_or_greater_f64(
-            report,
-            "advanced_settings.download_delay_ms",
-            self.download_delay_ms,
-        );
-
-        validate_zero_or_greater_f64(
-            report,
-            "advanced_settings.upload_delay_ms",
-            self.upload_delay_ms,
-        );
-
-        let high_load_level_valid = validate_zero_or_greater_f64(
-            report,
-            "advanced_settings.high_load_level",
-            self.high_load_level,
-        );
-
-        if validate_greater_than_zero_f64(
-            report,
-            "advanced_settings.min_change_interval",
-            self.min_change_interval,
-        ) && !std::time::Duration::try_from_secs_f64(self.min_change_interval)
-            .is_ok_and(|interval| !interval.is_zero())
-        {
-            report.error(
-                "advanced_settings.min_change_interval",
-                "must convert to a nonzero representable duration",
-            );
-        }
-
-        if !std::time::Duration::try_from_secs_f64(self.tick_interval).is_ok_and(|period| {
-            !period.is_zero() && std::time::Instant::now().checked_add(period).is_some()
-        }) {
-            report.error(
-                "advanced_settings.tick_interval",
-                "must be a nonzero representable duration",
-            );
-        }
-
-        if !(0.0..1.0).contains(&self.low_load_cut_floor) {
-            report.error(
-                "advanced_settings.low_load_cut_floor",
-                "must be at least 0 and below 1",
-            );
-        }
-
-        if !(0.0..=100.0).contains(&self.idle_recovery_percent) {
-            report.error(
-                "advanced_settings.idle_recovery_percent",
-                "must be between 0 and 100",
-            );
-        }
-
-        if !(0.0..=1.0).contains(&self.low_load_level) {
-            report.error(
-                "advanced_settings.low_load_level",
-                "must be between 0 and 1",
-            );
-        }
-
-        if let Some(path) = self.history_file.as_deref().map(str::trim)
-            && !path.is_empty()
-            && !path.starts_with('/')
-        {
-            report.error("advanced_settings.history_file", "must be an absolute path");
-        }
-
-        if self.speed_hist_size == 0 {
-            report.error(
-                "advanced_settings.speed_hist_size",
-                "must be greater than 0",
-            );
-        }
-
-        if high_load_level_valid {
-            if self.high_load_level == 0.0 {
-                report.warning(
-                    "advanced_settings.high_load_level",
-                    "0 causes any positive load to be treated as high load",
-                );
-            } else if self.high_load_level > 1.0 {
-                report.warning(
-                    "advanced_settings.high_load_level",
-                    format!(
-                        "{} requires utilisation to exceed the current shaper rate \
-                         before the high-load threshold is reached",
-                        self.high_load_level,
-                    ),
-                );
-            }
-        }
-    }
-}
-
-fn validate_greater_than_zero_f64(
+pub(crate) fn validate_greater_than_zero_f64(
     report: &mut ValidationReport,
     path: &'static str,
     value: f64,
@@ -460,7 +362,7 @@ fn validate_greater_than_zero_f64(
     }
 }
 
-fn validate_zero_or_greater_f64(
+pub(crate) fn validate_zero_or_greater_f64(
     report: &mut ValidationReport,
     path: &'static str,
     value: f64,
@@ -503,29 +405,6 @@ mod tests {
             measurement_bind_device: None,
             measurement_mark: None,
             measurement_fib: None,
-        }
-    }
-
-    #[test]
-    fn min_change_interval_must_be_a_nonzero_representable_duration() {
-        for value in [1e-300, 0.49e-9, f64::MAX] {
-            let settings = AdvancedSettings {
-                min_change_interval: value,
-                ..Default::default()
-            };
-            let mut report = ValidationReport::default();
-            settings.validate(&mut report);
-            let error = report.finish().unwrap_err().to_string();
-            assert!(error.contains("advanced_settings.min_change_interval"));
-        }
-        for value in [1e-9, 0.5] {
-            let settings = AdvancedSettings {
-                min_change_interval: value,
-                ..Default::default()
-            };
-            let mut report = ValidationReport::default();
-            settings.validate(&mut report);
-            assert!(report.finish().is_ok());
         }
     }
 

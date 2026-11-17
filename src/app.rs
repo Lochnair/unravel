@@ -56,20 +56,6 @@ impl App {
             info!("*** MONITORING MODE ACTIVE — qdisc rates will NOT be changed ***");
         }
 
-        let interval = Duration::from_secs_f64(settings.advanced_settings.tick_interval);
-
-        let (plan_tx, plan_rx) = watch::channel(MeasurementPlan {
-            revision: 0,
-            active_interval: interval,
-            assignments: Vec::new(),
-        });
-        let (applied_tx, applied_rx) = watch::channel(AppliedState::default());
-        let (measurement_stop, stop_rx) = watch::channel(false);
-        let (engine_done, measurement_done) = watch::channel(false);
-        let (measurement_tx, measurement_rx) = broadcast::channel(256);
-        let manager_measurements = measurement_tx.subscribe();
-        let (traffic_tx, traffic_rx) = watch::channel(None);
-
         let platform = Arc::new(Platform::default());
         for interface in [
             settings.network.download_interface(),
@@ -81,7 +67,30 @@ impl App {
             platform.validate_shaper(interface)?;
         }
 
-        let runtime = Arc::new(Runtime::new(platform, settings.clone(), traffic_tx)?);
+        // The law is built first: it decides the probing and sampling cadence
+        // the rest of the pipeline runs at.
+        let (diagnostics, csv_writer) = CsvWriter::new(&settings.output).await?.unzip();
+        let law = law::build(&settings, diagnostics)?;
+        let cadence = law.cadence();
+
+        let (plan_tx, plan_rx) = watch::channel(MeasurementPlan {
+            revision: 0,
+            active_interval: cadence.probe,
+            assignments: Vec::new(),
+        });
+        let (applied_tx, applied_rx) = watch::channel(AppliedState::default());
+        let (measurement_stop, stop_rx) = watch::channel(false);
+        let (engine_done, measurement_done) = watch::channel(false);
+        let (measurement_tx, measurement_rx) = broadcast::channel(256);
+        let manager_measurements = measurement_tx.subscribe();
+        let (traffic_tx, traffic_rx) = watch::channel(None);
+
+        let runtime = Arc::new(Runtime::new(
+            platform,
+            settings.clone(),
+            cadence.traffic,
+            traffic_tx,
+        )?);
 
         let engine = MeasurementEngine::new(
             &settings.network,
@@ -104,17 +113,17 @@ impl App {
             (MetricsSender::disabled(), None)
         };
 
-        let (diagnostics, csv_writer) = CsvWriter::new(&settings.output).await?.unzip();
-        let law = law::build(&settings, diagnostics)?;
         let law_ctx = LawContext::new(
             measurement_rx,
             metrics.clone(),
             Arc::clone(&runtime),
             applied_rx.clone(),
             traffic_rx,
+            settings.reflectors.num_reflectors as usize,
         );
         let manager = ReflectorManager::new(
             &settings,
+            cadence.probe,
             plan_tx,
             applied_rx,
             manager_measurements,

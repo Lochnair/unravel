@@ -288,6 +288,7 @@ pub struct ReflectorManager {
 impl ReflectorManager {
     pub async fn new(
         settings: &Settings,
+        active_period: Duration,
         desired: watch::Sender<MeasurementPlan>,
         applied: watch::Receiver<AppliedState>,
         measurements: broadcast::Receiver<MeasurementEvent>,
@@ -343,7 +344,7 @@ impl ReflectorManager {
             degraded_since: None,
             next_policy_at: now + POLICY_INTERVAL,
             pool_discovery,
-            active_period: Duration::from_secs_f64(settings.advanced_settings.tick_interval),
+            active_period,
             candidate_period: Duration::from_secs_f64(reflectors.candidate_period),
             rng,
             desired,
