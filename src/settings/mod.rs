@@ -198,6 +198,10 @@ impl Default for LawSettings {
 
 impl Settings {
     /// Loads the settings of `instance`, or of the unnamed instance.
+    #[cfg_attr(
+        not(any(all(feature = "uci", unix), feature = "toml")),
+        allow(unused_variables)
+    )]
     pub(crate) fn load(instance: Option<&str>) -> Result<Self, ConfigError> {
         let builder = Config::builder();
 
