@@ -33,6 +33,12 @@ start_instance() {
     local section="$1"
     local enabled output syslog_out
 
+    # `default` is the unnamed instance's name; unravel rejects it.
+    if [ "$section" = default ]; then
+        logger -t "$SERVICE_NAME" "network section 'default' is reserved, rename it"
+        return 0
+    fi
+
     enabled=$(uci -q get "${SERVICE_NAME}.${section}.enabled")
     [ "$(bool_to_int "$enabled" 1)" = 1 ] || return 0
 

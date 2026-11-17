@@ -75,6 +75,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Option<S
             !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "Instance name {name:?} must be letters, digits and underscores"
         );
+        anyhow::ensure!(
+            name != DEFAULT_INSTANCE,
+            "Instance name {name:?} is reserved for the unnamed instance; rename the network section"
+        );
         instance = Some(name);
     }
     Ok(instance)
