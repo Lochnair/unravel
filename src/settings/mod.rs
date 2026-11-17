@@ -254,7 +254,10 @@ impl Settings {
     }
 }
 
+// `enabled` is read by the OpenWrt init script, which starts only the
+// instances that are not disabled.
 #[derive(Clone, Debug, Deserialize, UciSection)]
+#[uci(external = "enabled")]
 pub(crate) struct NetworkSettings {
     pub(crate) download_interface: String,
     pub(crate) upload_interface: String,
