@@ -726,7 +726,6 @@ impl SqmaLaw {
                 continue;
             };
 
-            let load = traffic_kbps / state.current_kbps;
             let next = state.calculate_rate(
                 shaper,
                 traffic_kbps,
@@ -741,12 +740,11 @@ impl SqmaLaw {
                 state.current_kbps = next;
             }
 
-            ctx.metrics.send(Metric::Rate {
-                direction,
-                rate_kbps: state.current_kbps,
-                load,
-                delta_delay: deltas[deltas.len() / 2],
-            });
+            ctx.metrics.send(
+                Metric::law("delta")
+                    .tag("direction", direction.as_str())
+                    .field("delta_delay", deltas[deltas.len() / 2]),
+            );
         }
 
         self.save_history(ctx.store(), now).await;
@@ -795,21 +793,6 @@ impl SqmaLaw {
                 self.reflectors.remove(&event.target);
             }
             return Ok(());
-        }
-        // Diagnostics retain raw signed values, including rejected OWDs and
-        // observations arriving during the recovery hold.
-        if let Some(rtt_ms) = event.rtt_ms() {
-            ctx.metrics.send(Metric::Ping {
-                reflector: event.target.peer(),
-                protocol: event.target.protocol(),
-                rtt: rtt_ms,
-                up_time: one_way
-                    .map(|o| o.uplink.as_secs_f64() * 1000.0)
-                    .unwrap_or(rtt_ms / 2.0),
-                down_time: one_way
-                    .map(|o| o.downlink.as_secs_f64() * 1000.0)
-                    .unwrap_or(rtt_ms / 2.0),
-            });
         }
         if let Some(OneWayLatency {
             status: OneWayStatus::Unusable(reason),
@@ -880,13 +863,19 @@ impl SqmaLaw {
             self.slow_factor,
             self.fast_factor,
         );
-        ctx.metrics.send(Metric::Baseline {
-            reflector: event.target.peer(),
-            baseline_up_ewma: state.baseline.up,
-            baseline_down_ewma: state.baseline.down,
-            recent_up_ewma: state.recent.up,
-            recent_down_ewma: state.recent.down,
-        });
+        let reflector = event.target.peer().to_string();
+        for (direction, baseline, recent) in [
+            ("up", state.baseline.up, state.recent.up),
+            ("down", state.baseline.down, state.recent.down),
+        ] {
+            ctx.metrics.send(
+                Metric::law("baseline")
+                    .tag("reflector", reflector.as_str())
+                    .tag("direction", direction)
+                    .field("baseline_ewma", baseline)
+                    .field("recent_ewma", recent),
+            );
+        }
         Ok(())
     }
 }

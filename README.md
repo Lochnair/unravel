@@ -208,7 +208,18 @@ host = "192.168.1.100"
 port = 8089
 ```
 
-TCP is also supported. Rate metrics and events are exported by default when enabled; add `export_ping_metrics = true` or `export_baseline_metrics = true` if you need those too.
+TCP is also supported. Every line carries `host` and `instance` tags. Rate metrics and events are exported by default when enabled; add `export_ping_metrics = true` or `export_law_metrics = true` if you need those too.
+
+| Measurement | Sent | Tags | Fields |
+| --- | --- | --- | --- |
+| `unravel_rate` | per traffic sample, once a rate is set | `direction` | `rate_kbps`, `load` |
+| `unravel_ping` | per reply (`export_ping_metrics`) | `reflector`, `type` | `rtt`, `up_time`, `down_time` (when one-way times exist) |
+| `unravel_loss` | per lost probe (`export_ping_metrics`) | `reflector`, `type` | `count` |
+| `unravel_event` | on events | `type`, `reason`, `reflector`, … | `count` |
+| `unravel_law` | by the control law (`export_law_metrics`) | `law`, `series`, the law's own | the law's own |
+| `unravel_metrics_dropped` | when the queue overflowed | | `count` |
+
+SQMA sends `unravel_law` series `baseline` (tags `reflector`, `direction`; fields `baseline_ewma`, `recent_ewma`) and `delta` (tag `direction`; field `delta_delay`).
 
 ## License
 

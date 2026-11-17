@@ -311,7 +311,7 @@ impl ObservabilitySettings {
 
         if !self.export_ping_metrics
             && !self.export_rate_metrics
-            && !self.export_baseline_metrics
+            && !self.export_law_metrics
             && !self.export_events
         {
             report.warning(

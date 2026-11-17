@@ -2,12 +2,13 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::measurement::model::MeasurementProtocol;
+use crate::measurement::model::{MeasurementProtocol, MeasurementRole};
 use crate::runtime::Direction;
 use crate::settings::Settings;
 use crate::settings::{ObservabilityProtocol, ObservabilitySettings};
 use crate::time::{ClockSample, Realtime};
 use log::{info, warn};
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -112,26 +113,28 @@ impl Transport {
     }
 }
 
+/// Build metrics with the constructors below, not the variants.
 pub enum Metric {
+    /// One reply, sent by the measurement engine whatever law runs.
     Ping {
         reflector: IpAddr,
         protocol: MeasurementProtocol,
+        role: MeasurementRole,
         rtt: f64,
-        up_time: f64,
-        down_time: f64,
+        /// Raw one-way times in ms (up, down), when the protocol has them.
+        one_way: Option<(f64, f64)>,
     },
+    /// One lost probe, sent by the measurement engine.
+    Loss {
+        reflector: IpAddr,
+        protocol: MeasurementProtocol,
+        role: MeasurementRole,
+    },
+    /// The applied rate and its load, sent by the runtime per traffic sample.
     Rate {
         direction: Direction,
         rate_kbps: f64,
         load: f64,
-        delta_delay: f64,
-    },
-    Baseline {
-        reflector: IpAddr,
-        baseline_up_ewma: f64,
-        baseline_down_ewma: f64,
-        recent_up_ewma: f64,
-        recent_down_ewma: f64,
     },
     Event {
         name: String,
@@ -139,12 +142,50 @@ pub enum Metric {
         reflector: Option<IpAddr>,
         tags: Vec<(String, String)>,
     },
+    /// A law's own series. The writer adds the `law` tag.
+    Law {
+        series: String,
+        tags: Vec<(String, String)>,
+        fields: Vec<(String, f64)>,
+    },
     Dropped {
         count: u32,
     },
 }
 
 impl Metric {
+    pub fn ping(
+        reflector: IpAddr,
+        protocol: MeasurementProtocol,
+        role: MeasurementRole,
+        rtt: f64,
+        one_way: Option<(f64, f64)>,
+    ) -> Self {
+        Metric::Ping {
+            reflector,
+            protocol,
+            role,
+            rtt,
+            one_way,
+        }
+    }
+
+    pub fn loss(reflector: IpAddr, protocol: MeasurementProtocol, role: MeasurementRole) -> Self {
+        Metric::Loss {
+            reflector,
+            protocol,
+            role,
+        }
+    }
+
+    pub fn rate(direction: Direction, rate_kbps: f64, load: f64) -> Self {
+        Metric::Rate {
+            direction,
+            rate_kbps,
+            load,
+        }
+    }
+
     pub fn event(
         name: impl Into<String>,
         reason: impl Into<String>,
@@ -158,12 +199,44 @@ impl Metric {
         }
     }
 
-    /// Adds a tag to an event; other metrics are returned unchanged.
+    pub fn law(series: impl Into<String>) -> Self {
+        Metric::Law {
+            series: series.into(),
+            tags: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    /// Adds a tag to an event or law metric; other metrics are unchanged.
     pub fn tag(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        if let Metric::Event { tags, .. } = &mut self {
+        if let Metric::Event { tags, .. } | Metric::Law { tags, .. } = &mut self {
             tags.push((key.into(), value.into()));
         }
         self
+    }
+
+    /// Adds a field to a law metric; other metrics are unchanged.
+    pub fn field(mut self, key: impl Into<String>, value: f64) -> Self {
+        if let Metric::Law { fields, .. } = &mut self {
+            fields.push((key.into(), value));
+        }
+        self
+    }
+}
+
+/// Escapes a tag key, tag value or field key for the line protocol.
+fn escape(text: &str) -> Cow<'_, str> {
+    if text.contains([',', '=', ' ', '\\']) {
+        let mut out = String::with_capacity(text.len() + 4);
+        for c in text.chars() {
+            if matches!(c, ',' | '=' | ' ' | '\\') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -172,7 +245,7 @@ pub struct MetricsSender {
     tx: Option<mpsc::Sender<(Metric, u64)>>,
     dropped: Arc<AtomicU32>,
     export_ping_metrics: bool,
-    export_baseline_metrics: bool,
+    export_law_metrics: bool,
     export_rate_metrics: bool,
     export_events: bool,
 }
@@ -187,7 +260,7 @@ impl MetricsSender {
             tx: Some(tx),
             dropped,
             export_ping_metrics: settings.export_ping_metrics,
-            export_baseline_metrics: settings.export_baseline_metrics,
+            export_law_metrics: settings.export_law_metrics,
             export_rate_metrics: settings.export_rate_metrics,
             export_events: settings.export_events,
         }
@@ -198,7 +271,7 @@ impl MetricsSender {
             tx: None,
             dropped: Arc::new(AtomicU32::new(0)),
             export_ping_metrics: false,
-            export_baseline_metrics: false,
+            export_law_metrics: false,
             export_rate_metrics: false,
             export_events: false,
         }
@@ -206,8 +279,8 @@ impl MetricsSender {
 
     pub fn send(&self, metric: Metric) {
         let enabled = match &metric {
-            Metric::Ping { .. } => self.export_ping_metrics,
-            Metric::Baseline { .. } => self.export_baseline_metrics,
+            Metric::Ping { .. } | Metric::Loss { .. } => self.export_ping_metrics,
+            Metric::Law { .. } => self.export_law_metrics,
             Metric::Rate { .. } => self.export_rate_metrics,
             Metric::Event { .. } => self.export_events,
             Metric::Dropped { .. } => true,
@@ -225,10 +298,30 @@ impl MetricsSender {
     }
 }
 
+/// Tags on every line, `host=…,instance=…`, and with `law=…` for law metrics.
+#[derive(Clone)]
+struct LineTags {
+    common: String,
+    law: String,
+}
+
+fn role_name(role: MeasurementRole) -> &'static str {
+    match role {
+        MeasurementRole::Active => "active",
+        MeasurementRole::Candidate => "candidate",
+    }
+}
+
+fn write_tags(out: &mut String, tags: &[(String, String)]) {
+    // The line protocol has no empty tag keys or values.
+    for (key, value) in tags.iter().filter(|(k, v)| !k.is_empty() && !v.is_empty()) {
+        write!(out, ",{}={}", escape(key), escape(value)).unwrap_or(());
+    }
+}
+
 pub struct Metrics {
     settings: Settings,
-    /// Tags on every line: `host=<host_tag>,instance=<instance>`.
-    tags: String,
+    tags: LineTags,
     metrics_dropped: Arc<AtomicU32>,
     metrics_rx: mpsc::Receiver<(Metric, u64)>,
     transport: Transport,
@@ -257,10 +350,15 @@ impl Metrics {
                 Transport::new_tcp(host, port)
             }
         };
-        let tags = format!(
-            "host={},instance={instance}",
-            settings.observability.host_tag
+        let common = format!(
+            "host={},instance={}",
+            escape(&settings.observability.host_tag),
+            escape(instance)
         );
+        let tags = LineTags {
+            law: format!("{common},law={}", escape(&settings.law.name)),
+            common,
+        };
         Ok(Self {
             settings,
             tags,
@@ -330,7 +428,7 @@ impl Metrics {
         }
     }
 
-    async fn flush(transport: &mut Transport, batch: &[(Metric, u64)], tags: &str) {
+    async fn flush(transport: &mut Transport, batch: &[(Metric, u64)], tags: &LineTags) {
         match transport {
             /*
              * the UDP receive buffer might be too small on the receiver to accept batched data,
@@ -354,19 +452,36 @@ impl Metrics {
         }
     }
 
-    fn write_lines(metric: &Metric, timestamp_ns: u64, common: &str, out: &mut String) {
+    fn write_lines(metric: &Metric, timestamp_ns: u64, tags: &LineTags, out: &mut String) {
+        let common = &tags.common;
         match metric {
             Metric::Ping {
                 reflector,
                 protocol,
+                role,
                 rtt,
-                up_time,
-                down_time,
+                one_way,
+            } => {
+                write!(
+                    out,
+                    "unravel_ping,{common},reflector={reflector},type={protocol},role={} rtt={rtt:.3}",
+                    role_name(*role)
+                )
+                .unwrap_or(());
+                if let Some((up, down)) = one_way {
+                    write!(out, ",up_time={up:.3},down_time={down:.3}").unwrap_or(());
+                }
+                writeln!(out, " {timestamp_ns}").unwrap_or(());
+            }
+            Metric::Loss {
+                reflector,
+                protocol,
+                role,
             } => {
                 writeln!(
                     out,
-                    "sqm_ping,{common},reflector={reflector},type={protocol} \
-                    rtt={rtt:.3},up_time={up_time:.3},down_time={down_time:.3} {timestamp_ns}"
+                    "unravel_loss,{common},reflector={reflector},type={protocol},role={} count=1i {timestamp_ns}",
+                    role_name(*role)
                 )
                 .unwrap_or(());
             }
@@ -374,32 +489,17 @@ impl Metrics {
                 direction,
                 rate_kbps,
                 load,
-                delta_delay,
             } => {
-                let direction = match direction {
-                    Direction::Download => "download",
-                    Direction::Upload => "upload",
-                };
-                writeln!(out,
-                    "sqm_rate,{common},direction={direction} \
-                    rate_kbps={rate_kbps:.0},load={load:.4},delta_delay={delta_delay:.3} {timestamp_ns}"
-                ).unwrap_or(());
-            }
-            Metric::Baseline {
-                reflector,
-                baseline_up_ewma,
-                baseline_down_ewma,
-                recent_up_ewma,
-                recent_down_ewma,
-            } => {
-                writeln!(out,
-                    "sqm_baseline,{common},reflector={reflector},direction=up \
-                    baseline_ewma={baseline_up_ewma:.3},recent_ewma={recent_up_ewma:.3} {timestamp_ns}"
-                ).unwrap_or(());
-                writeln!(out,
-                    "sqm_baseline,{common},reflector={reflector},direction=down \
-                    baseline_ewma={baseline_down_ewma:.3},recent_ewma={recent_down_ewma:.3} {timestamp_ns}"
-                ).unwrap_or(());
+                write!(
+                    out,
+                    "unravel_rate,{common},direction={} rate_kbps={rate_kbps:.0}",
+                    direction.as_str()
+                )
+                .unwrap_or(());
+                if load.is_finite() {
+                    write!(out, ",load={load:.4}").unwrap_or(());
+                }
+                writeln!(out, " {timestamp_ns}").unwrap_or(());
             }
             Metric::Event {
                 name,
@@ -407,26 +507,37 @@ impl Metrics {
                 reflector,
                 tags,
             } => {
-                let mut tag_str = format!("{common},type={name}");
-
+                write!(out, "unravel_event,{common},type={}", escape(name)).unwrap_or(());
                 if let Some(reflector) = reflector {
-                    write!(tag_str, ",reflector={reflector}").unwrap_or(());
+                    write!(out, ",reflector={reflector}").unwrap_or(());
                 }
-
                 if !reason.is_empty() {
-                    write!(tag_str, ",reason={reason}").unwrap_or(());
+                    write!(out, ",reason={}", escape(reason)).unwrap_or(());
                 }
-
-                for (k, v) in tags {
-                    write!(tag_str, ",{k}={v}").unwrap_or(());
+                write_tags(out, tags);
+                writeln!(out, " count=1i {timestamp_ns}").unwrap_or(());
+            }
+            Metric::Law {
+                series,
+                tags: law_tags,
+                fields,
+            } => {
+                let mut fields = fields.iter().filter(|(_, value)| value.is_finite());
+                let Some((key, value)) = fields.next() else {
+                    return;
+                };
+                write!(out, "unravel_law,{},series={}", tags.law, escape(series)).unwrap_or(());
+                write_tags(out, law_tags);
+                write!(out, " {}={value}", escape(key)).unwrap_or(());
+                for (key, value) in fields {
+                    write!(out, ",{}={value}", escape(key)).unwrap_or(());
                 }
-
-                writeln!(out, "sqm_event,{tag_str} count=1i {timestamp_ns}").unwrap_or(());
+                writeln!(out, " {timestamp_ns}").unwrap_or(());
             }
             Metric::Dropped { count } => {
                 writeln!(
                     out,
-                    "sqm_metrics_dropped,{common} count={count}i {timestamp_ns}"
+                    "unravel_metrics_dropped,{common} count={count}i {timestamp_ns}"
                 )
                 .unwrap_or(());
             }

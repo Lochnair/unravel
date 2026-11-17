@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -11,6 +14,7 @@ use log::{error, warn};
 use tokio::{sync::watch, time};
 
 use crate::{
+    metrics::{Metric, MetricsSender},
     platform::{InterfaceStats, Platform},
     settings::Settings,
     time::{CLOCK_SAMPLE_INTERVAL, ClockStep, ClockTracker},
@@ -22,12 +26,39 @@ pub(crate) enum Direction {
     Upload,
 }
 
+impl Direction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Direction::Download => "download",
+            Direction::Upload => "upload",
+        }
+    }
+}
+
 pub(crate) struct Shaper {
     interface: String,
 
     pub(crate) base_kbps: f64,
     pub(crate) min_kbps: f64,
     pub(crate) max_kbps: Option<f64>,
+    /// The last rate applied, as `f64` bits; NaN until the first one.
+    applied_kbps: AtomicU64,
+}
+
+impl Shaper {
+    fn new(interface: &str, base_kbps: f64, min_kbps: f64) -> Self {
+        Self {
+            interface: interface.to_owned(),
+            base_kbps,
+            min_kbps,
+            max_kbps: None,
+            applied_kbps: AtomicU64::new(f64::NAN.to_bits()),
+        }
+    }
+
+    fn applied_kbps(&self) -> Option<f64> {
+        Some(f64::from_bits(self.applied_kbps.load(Ordering::Relaxed))).filter(|r| !r.is_nan())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +80,7 @@ pub struct Runtime {
     download: Option<Shaper>,
     upload: Option<Shaper>,
     dry_run: bool,
+    metrics: MetricsSender,
 }
 
 impl Runtime {
@@ -57,6 +89,7 @@ impl Runtime {
         settings: Settings,
         sample_interval: Duration,
         traffic_tx: watch::Sender<Option<TrafficRates>>,
+        metrics: MetricsSender,
     ) -> anyhow::Result<Self> {
         let traffic_interface = settings
             .network
@@ -69,21 +102,21 @@ impl Runtime {
             sample_interval,
             traffic_tx,
             clock_steps_tx: watch::channel(None).0,
-            download: settings
-                .network
-                .download_interface()
-                .map(|interface| Shaper {
-                    interface: interface.to_owned(),
-                    base_kbps: settings.network.download_base_kbits,
-                    min_kbps: settings.network.download_min_kbits(),
-                    max_kbps: None,
-                }),
-            upload: settings.network.upload_interface().map(|interface| Shaper {
-                interface: interface.to_owned(),
-                base_kbps: settings.network.upload_base_kbits,
-                min_kbps: settings.network.upload_min_kbits(),
-                max_kbps: None,
+            download: settings.network.download_interface().map(|interface| {
+                Shaper::new(
+                    interface,
+                    settings.network.download_base_kbits,
+                    settings.network.download_min_kbits(),
+                )
             }),
+            upload: settings.network.upload_interface().map(|interface| {
+                Shaper::new(
+                    interface,
+                    settings.network.upload_base_kbits,
+                    settings.network.upload_min_kbits(),
+                )
+            }),
+            metrics,
             dry_run: settings.advanced_settings.dry_run,
         })
     }
@@ -196,6 +229,16 @@ impl Runtime {
         };
 
         self.traffic_tx.send_replace(Some(rates));
+
+        for (direction, traffic_kbps) in [
+            (Direction::Download, rates.rx_kbps),
+            (Direction::Upload, rates.tx_kbps),
+        ] {
+            if let Some(rate_kbps) = self.shaper(direction).and_then(Shaper::applied_kbps) {
+                self.metrics
+                    .send(Metric::rate(direction, rate_kbps, traffic_kbps / rate_kbps));
+            }
+        }
     }
 
     pub(super) fn shaper(&self, direction: Direction) -> Option<&Shaper> {
@@ -234,6 +277,9 @@ impl Runtime {
 
         self.platform
             .set_rate(&shaper.interface, rate_kbps.round() as u64, self.dry_run)?;
+        shaper
+            .applied_kbps
+            .store(rate_kbps.to_bits(), Ordering::Relaxed);
 
         Ok(())
     }

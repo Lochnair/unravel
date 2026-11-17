@@ -108,22 +108,6 @@ impl App {
         let manager_measurements = measurement_tx.subscribe();
         let (traffic_tx, traffic_rx) = watch::channel(None);
 
-        let runtime = Arc::new(Runtime::new(
-            platform,
-            settings.clone(),
-            cadence.traffic,
-            traffic_tx,
-        )?);
-
-        let engine = MeasurementEngine::new(
-            &settings.network,
-            plan_rx,
-            applied_tx,
-            measurement_tx,
-            stop_rx,
-            runtime.clock_steps(),
-        )?;
-
         let (metrics, exporter) = if settings.observability.enabled {
             let dropped = Arc::new(AtomicU32::new(0));
             let (tx, rx) = mpsc::channel(1000);
@@ -136,6 +120,24 @@ impl App {
         } else {
             (MetricsSender::disabled(), None)
         };
+
+        let runtime = Arc::new(Runtime::new(
+            platform,
+            settings.clone(),
+            cadence.traffic,
+            traffic_tx,
+            metrics.clone(),
+        )?);
+
+        let engine = MeasurementEngine::new(
+            &settings.network,
+            plan_rx,
+            applied_tx,
+            measurement_tx,
+            stop_rx,
+            runtime.clock_steps(),
+            metrics.clone(),
+        )?;
 
         let law_ctx = LawContext::new(
             measurement_rx,

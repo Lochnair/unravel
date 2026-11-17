@@ -426,7 +426,7 @@ pub(crate) struct ObservabilitySettings {
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) export_rate_metrics: bool,
     #[serde(deserialize_with = "deserialize_flex_bool")]
-    pub(crate) export_baseline_metrics: bool,
+    pub(crate) export_law_metrics: bool,
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) export_events: bool,
     pub(crate) host_tag: String,
@@ -443,7 +443,7 @@ impl Default for ObservabilitySettings {
             batch_timeout_ms: 100,
             export_ping_metrics: false,
             export_rate_metrics: true,
-            export_baseline_metrics: false,
+            export_law_metrics: false,
             export_events: true,
             host_tag: default_host_tag(),
         }

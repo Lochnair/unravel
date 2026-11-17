@@ -7,11 +7,14 @@ use super::irtt::IrttDriver;
 use super::{
     icmp::IcmpDriver,
     integrity::MeasurementIntegrity,
-    model::{MeasurementEvent, MeasurementOutcome, MeasurementTarget},
+    model::{MeasurementEvent, MeasurementOutcome, MeasurementRole, MeasurementTarget},
     plan::{AppliedState, AppliedTarget, MeasurementPlan},
     scheduler::ProbeScheduler,
 };
-use crate::{error::ChannelClosed, settings::NetworkSettings, time::ClockStep};
+use crate::{
+    error::ChannelClosed, metrics::Metric, metrics::MetricsSender, settings::NetworkSettings,
+    time::ClockStep,
+};
 use log::{trace, warn};
 use std::{
     collections::{BTreeMap, HashSet},
@@ -38,9 +41,31 @@ pub struct MeasurementEngine {
     rejected_revision: Option<u64>,
     integrity: MeasurementIntegrity,
     clock_steps: watch::Receiver<Option<ClockStep>>,
+    metrics: MetricsSender,
 }
 
 impl MeasurementEngine {
+    /// Raw one-way times are kept, including ones integrity rejected.
+    fn publish_metric(&self, event: &MeasurementEvent, role: MeasurementRole) {
+        let (peer, protocol) = (event.target.peer(), event.target.protocol());
+        let metric = match event.outcome {
+            MeasurementOutcome::Loss => Metric::loss(peer, protocol, role),
+            MeasurementOutcome::Reply { one_way, .. } => {
+                let Some(rtt_ms) = event.rtt_ms() else {
+                    return;
+                };
+                let one_way = one_way.map(|o| {
+                    (
+                        o.uplink.as_secs_f64() * 1000.0,
+                        o.downlink.as_secs_f64() * 1000.0,
+                    )
+                });
+                Metric::ping(peer, protocol, role, rtt_ms, one_way)
+            }
+        };
+        self.metrics.send(metric);
+    }
+
     pub fn new(
         settings: &NetworkSettings,
         desired: watch::Receiver<MeasurementPlan>,
@@ -48,6 +73,7 @@ impl MeasurementEngine {
         measurements: broadcast::Sender<MeasurementEvent>,
         stop: watch::Receiver<bool>,
         clock_steps: watch::Receiver<Option<ClockStep>>,
+        metrics: MetricsSender,
     ) -> anyhow::Result<Self> {
         let initial = desired.borrow().clone();
         initial.validate()?;
@@ -70,6 +96,7 @@ impl MeasurementEngine {
             rejected_revision: None,
             integrity: MeasurementIntegrity::default(),
             clock_steps,
+            metrics,
         };
         engine.apply(initial)?;
         Ok(engine)
@@ -232,15 +259,17 @@ impl MeasurementEngine {
         self.sync_clock()?;
         for mut completion in completions {
             // Retired targets must not recreate integrity state with late replies.
-            if !self
+            let Some(role) = self
                 .plan
                 .assignments
                 .iter()
-                .any(|a| a.target == completion.target)
-            {
+                .find(|a| a.target == completion.target)
+                .map(|a| a.role)
+            else {
                 continue;
-            }
+            };
             self.integrity.assess(&mut completion);
+            self.publish_metric(&completion, role);
             if let MeasurementOutcome::Reply {
                 one_way: Some(owd), ..
             } = completion.outcome
