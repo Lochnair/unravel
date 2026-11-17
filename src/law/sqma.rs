@@ -370,6 +370,10 @@ pub(crate) struct SqmaLaw {
     history_path: Option<PathBuf>,
     history_saved_at: Option<Instant>,
     history_saved_body: String,
+
+    // Missing reflector data is checked every tick; warn once per episode.
+    warned_few_deltas: bool,
+    warned_no_deltas: bool,
 }
 
 #[async_trait::async_trait]
@@ -473,6 +477,8 @@ impl SqmaLaw {
             history_path,
             history_saved_at: None,
             history_saved_body: String::new(),
+            warned_few_deltas: false,
+            warned_no_deltas: false,
         })
     }
 
@@ -653,16 +659,25 @@ impl SqmaLaw {
 
         let minimum = ctx.num_reflectors().min(target_count);
         if target_count == 0 || down_deltas.len() < minimum || up_deltas.len() < minimum {
-            warn!(
-                "Not enough active delta values (D: {}, U: {}, need {})",
-                down_deltas.len(),
-                up_deltas.len(),
-                minimum
-            );
+            if !self.warned_few_deltas {
+                warn!(
+                    "Not enough active delta values (D: {}, U: {}, need {})",
+                    down_deltas.len(),
+                    up_deltas.len(),
+                    minimum
+                );
+                self.warned_few_deltas = true;
+            }
+        } else if self.warned_few_deltas {
+            info!("Enough active delta values again");
+            self.warned_few_deltas = false;
         }
 
         if down_deltas.is_empty() || up_deltas.is_empty() {
-            warn!("No reflector data available, dropping to minimum rates");
+            if !self.warned_no_deltas {
+                warn!("No reflector data available, dropping to minimum rates");
+                self.warned_no_deltas = true;
+            }
             ctx.metrics.send(Metric::Event {
                 name: "reflector_unavailable",
                 reason: "",
@@ -683,6 +698,10 @@ impl SqmaLaw {
             }
 
             return Ok(());
+        }
+        if self.warned_no_deltas {
+            info!("Reflector data available again");
+            self.warned_no_deltas = false;
         }
 
         let Some(traffic) = *ctx.traffic.borrow() else {
