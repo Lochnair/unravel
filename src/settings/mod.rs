@@ -150,7 +150,9 @@ pub(crate) struct Settings {
     #[uci(section)]
     pub(crate) law: LawSettings,
 
-    #[uci(section)]
+    // In UCI each `network` section is an instance, and refers to the other
+    // sections it uses by name.
+    #[uci(section, anchor)]
     pub(crate) network: NetworkSettings,
 
     #[serde(default)]
@@ -195,12 +197,14 @@ impl Default for LawSettings {
 }
 
 impl Settings {
-    pub(crate) fn load() -> Result<Self, ConfigError> {
+    /// Loads the settings of `instance`, or of the unnamed instance.
+    pub(crate) fn load(instance: Option<&str>) -> Result<Self, ConfigError> {
         let builder = Config::builder();
 
         #[cfg(all(feature = "uci", unix))]
         let builder = builder.add_source(
             UciSource::from_schema::<Self>()
+                .with_instance(instance)
                 .with_repeated_schema(&[
                     uci_schema::UciRepeatedSectionMapping {
                         uci_section: "reflector",
@@ -217,8 +221,13 @@ impl Settings {
         );
 
         #[cfg(feature = "toml")]
-        let builder =
-            builder.add_source(config::File::with_name("/etc/unravel/config.toml").required(false));
+        let builder = builder.add_source(
+            config::File::with_name(&format!(
+                "/etc/unravel/{}.toml",
+                instance.unwrap_or("config")
+            ))
+            .required(false),
+        );
 
         let builder = builder.add_source(
             Environment::with_prefix("UNRAVEL")

@@ -16,6 +16,10 @@ pub(crate) struct UciSectionMapping {
     /// Top-level config-rs / Serde settings key.
     pub(crate) config_section: &'static str,
 
+    /// A section of this type is an instance. It has an option named after
+    /// each other section type, naming the section of that type it uses.
+    pub(crate) anchor: bool,
+
     pub(crate) options: &'static [UciOptionMapping],
 
     /// Options in this section that something other than unRAVEL reads, such

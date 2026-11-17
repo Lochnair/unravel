@@ -26,6 +26,8 @@ use crate::settings::Settings;
 use std::process::ExitCode;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Name of the instance started without `--instance`.
+const DEFAULT_INSTANCE: &str = "default";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
@@ -34,11 +36,16 @@ async fn main() -> anyhow::Result<ExitCode> {
     log::message(format_args!("Starting unRAVEL version {}", VERSION));
 
     let result = async {
-        let settings = Settings::load()?;
+        let instance = parse_args(std::env::args().skip(1))?;
+        if let Some(name) = &instance {
+            log::message(format_args!("Instance {name}"));
+        }
+        let settings = Settings::load(instance.as_deref())?;
         ::log::set_max_level(settings.output.log_level.to_level_filter());
         warn_platform_limitations();
 
-        App::prepare(settings).await?.run().await
+        let name = instance.as_deref().unwrap_or(DEFAULT_INSTANCE);
+        App::prepare(settings, name).await?.run().await
     }
     .await;
 
@@ -49,4 +56,26 @@ async fn main() -> anyhow::Result<ExitCode> {
     } else {
         ExitCode::FAILURE
     })
+}
+
+/// The only argument is `--instance <name>` (or `--instance=<name>`).
+fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Option<String>> {
+    let mut instance = None;
+    while let Some(arg) = args.next() {
+        let value = match arg.strip_prefix("--instance") {
+            Some("") => args.next(),
+            Some(rest) => rest.strip_prefix('=').map(str::to_owned),
+            None => None,
+        };
+        let Some(name) = value else {
+            anyhow::bail!("Unexpected argument {arg:?}; usage: unravel [--instance <name>]");
+        };
+        anyhow::ensure!(instance.is_none(), "--instance given more than once");
+        anyhow::ensure!(
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "Instance name {name:?} must be letters, digits and underscores"
+        );
+        instance = Some(name);
+    }
+    Ok(instance)
 }

@@ -55,6 +55,14 @@ pub fn derive_uci_section(input: TokenStream) -> TokenStream {
 /// #[uci(section = "advanced_settings")]
 /// advanced: AdvancedSettings,
 /// ```
+///
+/// At most one field may add `anchor`: a section of that type is an instance,
+/// and names the other sections it uses with options named after their types.
+///
+/// ```ignore
+/// #[uci(section, anchor)]
+/// network: NetworkSettings,
+/// ```
 #[proc_macro_derive(UciConfig, attributes(uci))]
 pub fn derive_uci_config(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -237,6 +245,7 @@ fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let package = parse_package_name(input)?;
 
     let mut sections = Vec::with_capacity(fields.named.len());
+    let mut anchor_seen = false;
 
     for field in &fields.named {
         let field_ident = field
@@ -249,12 +258,22 @@ fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         let config_section_name = field_ident.unraw().to_string();
         let config_section_name = LitStr::new(&config_section_name, field_ident.span());
 
-        let uci_section_name = parse_section_name(field)?;
+        let (uci_section_name, anchor) = parse_section_name(field)?;
+        if anchor {
+            if anchor_seen {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "only one section can be the `anchor`",
+                ));
+            }
+            anchor_seen = true;
+        }
 
         sections.push(quote! {
             crate::settings::uci_schema::UciSectionMapping {
                 uci_section: #uci_section_name,
                 config_section: #config_section_name,
+                anchor: #anchor,
                 options: <
                     #field_type as
                     crate::settings::uci_schema::UciSectionSchema
@@ -346,7 +365,7 @@ fn parse_package_name(input: &DeriveInput) -> syn::Result<LitStr> {
     })
 }
 
-fn parse_section_name(field: &Field) -> syn::Result<LitStr> {
+fn parse_section_name(field: &Field) -> syn::Result<(LitStr, bool)> {
     let field_ident = field
         .ident
         .as_ref()
@@ -356,6 +375,7 @@ fn parse_section_name(field: &Field) -> syn::Result<LitStr> {
     let default_name = LitStr::new(&default_name, field_ident.span());
 
     let mut section = None;
+    let mut anchor = false;
 
     for attribute in &field.attrs {
         if !attribute.path().is_ident("uci") {
@@ -383,15 +403,25 @@ fn parse_section_name(field: &Field) -> syn::Result<LitStr> {
                 return Ok(());
             }
 
-            Err(meta.error("expected `section` or `section = \"...\"`"))
+            if meta.path.is_ident("anchor") {
+                if anchor {
+                    return Err(meta.error("duplicate `anchor` attribute"));
+                }
+                anchor = true;
+                return Ok(());
+            }
+
+            Err(meta.error("expected `section`, `section = \"...\"` or `anchor`"))
         })?;
     }
 
-    section.ok_or_else(|| {
+    let section = section.ok_or_else(|| {
         syn::Error::new_spanned(
             field,
             "UciConfig fields require `#[uci(section)]` \
              or `#[uci(section = \"...\")]`",
         )
-    })
+    })?;
+
+    Ok((section, anchor))
 }

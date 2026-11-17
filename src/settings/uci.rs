@@ -17,9 +17,30 @@ enum PackageSelection {
     All,
 }
 
+/// A section of a singleton type, mapped but not yet chosen.
+struct MappedSection {
+    /// `<package>.<name>` or `<package>.@<type>[0]`.
+    key: String,
+    section_type: &'static str,
+    /// `None` for the anonymous section.
+    name: Option<String>,
+    values: Map<String, Value>,
+    /// Only an anchor section has these.
+    references: Vec<Reference>,
+}
+
+/// An anchor section's option naming the section of one type it uses.
+struct Reference {
+    section_type: String,
+    target: String,
+    uci_key: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct UciSource {
     packages: PackageSelection,
+    /// Name of the anchor section to read. `None` reads the anonymous one.
+    instance: Option<String>,
     required: bool,
     schema: &'static [UciSectionMapping],
     repeated_schema: &'static [UciRepeatedSectionMapping],
@@ -31,6 +52,7 @@ impl UciSource {
     fn with_selection(packages: PackageSelection) -> Self {
         Self {
             packages,
+            instance: None,
             required: true,
             schema: &[],
             repeated_schema: &[],
@@ -64,6 +86,13 @@ impl UciSource {
         T: UciConfigSchema,
     {
         Self::new([T::UCI_PACKAGE]).with_schema(T::UCI_SECTIONS)
+    }
+
+    /// Reads the anchor section with this name and the sections it names,
+    /// instead of the anonymous sections.
+    pub(crate) fn with_instance(mut self, instance: Option<&str>) -> Self {
+        self.instance = instance.map(str::to_owned);
+        self
     }
 
     pub(crate) fn with_schema(mut self, schema: &'static [UciSectionMapping]) -> Self {
@@ -194,6 +223,16 @@ impl UciSource {
             ))
         })?;
 
+        // Section types an anchor section can refer to by name.
+        let reference_types: Vec<&str> = self
+            .schema
+            .iter()
+            .filter(|mapping| !mapping.anchor)
+            .map(|mapping| mapping.uci_section)
+            .collect();
+
+        let mut mapped = Vec::new();
+
         for section in sections {
             let repeated_mapping = self
                 .repeated_schema
@@ -211,6 +250,7 @@ impl UciSource {
             let section_key = format!("{package_name}.{selector}");
 
             let mut singleton = None;
+            let mut section_name = None;
             if repeated_mapping.is_none() && self.has_schema() {
                 let Some(mapping) = self
                     .schema
@@ -223,12 +263,22 @@ impl UciSource {
                     )));
                 };
 
-                if !matches!(selector, SectionSelector::Anonymous { index: 0, .. }) {
-                    return Err(SourceError::Message(format!(
-                        "UCI section {section_key} is not supported: only one anonymous \
-                         {:?} section is read",
-                        section.type_()
-                    )));
+                // `@type[n]` counts named sections too, so the index of the
+                // first anonymous section is not always 0.
+                match selector {
+                    SectionSelector::Named(name) => section_name = Some(name.to_owned()),
+                    SectionSelector::Anonymous { .. }
+                        if mapped.iter().any(|mapped: &MappedSection| {
+                            mapped.section_type == mapping.uci_section && mapped.name.is_none()
+                        }) =>
+                    {
+                        return Err(SourceError::Message(format!(
+                            "UCI section {section_key} is not supported: only one anonymous \
+                             {:?} section is read; give the others names",
+                            section.type_()
+                        )));
+                    }
+                    SectionSelector::Anonymous { .. } => {}
                 }
 
                 singleton = Some(mapping);
@@ -266,6 +316,8 @@ impl UciSource {
                 None => None,
             };
 
+            let mut references = Vec::new();
+
             for (option_name, value) in entries {
                 let option_name = option_name.as_str();
                 let uci_key = format!("{section_key}.{option_name}");
@@ -288,6 +340,18 @@ impl UciSource {
                         .find(|option| option.uci_option == option_name)
                     {
                         format!("{}.{}", mapping.config_section, option.config_field)
+                    } else if mapping.anchor && reference_types.contains(&option_name) {
+                        let UciValue::String(target) = value else {
+                            return Err(SourceError::Message(format!(
+                                "UCI option {uci_key} must name one section, not a list"
+                            )));
+                        };
+                        references.push(Reference {
+                            section_type: option_name.to_owned(),
+                            target,
+                            uci_key,
+                        });
+                        continue;
                     } else if mapping.external.contains(&option_name) {
                         continue;
                     } else if mapping.passthrough_key.is_some() {
@@ -326,7 +390,9 @@ impl UciSource {
                     }
                 };
 
-                let destination = if repeated_mapping.is_some() {
+                // Singleton sections are kept aside until the instance's own
+                // sections are known.
+                let destination = if repeated_mapping.is_some() || singleton.is_some() {
                     &mut section_values
                 } else {
                     &mut *values
@@ -346,10 +412,138 @@ impl UciSource {
                     .entry(mapping.config_path.to_owned())
                     .or_default()
                     .push(Value::new(Some(&origin), ValueKind::Table(section_values)));
+            } else if let Some(mapping) = singleton {
+                mapped.push(MappedSection {
+                    key: section_key,
+                    section_type: mapping.uci_section,
+                    name: section_name,
+                    values: section_values,
+                    references,
+                });
+            }
+        }
+
+        for index in self.instance_sections(package_name, &mapped)? {
+            for (key, value) in std::mem::take(&mut mapped[index].values) {
+                if values.insert(key.clone(), value).is_some() {
+                    return Err(SourceError::Message(format!(
+                        "duplicate UCI destination key {key:?} while mapping {}",
+                        mapped[index].key
+                    )));
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Indexes into `mapped` of the sections the instance uses: its anchor
+    /// section and the sections that names. An anonymous anchor also uses the
+    /// anonymous section of each type it does not name. Without an anchor
+    /// section, every anonymous section is used.
+    fn instance_sections(
+        &self,
+        package_name: &str,
+        mapped: &[MappedSection],
+    ) -> Result<Vec<usize>, SourceError> {
+        let anchor_type = self
+            .schema
+            .iter()
+            .find(|mapping| mapping.anchor)
+            .map(|mapping| mapping.uci_section);
+        let anonymous = |section_type: &str| {
+            mapped
+                .iter()
+                .position(|section| section.section_type == section_type && section.name.is_none())
+        };
+
+        let anchor = match (anchor_type, &self.instance) {
+            (Some(anchor_type), Some(instance)) => {
+                let Some(index) = mapped
+                    .iter()
+                    .position(|section| section.name.as_deref() == Some(instance))
+                else {
+                    return Err(SourceError::Message(format!(
+                        "UCI package {package_name:?} has no {anchor_type:?} section \
+                         named {instance:?}"
+                    )));
+                };
+                if mapped[index].section_type != anchor_type {
+                    return Err(SourceError::Message(format!(
+                        "UCI section {} is a {:?} section, not a {anchor_type:?} section",
+                        mapped[index].key, mapped[index].section_type
+                    )));
+                }
+                Some(index)
+            }
+            (Some(anchor_type), None) => {
+                let index = anonymous(anchor_type);
+                let named: Vec<&str> = mapped
+                    .iter()
+                    .filter(|section| section.section_type == anchor_type)
+                    .filter_map(|section| section.name.as_deref())
+                    .collect();
+                if index.is_none() && !named.is_empty() {
+                    return Err(SourceError::Message(format!(
+                        "UCI package {package_name:?} has no anonymous {anchor_type:?} \
+                         section; start unravel with --instance <name> (configured: {})",
+                        named.join(", ")
+                    )));
+                }
+                index
+            }
+            (None, Some(_)) => {
+                return Err(SourceError::Message(
+                    "instances need a UCI schema with an anchor section".to_owned(),
+                ));
+            }
+            (None, None) => None,
+        };
+
+        let Some(anchor) = anchor else {
+            return Ok(mapped
+                .iter()
+                .enumerate()
+                .filter(|(_, section)| section.name.is_none())
+                .map(|(index, _)| index)
+                .collect());
+        };
+
+        let mut chosen = vec![anchor];
+        for mapping in self.schema.iter().filter(|mapping| !mapping.anchor) {
+            let reference = mapped[anchor]
+                .references
+                .iter()
+                .find(|reference| reference.section_type == mapping.uci_section);
+
+            if let Some(reference) = reference {
+                let Some(index) = mapped
+                    .iter()
+                    .position(|section| section.name.as_deref() == Some(&reference.target))
+                else {
+                    return Err(SourceError::Message(format!(
+                        "UCI option {} names {package_name}.{}, which does not exist",
+                        reference.uci_key, reference.target
+                    )));
+                };
+                if mapped[index].section_type != mapping.uci_section {
+                    return Err(SourceError::Message(format!(
+                        "UCI option {} names {}, which is a {:?} section, not a {:?} section",
+                        reference.uci_key,
+                        mapped[index].key,
+                        mapped[index].section_type,
+                        mapping.uci_section
+                    )));
+                }
+                chosen.push(index);
+            } else if mapped[anchor].name.is_none()
+                && let Some(index) = anonymous(mapping.uci_section)
+            {
+                chosen.push(index);
+            }
+        }
+
+        Ok(chosen)
     }
 }
 

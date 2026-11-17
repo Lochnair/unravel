@@ -29,7 +29,6 @@ use tokio::{
 };
 
 const SINK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const DEFAULT_INSTANCE: &str = "default";
 type TaskResult = (&'static str, anyhow::Result<()>);
 
 struct PreparedWorkers {
@@ -52,7 +51,7 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) async fn prepare(settings: Settings) -> anyhow::Result<Self> {
+    pub(crate) async fn prepare(settings: Settings, instance: &str) -> anyhow::Result<Self> {
         settings.validate()?;
         if settings.advanced_settings.dry_run {
             info!("*** MONITORING MODE ACTIVE — qdisc rates will NOT be changed ***");
@@ -86,8 +85,7 @@ impl App {
                 settings.law.name,
             );
         }
-        // Only one instance runs for now; --instance will name the folder.
-        let folder = Path::new(settings.output.folder.trim()).join(DEFAULT_INSTANCE);
+        let folder = Path::new(settings.output.folder.trim()).join(instance);
         let csv_writer = match records {
             Some(records) => {
                 tokio::fs::create_dir_all(&folder)
@@ -129,7 +127,8 @@ impl App {
         let (metrics, exporter) = if settings.observability.enabled {
             let dropped = Arc::new(AtomicU32::new(0));
             let (tx, rx) = mpsc::channel(1000);
-            let exporter = Metrics::new(settings.clone(), rx, Arc::clone(&dropped)).await?;
+            let exporter =
+                Metrics::new(settings.clone(), instance, rx, Arc::clone(&dropped)).await?;
             (
                 MetricsSender::new(tx, dropped, &settings.observability),
                 Some(exporter),

@@ -204,6 +204,8 @@ impl MetricsSender {
 
 pub struct Metrics {
     settings: Settings,
+    /// Tags on every line: `host=<host_tag>,instance=<instance>`.
+    tags: String,
     metrics_dropped: Arc<AtomicU32>,
     metrics_rx: mpsc::Receiver<(Metric, u64)>,
     transport: Transport,
@@ -212,6 +214,7 @@ pub struct Metrics {
 impl Metrics {
     pub async fn new(
         settings: Settings,
+        instance: &str,
         metrics_rx: mpsc::Receiver<(Metric, u64)>,
         metrics_dropped: Arc<AtomicU32>,
     ) -> anyhow::Result<Self> {
@@ -231,8 +234,13 @@ impl Metrics {
                 Transport::new_tcp(host, port)
             }
         };
+        let tags = format!(
+            "host={},instance={instance}",
+            settings.observability.host_tag
+        );
         Ok(Self {
             settings,
+            tags,
             metrics_rx,
             metrics_dropped,
             transport,
@@ -242,7 +250,7 @@ impl Metrics {
     pub async fn run(mut self) -> anyhow::Result<()> {
         let batch_size = self.settings.observability.batch_size;
         let timeout = Duration::from_millis(self.settings.observability.batch_timeout_ms);
-        let host_tag = self.settings.observability.host_tag.clone();
+        let tags = self.tags.clone();
         let mut batch = Vec::with_capacity(batch_size);
 
         let deadline = tokio::time::sleep(timeout);
@@ -254,7 +262,7 @@ impl Metrics {
                 _ = &mut deadline => {
                     self.collect_dropped(&mut batch);
                     if !batch.is_empty() {
-                        Self::flush(&mut self.transport, &batch, &host_tag).await;
+                        Self::flush(&mut self.transport, &batch, &tags).await;
                         batch.clear();
                     }
                     deadline.as_mut().reset(tokio::time::Instant::now() + timeout);
@@ -276,7 +284,7 @@ impl Metrics {
                 }
             }
             if batch.len() >= batch_size {
-                Self::flush(&mut self.transport, &batch, &host_tag).await;
+                Self::flush(&mut self.transport, &batch, &tags).await;
                 batch.clear();
                 deadline
                     .as_mut()
@@ -286,7 +294,7 @@ impl Metrics {
 
         self.collect_dropped(&mut batch);
         if !batch.is_empty() {
-            Self::flush(&mut self.transport, &batch, &host_tag).await;
+            Self::flush(&mut self.transport, &batch, &tags).await;
         }
         Ok(())
     }
@@ -299,7 +307,7 @@ impl Metrics {
         }
     }
 
-    async fn flush(transport: &mut Transport, batch: &[(Metric, u64)], host_tag: &str) {
+    async fn flush(transport: &mut Transport, batch: &[(Metric, u64)], tags: &str) {
         match transport {
             /*
              * the UDP receive buffer might be too small on the receiver to accept batched data,
@@ -309,21 +317,21 @@ impl Metrics {
                 let mut data = String::with_capacity(300);
                 for (metric, timestamp_ns) in batch {
                     data.clear();
-                    Self::write_lines(metric, *timestamp_ns, host_tag, &mut data);
+                    Self::write_lines(metric, *timestamp_ns, tags, &mut data);
                     transport.send(&data).await;
                 }
             }
             Transport::Tcp { .. } => {
                 let mut data = String::with_capacity(batch.len() * 300);
                 for (metric, timestamp_ns) in batch {
-                    Self::write_lines(metric, *timestamp_ns, host_tag, &mut data);
+                    Self::write_lines(metric, *timestamp_ns, tags, &mut data);
                 }
                 transport.send(&data).await;
             }
         }
     }
 
-    fn write_lines(metric: &Metric, timestamp_ns: u64, host_tag: &str, out: &mut String) {
+    fn write_lines(metric: &Metric, timestamp_ns: u64, common: &str, out: &mut String) {
         match metric {
             Metric::Ping {
                 reflector,
@@ -334,7 +342,7 @@ impl Metrics {
             } => {
                 writeln!(
                     out,
-                    "sqm_ping,host={host_tag},reflector={reflector},type={protocol} \
+                    "sqm_ping,{common},reflector={reflector},type={protocol} \
                     rtt={rtt:.3},up_time={up_time:.3},down_time={down_time:.3} {timestamp_ns}"
                 )
                 .unwrap_or(());
@@ -350,7 +358,7 @@ impl Metrics {
                     Direction::Upload => "upload",
                 };
                 writeln!(out,
-                    "sqm_rate,host={host_tag},direction={direction} \
+                    "sqm_rate,{common},direction={direction} \
                     rate_kbps={rate_kbps:.0},load={load:.4},delta_delay={delta_delay:.3} {timestamp_ns}"
                 ).unwrap_or(());
             }
@@ -362,11 +370,11 @@ impl Metrics {
                 recent_down_ewma,
             } => {
                 writeln!(out,
-                    "sqm_baseline,host={host_tag},reflector={reflector},direction=up \
+                    "sqm_baseline,{common},reflector={reflector},direction=up \
                     baseline_ewma={baseline_up_ewma:.3},recent_ewma={recent_up_ewma:.3} {timestamp_ns}"
                 ).unwrap_or(());
                 writeln!(out,
-                    "sqm_baseline,host={host_tag},reflector={reflector},direction=down \
+                    "sqm_baseline,{common},reflector={reflector},direction=down \
                     baseline_ewma={baseline_down_ewma:.3},recent_ewma={recent_down_ewma:.3} {timestamp_ns}"
                 ).unwrap_or(());
             }
@@ -376,7 +384,7 @@ impl Metrics {
                 reflector,
                 tags,
             } => {
-                let mut tag_str = format!("host={host_tag},type={name}");
+                let mut tag_str = format!("{common},type={name}");
 
                 if let Some(reflector) = reflector {
                     write!(tag_str, ",reflector={reflector}").unwrap_or(());
@@ -395,7 +403,7 @@ impl Metrics {
             Metric::Dropped { count } => {
                 writeln!(
                     out,
-                    "sqm_metrics_dropped,host={host_tag} count={count}i {timestamp_ns}"
+                    "sqm_metrics_dropped,{common} count={count}i {timestamp_ns}"
                 )
                 .unwrap_or(());
             }
