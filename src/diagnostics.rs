@@ -57,6 +57,19 @@ impl DiagnosticsSender {
     }
 }
 
+/// The sender and the queue a [`CsvWriter`] drains. Creating them touches no
+/// files, so the consumer can be built before the outputs are opened.
+pub(crate) fn channel() -> (DiagnosticsSender, mpsc::Receiver<DiagnosticRecord>) {
+    let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+    (
+        DiagnosticsSender {
+            tx,
+            last_history: Instant::now(),
+        },
+        rx,
+    )
+}
+
 pub(crate) struct CsvWriter {
     history: File,
     stats: File,
@@ -64,20 +77,14 @@ pub(crate) struct CsvWriter {
 }
 
 impl CsvWriter {
-    pub async fn new(output: &OutputSettings) -> anyhow::Result<Option<(DiagnosticsSender, Self)>> {
-        if output.suppress_statistics {
-            return Ok(None);
-        }
+    /// Creates both CSV files, replacing those of the previous run.
+    pub async fn open(
+        output: &OutputSettings,
+        rx: mpsc::Receiver<DiagnosticRecord>,
+    ) -> anyhow::Result<Self> {
         let history = create(&output.speed_hist_file, HISTORY_HEADER).await?;
         let stats = create(&output.stats_file, STATS_HEADER).await?;
-        let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
-        Ok(Some((
-            DiagnosticsSender {
-                tx,
-                last_history: Instant::now(),
-            },
-            Self { history, stats, rx },
-        )))
+        Ok(Self { history, stats, rx })
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {

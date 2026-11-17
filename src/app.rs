@@ -5,7 +5,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::diagnostics::CsvWriter;
+use crate::diagnostics::{self, CsvWriter};
 use crate::error::ChannelClosed;
 use crate::law::{self, Law, LawContext};
 use crate::measurement::{
@@ -68,10 +68,26 @@ impl App {
         }
 
         // The law is built first: it decides the probing and sampling cadence
-        // the rest of the pipeline runs at.
-        let (diagnostics, csv_writer) = CsvWriter::new(&settings.output).await?.unzip();
+        // the rest of the pipeline runs at. Its configuration is checked here,
+        // before the CSV files of the previous run are replaced.
+        let (diagnostics, records) = (!settings.output.suppress_statistics)
+            .then(diagnostics::channel)
+            .unzip();
         let law = law::build(&settings, diagnostics)?;
         let cadence = law.cadence();
+        // Both periods drive timers that panic on a zero or unrepresentable
+        // interval, so a law returning one is rejected here.
+        for (name, period) in [("probe", cadence.probe), ("traffic", cadence.traffic)] {
+            anyhow::ensure!(
+                !period.is_zero() && std::time::Instant::now().checked_add(period).is_some(),
+                "Law {:?} requested an unusable {name} period: {period:?}",
+                settings.law.name,
+            );
+        }
+        let csv_writer = match records {
+            Some(records) => Some(CsvWriter::open(&settings.output, records).await?),
+            None => None,
+        };
 
         let (plan_tx, plan_rx) = watch::channel(MeasurementPlan {
             revision: 0,
