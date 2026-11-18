@@ -21,7 +21,7 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use crate::{
     error::ChannelClosed,
     law::{Cadence, Law, LawContext},
-    measurement::model::{MeasurementEvent, MeasurementOutcome, OneWayStatus},
+    measurement::model::{MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayStatus},
     metrics::Metric,
     runtime::{Direction, TrafficRates},
 };
@@ -65,6 +65,8 @@ pub(super) const REQUIRED_HOOKS: &[&str] = &["on_measurement", "on_traffic"];
 pub(super) const OPTIONAL_HOOKS: &[&str] = &["init", "on_timer", "on_clock_step"];
 
 pub(super) struct Measurement {
+    /// The IP, or `ip:port` for IRTT, where one IP can serve several
+    /// endpoints. With `protocol` it identifies the target.
     pub reflector: String,
     pub protocol: String,
     /// `"active"` or `"candidate"`.
@@ -204,6 +206,14 @@ impl ScriptLaw {
         let cadence = backend
             .cadence()
             .with_context(|| format!("Reading the cadence of {}", path.display()))?;
+        // The timer's first deadline is now + timer, which panics if it
+        // doesn't fit in an Instant. App checks probe and traffic the same way.
+        if let Some(timer) = cadence.timer {
+            anyhow::ensure!(
+                Instant::now().checked_add(timer).is_some(),
+                "cadence.timer is too large: {timer:?}"
+            );
+        }
 
         Ok(Self {
             backend,
@@ -265,27 +275,13 @@ impl Law for ScriptLaw {
 
         loop {
             tokio::select! {
+                // Rate-limited control inputs come before measurements, so a
+                // measurement backlog can't starve them (as in SQMA).
                 biased;
                 changed = ctx.clock_steps.changed() => {
                     changed.context("Clock-step channel closed")?;
                     if ctx.clock_steps.borrow_and_update().is_some() {
                         self.call(&ctx, Event::ClockStep)?;
-                    }
-                }
-
-                event = ctx.measurements.recv() => {
-                    match event {
-                        Ok(event) => {
-                            let m = measurement(&event, &ctx, since_start(event.completed_at));
-                            self.call(&ctx, Event::Measurement(m))?;
-                        }
-                        Err(RecvError::Lagged(count)) => {
-                            warn!("Control law missed {count} measurement events");
-                            ctx.metrics.send(Metric::event("measurement_lag", "control_law", None));
-                        }
-                        Err(RecvError::Closed) => {
-                            return Err(ChannelClosed).context("Measurement channel closed");
-                        }
                     }
                 }
 
@@ -303,6 +299,22 @@ impl Law for ScriptLaw {
 
                 _ = tick(&mut timer) => {
                     self.call(&ctx, Event::Timer(since_start(Instant::now())))?;
+                }
+
+                event = ctx.measurements.recv() => {
+                    match event {
+                        Ok(event) => {
+                            let m = measurement(&event, &ctx, since_start(event.completed_at));
+                            self.call(&ctx, Event::Measurement(m))?;
+                        }
+                        Err(RecvError::Lagged(count)) => {
+                            warn!("Control law missed {count} measurement events");
+                            ctx.metrics.send(Metric::event("measurement_lag", "control_law", None));
+                        }
+                        Err(RecvError::Closed) => {
+                            return Err(ChannelClosed).context("Measurement channel closed");
+                        }
+                    }
                 }
             }
         }
@@ -330,7 +342,10 @@ fn measurement(event: &MeasurementEvent, ctx: &LawContext, t: f64) -> Measuremen
         MeasurementOutcome::Loss => None,
     };
     Measurement {
-        reflector: event.target.peer().to_string(),
+        reflector: match &event.target {
+            MeasurementTarget::Irtt { endpoint, .. } => endpoint.to_string(),
+            target => target.peer().to_string(),
+        },
         protocol: event.target.protocol().to_string(),
         role,
         t,
