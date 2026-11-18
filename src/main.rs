@@ -23,14 +23,17 @@ mod time;
 use crate::app::App;
 use crate::platform::warn_platform_limitations;
 use crate::settings::Settings;
-use std::process::ExitCode;
+use std::{process::ExitCode, time::Duration};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Name of the instance started without `--instance`.
 const DEFAULT_INSTANCE: &str = "default";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<ExitCode> {
+/// How long exit waits for blocking work (file writes, DNS lookups) still
+/// running after the app has finished. Shapers are restored before this.
+const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+fn main() -> anyhow::Result<ExitCode> {
     // Initialization errors return before any shaper can be modified. The
     // arguments are parsed first so every log line carries the instance; a
     // parse error is reported once the logger is up.
@@ -38,7 +41,10 @@ async fn main() -> anyhow::Result<ExitCode> {
     log::init(instance.as_ref().ok().and_then(Option::as_deref))?;
     log::message(format_args!("Starting unRAVEL version {}", VERSION));
 
-    let result = async {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(async {
         let instance = instance?;
         let settings = Settings::load(instance.as_deref())?;
         ::log::set_max_level(settings.output.log_level.to_level_filter());
@@ -46,8 +52,10 @@ async fn main() -> anyhow::Result<ExitCode> {
 
         let name = instance.as_deref().unwrap_or(DEFAULT_INSTANCE);
         App::prepare(settings, name).await?.run().await
-    }
-    .await;
+    });
+    // Dropping the runtime would wait forever for blocking work; anything
+    // still stuck after the timeout is left behind.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
     // App::run has already completed shaper restoration and worker cleanup.
     log::finish(result.as_ref().err());
