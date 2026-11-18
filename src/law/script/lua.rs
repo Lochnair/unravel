@@ -55,6 +55,31 @@ impl LuaBackend {
             },
         )?;
 
+        // The budget error is a plain Lua error, so pcall could catch it and
+        // keep looping. Once the budget is spent, every protected call
+        // re-raises, until the error leaves the hook.
+        let counter = ticks.clone();
+        let spent =
+            lua.create_function(move |_, ()| Ok(counter.load(Ordering::Relaxed) > MAX_TICKS))?;
+        lua.load(
+            r#"
+            local spent, pcall, xpcall, error = ...
+            local function check(...)
+                if spent() then error("instruction limit exceeded", 0) end
+                return ...
+            end
+            _G.pcall = function(...) return check(pcall(...)) end
+            _G.xpcall = function(...) return check(xpcall(...)) end
+            "#,
+        )
+        .set_name("=sandbox")
+        .call::<()>((
+            spent,
+            globals.get::<Function>("pcall")?,
+            globals.get::<Function>("xpcall")?,
+            globals.get::<Function>("error")?,
+        ))?;
+
         let law: Table = lua
             .load(&source)
             .set_name(format!("@{}", path.display()))
