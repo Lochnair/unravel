@@ -40,8 +40,11 @@ impl LuaBackend {
             LuaOptions::default(),
         )?;
         let globals = lua.globals();
-        globals.set("load", mlua::Nil)?;
-        globals.set("dofile", mlua::Nil)?;
+        // Scripts may not load more code. Lua 5.1 loads bytecode, which can
+        // break out of the VM, through any of these.
+        for loader in ["load", "loadstring", "loadfile", "dofile"] {
+            globals.set(loader, mlua::Nil)?;
+        }
 
         let ticks = Arc::new(AtomicU32::new(0));
         let counter = ticks.clone();
