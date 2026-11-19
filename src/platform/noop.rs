@@ -11,6 +11,10 @@ impl Platform {
         Ok(())
     }
 
+    pub(crate) fn wire_packet_bytes(&self, _interface: &str) -> Result<Option<u32>, Infallible> {
+        Ok(None)
+    }
+
     pub(crate) fn set_rate(
         &self,
         interface: &str,

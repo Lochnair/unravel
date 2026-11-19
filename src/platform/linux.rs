@@ -13,6 +13,9 @@ use thiserror::Error;
 use crate::platform::InterfaceStats;
 
 const TC_H_ROOT: u32 = 0xffff_ffff;
+// CAKE's link-layer framing (`atm`/`ptm` in tc).
+const CAKE_ATM_ATM: u32 = 1;
+const CAKE_ATM_PTM: u32 = 2;
 
 #[derive(Debug, Error)]
 pub(crate) enum NetlinkError {
@@ -79,6 +82,18 @@ impl Platform {
         Ok(())
     }
 
+    /// The largest packet CAKE puts on the wire: the MTU plus CAKE's
+    /// overhead, rounded up to whole ATM cells or PTM blocks as CAKE does.
+    pub(crate) fn wire_packet_bytes(&self, interface: &str) -> Result<Option<u32>, NetlinkError> {
+        let mut socket = self
+            .shaper_socket
+            .lock()
+            .map_err(|_| NetlinkError::SocketPoisoned)?;
+        let qdisc = Self::root_qdisc(&mut socket, interface)?;
+        let mtu = Self::link_mtu(&mut socket, interface)?;
+        Ok(Some(wire_bytes(mtu, qdisc.framing, qdisc.overhead)))
+    }
+
     pub(crate) fn set_rate(
         &self,
         interface: &str,
@@ -91,7 +106,7 @@ impl Platform {
             .shaper_socket
             .lock()
             .map_err(|_| NetlinkError::SocketPoisoned)?;
-        let qdisc = Self::root_qdisc(&mut socket, interface)?;
+        let qdisc = Self::root_qdisc(&mut socket, interface)?.header;
 
         if dry_run {
             info!(
@@ -121,7 +136,7 @@ impl Platform {
         Ok(())
     }
 
-    fn root_qdisc(socket: &mut NetlinkSocket, interface: &str) -> Result<tc::Tcmsg, NetlinkError> {
+    fn root_qdisc(socket: &mut NetlinkSocket, interface: &str) -> Result<CakeQdisc, NetlinkError> {
         let ifindex = Self::find_interface(socket, interface)?;
         let mut header = tc::Tcmsg::new();
         header.ifindex = ifindex;
@@ -138,10 +153,35 @@ impl Platform {
             if header.handle == 0 {
                 return Err(NetlinkError::ZeroQdiscHandle(interface.to_string()));
             }
-            Ok(header)
+            let (framing, overhead) = match attrs.get_options() {
+                Ok(tc::OptionsMsg::Cake(cake)) => (
+                    cake.get_atm().unwrap_or(0),
+                    // The kernel sends a signed value.
+                    cake.get_overhead().map_or(0, |overhead| overhead as i32),
+                ),
+                _ => (0, 0),
+            };
+            Ok(CakeQdisc {
+                header,
+                framing,
+                overhead,
+            })
         } else {
             Err(NetlinkError::NoQdiscFound(interface.to_string()))
         }
+    }
+
+    fn link_mtu(socket: &mut NetlinkSocket, interface: &str) -> Result<u32, NetlinkError> {
+        let mut request = rt_link::Request::new().op_getlink_do(&Default::default());
+        request.encode().push_ifname_bytes(interface.as_bytes());
+
+        let mut iter = socket.request(&request)?;
+        let (_, attrs) = iter
+            .recv_one()
+            .map_err(|_| NetlinkError::InterfaceNotFound(interface.to_string()))?;
+        attrs
+            .get_mtu()
+            .map_err(|_| NetlinkError::InterfaceNotFound(interface.to_string()))
     }
 
     fn find_interface(socket: &mut NetlinkSocket, interface: &str) -> Result<i32, NetlinkError> {
@@ -154,6 +194,24 @@ impl Platform {
             .map_err(|_| NetlinkError::InterfaceNotFound(interface.to_string()))?;
         Ok(header.ifi_index)
     }
+}
+
+struct CakeQdisc {
+    header: tc::Tcmsg,
+    framing: u32,
+    overhead: i32,
+}
+
+fn wire_bytes(mtu: u32, framing: u32, overhead: i32) -> u32 {
+    let len = (i64::from(mtu) + i64::from(overhead)).max(0) as u64;
+    let len = match framing {
+        // 48 payload bytes per 53-byte cell.
+        CAKE_ATM_ATM => len.div_ceil(48) * 53,
+        // One extra byte per 64.
+        CAKE_ATM_PTM => len + len.div_ceil(64),
+        _ => len,
+    };
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 pub(crate) fn warn_platform_limitations() {}

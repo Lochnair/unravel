@@ -38,15 +38,32 @@ pub(crate) struct Shaper {
     pub(crate) base_kbps: f64,
     pub(crate) min_kbps: f64,
     pub(crate) max_kbps: Option<f64>,
+    /// The largest packet on the wire, read from the interface and its CAKE
+    /// qdisc at startup. `None` where the platform can't tell.
+    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
+    pub(crate) wire_packet_bytes: Option<u32>,
 }
 
 impl Shaper {
-    fn new(interface: &str, base_kbps: f64, min_kbps: f64, max_kbps: Option<f64>) -> Self {
+    fn new(
+        platform: &Platform,
+        interface: &str,
+        base_kbps: f64,
+        min_kbps: f64,
+        max_kbps: Option<f64>,
+    ) -> Self {
+        let wire_packet_bytes = platform
+            .wire_packet_bytes(interface)
+            .unwrap_or_else(|error| {
+                warn!("Couldn't read the wire packet size of {interface}: {error}");
+                None
+            });
         Self {
             interface: interface.to_owned(),
             base_kbps,
             min_kbps,
             max_kbps,
+            wire_packet_bytes,
         }
     }
 }
@@ -88,13 +105,13 @@ impl Runtime {
             .ok_or_else(|| anyhow::anyhow!("At least one shaping interface must be configured"))?
             .to_owned();
         Ok(Runtime {
-            platform,
             traffic_interface,
             sample_interval,
             traffic_tx,
             clock_steps_tx: watch::channel(None).0,
             download: settings.network.download_interface().map(|interface| {
                 Shaper::new(
+                    &platform,
                     interface,
                     settings.network.download_base_kbits,
                     settings.network.download_min_kbits(),
@@ -103,12 +120,14 @@ impl Runtime {
             }),
             upload: settings.network.upload_interface().map(|interface| {
                 Shaper::new(
+                    &platform,
                     interface,
                     settings.network.upload_base_kbits,
                     settings.network.upload_min_kbits(),
                     settings.network.upload_max_kbits(),
                 )
             }),
+            platform,
             metrics,
             dry_run: settings.advanced_settings.dry_run,
         })

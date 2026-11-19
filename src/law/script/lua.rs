@@ -221,6 +221,14 @@ impl UserData for LuaCtx<'_> {
         methods.add_method("min", |_, this, direction: String| {
             this.0.min(&direction).map_err(mlua::Error::external)
         });
+        methods.add_method("max", |_, this, direction: String| {
+            this.0.max(&direction).map_err(mlua::Error::external)
+        });
+        methods.add_method("wire_packet_bytes", |_, this, direction: String| {
+            this.0
+                .wire_packet_bytes(&direction)
+                .map_err(mlua::Error::external)
+        });
         methods.add_method("num_reflectors", |_, this, ()| Ok(this.0.num_reflectors()));
         methods.add_method("log", |_, this, (level, message): (String, String)| {
             this.0.log(&level, &message).map_err(mlua::Error::external)

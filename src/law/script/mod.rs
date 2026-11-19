@@ -146,6 +146,19 @@ impl ScriptCtx<'_> {
         Ok(self.law.shaper(direction).map(|s| s.min_kbps))
     }
 
+    /// `None` without a shaper for `direction` or without a configured maximum.
+    pub fn max(&self, direction: &str) -> anyhow::Result<Option<f64>> {
+        let direction = parse_direction(direction)?;
+        Ok(self.law.shaper(direction).and_then(|s| s.max_kbps))
+    }
+
+    /// The largest packet on the wire, MTU plus CAKE overhead and framing.
+    /// `None` without a shaper for `direction` or where it can't be read.
+    pub fn wire_packet_bytes(&self, direction: &str) -> anyhow::Result<Option<u32>> {
+        let direction = parse_direction(direction)?;
+        Ok(self.law.shaper(direction).and_then(|s| s.wire_packet_bytes))
+    }
+
     pub fn num_reflectors(&self) -> usize {
         self.law.num_reflectors()
     }
