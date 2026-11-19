@@ -27,6 +27,7 @@ fastrand = "2"
 icmp-socket2 = { version = "0.6.5", features = ["tokio"] }
 irtt-client = { version = "0.8.0", optional = true, features = ["ancillary", "tokio"] }
 libc = "0.2"
+mlua = { version = "0.11", features = ["lua54", "send"], optional = true }
 rustix = { version = "1.1", features = ["fs", "system", "thread", "time"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2.0"
@@ -45,8 +46,10 @@ netlink-socket2 = { version = "0.3.5" }
 rust-uci = { git = "https://github.com/Lochnair/rust-uci.git", rev = "6835397f4f4ba8b69e75e727105186865c357417", optional = true, default-features = false }
 
 [features]
-default = ["irtt", "toml", "uci-vendored"]
+default = ["irtt", "lua-vendored", "toml", "uci-vendored"]
 irtt = ["dep:irtt-client"]
+lua = ["dep:mlua"]
+lua-vendored = ["lua", "mlua/vendored"]
 toml = ["config/toml"]
 uci = ["dep:rust-uci"]
 uci-vendored = ["uci", "rust-uci/vendored"]

@@ -366,7 +366,7 @@ impl Metrics {
             escape(instance)
         );
         let tags = LineTags {
-            law: format!("{common},law={}", escape(&settings.law.name)),
+            law: format!("{common},law={}", escape(settings.law.name.as_str())),
             common,
         };
         Ok(Self {

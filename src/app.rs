@@ -75,6 +75,8 @@ impl App {
             .then(diagnostics::channel)
             .unzip();
         let law = law::build(&settings, diagnostics)?;
+        // A law that kept no sender writes no statistics.
+        let records = records.filter(|records| !records.is_closed());
         let cadence = law.cadence();
         // Both periods drive timers that panic on a zero or unrepresentable
         // interval, so a law returning one is rejected here.
@@ -82,7 +84,7 @@ impl App {
             anyhow::ensure!(
                 !period.is_zero() && std::time::Instant::now().checked_add(period).is_some(),
                 "Law {:?} requested an unusable {name} period: {period:?}",
-                settings.law.name,
+                settings.law.name.as_str(),
             );
         }
         let folder = Path::new(settings.output.folder.trim()).join(instance);
@@ -146,7 +148,7 @@ impl App {
             applied_rx.clone(),
             traffic_rx,
             settings.reflectors.num_reflectors as usize,
-            LawStore::new(folder.join(&settings.law.name)),
+            LawStore::new(folder.join(settings.law.name.as_str())),
         );
         let manager = ReflectorManager::new(
             &settings,

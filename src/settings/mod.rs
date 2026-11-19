@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::law::LawKind;
 use crate::measurement::model::MeasurementProtocol;
 use config::{Config, ConfigError, Environment};
 use log::Level;
@@ -179,7 +180,8 @@ pub(crate) struct Settings {
 #[uci(passthrough_key = "name")]
 pub(crate) struct LawSettings {
     #[uci(rename = "type")]
-    pub(crate) name: String,
+    #[serde(deserialize_with = "deserialize_from_str")]
+    pub(crate) name: LawKind,
 
     /// The selected law's own table, `law.<name>`, left for the law to read.
     #[serde(skip)]
@@ -190,7 +192,7 @@ pub(crate) struct LawSettings {
 impl Default for LawSettings {
     fn default() -> Self {
         Self {
-            name: "sqma".to_owned(),
+            name: LawKind::Sqma,
             config: None,
         }
     }
@@ -235,7 +237,7 @@ impl Settings {
     fn from_config(config: Config) -> Result<Self, ConfigError> {
         let mut settings: Self = config.clone().try_deserialize()?;
 
-        settings.law.config = match config.get(&format!("law.{}", settings.law.name)) {
+        settings.law.config = match config.get(&format!("law.{}", settings.law.name.as_str())) {
             Ok(value) => Some(value),
             Err(ConfigError::NotFound(_)) => None,
             Err(error) => return Err(error),
