@@ -71,6 +71,8 @@ pub(super) struct Measurement {
     pub protocol: String,
     /// `"active"` or `"candidate"`.
     pub role: &'static str,
+    /// When the probe was sent; `t` is when it completed.
+    pub sent: f64,
     pub t: f64,
     pub loss: bool,
     pub rtt_ms: Option<f64>,
@@ -171,6 +173,27 @@ impl ScriptCtx<'_> {
 
     pub fn event(&self, name: &str, reason: &str) {
         self.law.metrics.send(Metric::event(name, reason, None));
+    }
+
+    /// A `unravel_law` line for `series`.
+    pub fn metric(&self, series: &str, fields: Vec<(String, f64)>, tags: Vec<(String, String)>) {
+        let metric = tags
+            .into_iter()
+            .fold(Metric::law(series), |m, (k, v)| m.tag(k, v));
+        let metric = fields.into_iter().fold(metric, |m, (k, v)| m.field(k, v));
+        self.law.metrics.send(metric);
+    }
+
+    /// The reflectors currently probed as active, as `(reflector, protocol)`
+    /// in the same form measurements carry.
+    pub fn active_reflectors(&self) -> Vec<(String, String)> {
+        self.law
+            .applied
+            .borrow()
+            .active_targets()
+            .iter()
+            .map(|target| (reflector_name(target), target.protocol().to_string()))
+            .collect()
     }
 }
 
@@ -304,7 +327,12 @@ impl Law for ScriptLaw {
                 event = ctx.measurements.recv() => {
                     match event {
                         Ok(event) => {
-                            let m = measurement(&event, &ctx, since_start(event.completed_at));
+                            let m = measurement(
+                                &event,
+                                &ctx,
+                                since_start(event.started_at),
+                                since_start(event.completed_at),
+                            );
                             self.call(&ctx, Event::Measurement(m))?;
                         }
                         Err(RecvError::Lagged(count)) => {
@@ -331,7 +359,15 @@ async fn tick(timer: &mut Option<time::Interval>) {
     }
 }
 
-fn measurement(event: &MeasurementEvent, ctx: &LawContext, t: f64) -> Measurement {
+/// The IP, or `ip:port` for IRTT, where one IP can serve several endpoints.
+fn reflector_name(target: &MeasurementTarget) -> String {
+    match target {
+        MeasurementTarget::Irtt { endpoint, .. } => endpoint.to_string(),
+        target => target.peer().to_string(),
+    }
+}
+
+fn measurement(event: &MeasurementEvent, ctx: &LawContext, sent: f64, t: f64) -> Measurement {
     let role = if ctx.applied.borrow().is_active(&event.target) {
         "active"
     } else {
@@ -342,12 +378,10 @@ fn measurement(event: &MeasurementEvent, ctx: &LawContext, t: f64) -> Measuremen
         MeasurementOutcome::Loss => None,
     };
     Measurement {
-        reflector: match &event.target {
-            MeasurementTarget::Irtt { endpoint, .. } => endpoint.to_string(),
-            target => target.peer().to_string(),
-        },
+        reflector: reflector_name(&event.target),
         protocol: event.target.protocol().to_string(),
         role,
+        sent,
         t,
         loss: matches!(event.outcome, MeasurementOutcome::Loss),
         rtt_ms: event.rtt_ms(),

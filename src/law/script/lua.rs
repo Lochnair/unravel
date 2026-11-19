@@ -156,6 +156,7 @@ impl Backend for LuaBackend {
                     t.set("reflector", m.reflector.as_str())?;
                     t.set("protocol", m.protocol.as_str())?;
                     t.set("role", m.role)?;
+                    t.set("sent", m.sent)?;
                     t.set("t", m.t)?;
                     t.set("loss", m.loss)?;
                     t.set("rtt_ms", m.rtt_ms)?;
@@ -235,6 +236,31 @@ impl UserData for LuaCtx<'_> {
         methods.add_method("event", |_, this, (name, reason): (String, String)| {
             this.0.event(&name, &reason);
             Ok(())
+        });
+        methods.add_method(
+            "metric",
+            |_, this, (series, fields, tags): (String, Table, Option<Table>)| {
+                // Sorted, so a series' lines keep one key order.
+                let mut fields: Vec<(String, f64)> = fields.pairs().collect::<Result<_, _>>()?;
+                fields.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut tags: Vec<(String, String)> = match tags {
+                    Some(tags) => tags.pairs().collect::<Result<_, _>>()?,
+                    None => Vec::new(),
+                };
+                tags.sort();
+                this.0.metric(&series, fields, tags);
+                Ok(())
+            },
+        );
+        methods.add_method("active_reflectors", |lua, this, ()| {
+            let list = lua.create_table()?;
+            for (reflector, protocol) in this.0.active_reflectors() {
+                let entry = lua.create_table()?;
+                entry.set("reflector", reflector)?;
+                entry.set("protocol", protocol)?;
+                list.push(entry)?;
+            }
+            Ok(list)
         });
     }
 }
