@@ -120,7 +120,7 @@ The bandwidth values are in kbit/s, so this example uses 50 Mbit/s download and 
 
 The minimum is a percentage of the base rate, 20% by default. With these values the shapers can go down to 10 Mbit/s download and 2 Mbit/s upload. Choose minima that leave you with a usable connection when capacity drops.
 
-You can also set a maximum, as a percentage of the base rate, with `download_max_percent` and `upload_max_percent` (at least 100). There's no maximum by default. Every law is held to it.
+You can also set a maximum, as a percentage of the base rate, with `download_max_percent` and `upload_max_percent` (at least 100). There's no maximum by default. Every law is held to it. The cake-autorate law needs one for each direction it shapes.
 
 ### TOML
 
@@ -167,6 +167,29 @@ config law 'wan2_law'
 On Linux, set `measurement_bind_device` in the instance's network settings if you need to bind its probes to a particular interface. To skip an instance when the OpenWrt service starts, set `option enabled '0'` under its `config network`.
 
 For a manual start, use `/usr/sbin/unravel --instance wan2`. If your build supports TOML, this instance reads `/etc/unravel/wan2.toml`.
+
+### cake-autorate law (experimental)
+
+The package ships cake-autorate's rate control as a script law. unRAVEL still picks and replaces the reflectors; the script only decides the rates. To try it, set a maximum rate and point the law at the script:
+
+```uci
+config network
+    ...
+    option download_max_percent '400'
+    option upload_max_percent '175'
+
+config law
+    option type 'script'
+    option path '/usr/share/unravel/laws/cake.lua'
+```
+
+It uses cake-autorate's defaults. The options it accepts, such as `download_delay_ms` and `high_load_level`, are listed at the top of the script, and go in the same `law` section. Try it with `dry_run` on first.
+
+Like cake-autorate, it reads each direction's largest packet on the wire from the interface MTU and the CAKE qdisc's overhead and ATM or PTM framing when it starts, and logs it. At low rates this raises the delay thresholds and lengthens the window that load is measured over. Where it can't be read, it assumes 1500 bytes; set `download_wire_packet_bytes` or `upload_wire_packet_bytes` in the `law` section to override it.
+
+It needs a build with Lua support. Script laws run on Lua 5.1, which OpenWrt ships as `liblua`, including older releases. Cargo builds and the release archives bundle it, and the archives include the script as `laws/cake.lua`. The OpenWrt package links the system `liblua` with the `lua` feature.
+
+Its `unravel_law` series is `cake`, sent with each load sample: every traffic sample, or less often on slow links (tags `direction` and `reason`, which is the strongest action since the last load sample: `bufferbloat`, `high_load`, `decay` or `hold`; fields `rate_kbps`, `achieved_kbps`, `load`, `avg_delta_ms`, `delayed`).
 
 ## Running it
 

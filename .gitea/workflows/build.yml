@@ -93,7 +93,7 @@ jobs:
           cp "$binary" "$stripped"
           llvm-strip --strip-all "$stripped"
           # Tar preserves executable permissions when downloading the artifact.
-          tar -czf "$artifact" -C dist "unravel-${TARGET}"
+          tar -czf "$artifact" -C dist "unravel-${TARGET}" laws/cake.lua
 
           size() {
             stat -c %s "$1" | numfmt --to=iec-i --suffix=B --format='%.1f'
