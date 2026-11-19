@@ -343,7 +343,10 @@ impl RateState {
             }
         }
 
-        next_kbps.max(shaper.min_kbps).floor()
+        next_kbps
+            .max(shaper.min_kbps)
+            .min(shaper.max_kbps.unwrap_or(f64::INFINITY))
+            .floor()
     }
 }
 

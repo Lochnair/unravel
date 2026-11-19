@@ -120,6 +120,8 @@ The bandwidth values are in kbit/s, so this example uses 50 Mbit/s download and 
 
 The minimum is a percentage of the base rate, 20% by default. With these values the shapers can go down to 10 Mbit/s download and 2 Mbit/s upload. Choose minima that leave you with a usable connection when capacity drops.
 
+You can also set a maximum, as a percentage of the base rate, with `download_max_percent` and `upload_max_percent` (at least 100). There's no maximum by default. Every law is held to it.
+
 ### TOML
 
 For a manual install, put the equivalent settings in `/etc/unravel/config.toml`.

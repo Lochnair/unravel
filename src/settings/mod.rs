@@ -263,6 +263,10 @@ pub(crate) struct NetworkSettings {
     pub(crate) upload_base_kbits: f64,
     #[serde(default = "default_min_percent")]
     pub(crate) upload_min_percent: f64,
+    /// The highest rate a law may set, as a percentage of base. Unset means
+    /// no maximum.
+    pub(crate) download_max_percent: Option<f64>,
+    pub(crate) upload_max_percent: Option<f64>,
 
     #[allow(dead_code)]
     pub(crate) measurement_bind_device: Option<String>,
@@ -294,6 +298,16 @@ impl NetworkSettings {
 
     pub(crate) fn upload_min_kbits(&self) -> f64 {
         (self.upload_base_kbits * self.upload_min_percent / 100.0).floor()
+    }
+
+    pub(crate) fn download_max_kbits(&self) -> Option<f64> {
+        self.download_max_percent
+            .map(|percent| (self.download_base_kbits * percent / 100.0).floor())
+    }
+
+    pub(crate) fn upload_max_kbits(&self) -> Option<f64> {
+        self.upload_max_percent
+            .map(|percent| (self.upload_base_kbits * percent / 100.0).floor())
     }
 }
 

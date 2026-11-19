@@ -142,6 +142,25 @@ impl NetworkSettings {
                 self.upload_min_percent,
             );
 
+        for (path, enabled, max_percent) in [
+            (
+                "network.download_max_percent",
+                self.download_interface().is_some(),
+                self.download_max_percent,
+            ),
+            (
+                "network.upload_max_percent",
+                self.upload_interface().is_some(),
+                self.upload_max_percent,
+            ),
+        ] {
+            if let (true, Some(percent)) = (enabled, max_percent)
+                && !(percent.is_finite() && percent >= 100.0)
+            {
+                report.error(path, format!("must be at least 100, got {percent}"));
+            }
+        }
+
         if download_percent_valid && self.download_min_percent > WARN_HIGH_MIN_PERCENT {
             report.warning(
                 "network.download_min_percent",
@@ -378,6 +397,8 @@ mod tests {
             download_min_percent: 1.0,
             upload_base_kbits,
             upload_min_percent: 1.0,
+            download_max_percent: None,
+            upload_max_percent: None,
             measurement_bind_device: None,
             measurement_mark: None,
             measurement_fib: None,

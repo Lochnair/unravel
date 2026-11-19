@@ -41,12 +41,12 @@ pub(crate) struct Shaper {
 }
 
 impl Shaper {
-    fn new(interface: &str, base_kbps: f64, min_kbps: f64) -> Self {
+    fn new(interface: &str, base_kbps: f64, min_kbps: f64, max_kbps: Option<f64>) -> Self {
         Self {
             interface: interface.to_owned(),
             base_kbps,
             min_kbps,
-            max_kbps: None,
+            max_kbps,
         }
     }
 }
@@ -98,6 +98,7 @@ impl Runtime {
                     interface,
                     settings.network.download_base_kbits,
                     settings.network.download_min_kbits(),
+                    settings.network.download_max_kbits(),
                 )
             }),
             upload: settings.network.upload_interface().map(|interface| {
@@ -105,6 +106,7 @@ impl Runtime {
                     interface,
                     settings.network.upload_base_kbits,
                     settings.network.upload_min_kbits(),
+                    settings.network.upload_max_kbits(),
                 )
             }),
             metrics,
@@ -246,13 +248,15 @@ impl Runtime {
             "Invalid requested shaper rate: {rate_kbps}"
         );
 
+        let mut rate_kbps = rate_kbps;
         if let Some(max_kbps) = shaper.max_kbps
             && rate_kbps > max_kbps
         {
             warn!(
                 "Law requested {direction:?} rate above configured maximum: \
-                 {rate_kbps} > {max_kbps} kbps"
+                 {rate_kbps} > {max_kbps} kbps, using the maximum"
             );
+            rate_kbps = max_kbps;
         }
 
         if rate_kbps < shaper.min_kbps {
