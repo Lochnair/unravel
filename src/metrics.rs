@@ -130,11 +130,15 @@ pub enum Metric {
         protocol: MeasurementProtocol,
         role: MeasurementRole,
     },
-    /// The applied rate and its load, sent by the runtime per traffic sample.
+    /// A rate applied to the shaper, sent by the runtime when it is set.
     Rate {
         direction: Direction,
         rate_kbps: f64,
-        load: f64,
+    },
+    /// Measured traffic, sent by the runtime per traffic sample.
+    Traffic {
+        direction: Direction,
+        traffic_kbps: f64,
     },
     Event {
         name: String,
@@ -178,11 +182,17 @@ impl Metric {
         }
     }
 
-    pub fn rate(direction: Direction, rate_kbps: f64, load: f64) -> Self {
+    pub fn rate(direction: Direction, rate_kbps: f64) -> Self {
         Metric::Rate {
             direction,
             rate_kbps,
-            load,
+        }
+    }
+
+    pub fn traffic(direction: Direction, traffic_kbps: f64) -> Self {
+        Metric::Traffic {
+            direction,
+            traffic_kbps,
         }
     }
 
@@ -281,7 +291,7 @@ impl MetricsSender {
         let enabled = match &metric {
             Metric::Ping { .. } | Metric::Loss { .. } => self.export_ping_metrics,
             Metric::Law { .. } => self.export_law_metrics,
-            Metric::Rate { .. } => self.export_rate_metrics,
+            Metric::Rate { .. } | Metric::Traffic { .. } => self.export_rate_metrics,
             Metric::Event { .. } => self.export_events,
             Metric::Dropped { .. } => true,
         };
@@ -488,18 +498,24 @@ impl Metrics {
             Metric::Rate {
                 direction,
                 rate_kbps,
-                load,
             } => {
-                write!(
+                writeln!(
                     out,
-                    "unravel_rate,{common},direction={} rate_kbps={rate_kbps:.0}",
+                    "unravel_rate,{common},direction={} rate_kbps={rate_kbps:.0} {timestamp_ns}",
                     direction.as_str()
                 )
                 .unwrap_or(());
-                if load.is_finite() {
-                    write!(out, ",load={load:.4}").unwrap_or(());
-                }
-                writeln!(out, " {timestamp_ns}").unwrap_or(());
+            }
+            Metric::Traffic {
+                direction,
+                traffic_kbps,
+            } => {
+                writeln!(
+                    out,
+                    "unravel_traffic,{common},direction={} traffic_kbps={traffic_kbps:.0} {timestamp_ns}",
+                    direction.as_str()
+                )
+                .unwrap_or(());
             }
             Metric::Event {
                 name,

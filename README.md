@@ -208,11 +208,12 @@ host = "192.168.1.100"
 port = 8089
 ```
 
-TCP is also supported. Every line carries `host` and `instance` tags. Rate metrics and events are exported by default when enabled; add `export_ping_metrics = true` or `export_law_metrics = true` if you need those too.
+TCP is also supported. Every line carries `host` and `instance` tags. Rate and traffic metrics (`export_rate_metrics`) and events are exported by default when enabled; add `export_ping_metrics = true` or `export_law_metrics = true` if you need those too.
 
 | Measurement | Sent | Tags | Fields |
 | --- | --- | --- | --- |
-| `unravel_rate` | per traffic sample, once a rate is set | `direction` | `rate_kbps`, `load` |
+| `unravel_rate` | when a rate is applied | `direction` | `rate_kbps` |
+| `unravel_traffic` | per traffic sample | `direction` | `traffic_kbps` |
 | `unravel_ping` | per reply (`export_ping_metrics`) | `reflector`, `type` | `rtt`, `up_time`, `down_time` (when one-way times exist) |
 | `unravel_loss` | per lost probe (`export_ping_metrics`) | `reflector`, `type` | `count` |
 | `unravel_event` | on events | `type`, `reason`, `reflector`, … | `count` |

@@ -3,10 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -41,8 +38,6 @@ pub(crate) struct Shaper {
     pub(crate) base_kbps: f64,
     pub(crate) min_kbps: f64,
     pub(crate) max_kbps: Option<f64>,
-    /// The last rate applied, as `f64` bits; NaN until the first one.
-    applied_kbps: AtomicU64,
 }
 
 impl Shaper {
@@ -52,12 +47,7 @@ impl Shaper {
             base_kbps,
             min_kbps,
             max_kbps: None,
-            applied_kbps: AtomicU64::new(f64::NAN.to_bits()),
         }
-    }
-
-    fn applied_kbps(&self) -> Option<f64> {
-        Some(f64::from_bits(self.applied_kbps.load(Ordering::Relaxed))).filter(|r| !r.is_nan())
     }
 }
 
@@ -234,10 +224,7 @@ impl Runtime {
             (Direction::Download, rates.rx_kbps),
             (Direction::Upload, rates.tx_kbps),
         ] {
-            if let Some(rate_kbps) = self.shaper(direction).and_then(Shaper::applied_kbps) {
-                self.metrics
-                    .send(Metric::rate(direction, rate_kbps, traffic_kbps / rate_kbps));
-            }
+            self.metrics.send(Metric::traffic(direction, traffic_kbps));
         }
     }
 
@@ -277,9 +264,7 @@ impl Runtime {
 
         self.platform
             .set_rate(&shaper.interface, rate_kbps.round() as u64, self.dry_run)?;
-        shaper
-            .applied_kbps
-            .store(rate_kbps.to_bits(), Ordering::Relaxed);
+        self.metrics.send(Metric::rate(direction, rate_kbps));
 
         Ok(())
     }
