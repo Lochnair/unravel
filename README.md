@@ -74,7 +74,7 @@ apk add --allow-untrusted /tmp/unravel*.apk
 
 ### Building with Cargo
 
-For other Linux systems, use a current stable Rust toolchain. The default build reads TOML and UCI configuration files, supports IRTT and bundles Lua 5.4. On Debian or Ubuntu, install the build dependencies first.
+For other Linux systems, use a current stable Rust toolchain. The default build reads TOML and UCI configuration files, supports IRTT and bundles Lua 5.1. It also includes ubus status support. On Debian or Ubuntu, install the build dependencies first.
 
 ```sh
 sudo apt install build-essential
@@ -120,7 +120,7 @@ The bandwidth values are in kbit/s, so this example uses 50 Mbit/s download and 
 
 The minimum is a percentage of the base rate, 20% by default. With these values the shapers can go down to 10 Mbit/s download and 2 Mbit/s upload. Choose minima that leave you with a usable connection when capacity drops.
 
-You can also set a maximum, as a percentage of the base rate, with `download_max_percent` and `upload_max_percent` (at least 100). There's no maximum by default. Every law is held to it. The cake-autorate law needs one for each direction it shapes.
+To cap either shaper, set `download_max_percent` or `upload_max_percent` to at least 100. For example, 150 caps the shaper at 1.5 times its base rate. The caps are off by default and apply to every control law.
 
 ### TOML
 
@@ -168,29 +168,6 @@ On Linux, set `measurement_bind_device` in the instance's network settings if yo
 
 For a manual start, use `/usr/sbin/unravel --instance wan2`. If your build supports TOML, this instance reads `/etc/unravel/wan2.toml`.
 
-### cake-autorate law (experimental)
-
-The package ships cake-autorate's rate control as a script law. unRAVEL still picks and replaces the reflectors; the script only decides the rates. To try it, set a maximum rate and point the law at the script:
-
-```uci
-config network
-    ...
-    option download_max_percent '400'
-    option upload_max_percent '175'
-
-config law
-    option type 'script'
-    option path '/usr/share/unravel/laws/cake.lua'
-```
-
-It uses cake-autorate's defaults. The options it accepts, such as `download_delay_ms` and `high_load_level`, are listed at the top of the script, and go in the same `law` section. Try it with `dry_run` on first.
-
-Like cake-autorate, it reads each direction's largest packet on the wire from the interface MTU and the CAKE qdisc's overhead and ATM or PTM framing when it starts, and logs it. At low rates this raises the delay thresholds and lengthens the window that load is measured over. Where it can't be read, it assumes 1500 bytes; set `download_wire_packet_bytes` or `upload_wire_packet_bytes` in the `law` section to override it.
-
-It needs a build with Lua support. Script laws run on Lua 5.1, which OpenWrt ships as `liblua`, including older releases. Cargo builds and the release archives bundle it, and the archives include the script as `laws/cake.lua`. The OpenWrt package links the system `liblua` with the `lua` feature.
-
-Its `unravel_law` series is `cake`, sent with each load sample: every traffic sample, or less often on slow links (tags `direction` and `reason`, which is the strongest action since the last load sample: `bufferbloat`, `high_load`, `decay` or `hold`; fields `rate_kbps`, `achieved_kbps`, `load`, `avg_delta_ms`, `delayed`).
-
 ## Running it
 
 To try it without changing CAKE's rates, set `option dry_run '1'` under `config advanced_settings`, or `dry_run = true` under `[advanced_settings]` in TOML. Dry run still needs the configured interfaces and CAKE qdiscs. It sends probes and SQMA still writes its CSV files if statistics are enabled. Turn off `dry_run` when you're ready to let unRAVEL change the rates.
@@ -215,12 +192,13 @@ unRAVEL starts by setting the enabled shapers to their minimum rates. Once it's 
 
 Ctrl+C or SIGTERM stops the program and attempts to restore the enabled shapers to your configured base rates. When running through the OpenWrt service, use `/etc/init.d/unravel stop` to stop it.
 
-### Status
+### Checking status on OpenWrt
 
-On OpenWrt, each running instance publishes its state on ubus: `unravel` for the unnamed instance and `unravel.<name>` for a named one.
+With the `ubus` build feature enabled, you can check the current rates and active reflector count without stopping the service. Use `unravel` for the unnamed instance and `unravel.<name>` for a named one. For example, if you added `wan2` above, use the second command.
 
 ```sh
 ubus call unravel status
+ubus call unravel.wan2 status
 ```
 
 ```json
@@ -248,9 +226,9 @@ ubus call unravel status
 }
 ```
 
-`uptime` is in seconds and `reflectors` counts the active ones. A direction only appears when it's shaped, and `max_kbps` only when a maximum is configured. `rate_kbps` is the rate last set (simulated in dry run), and `traffic_kbps` is the latest traffic sample; either is left out until there is one. The package's rpcd ACL, `unravel`, grants read access to every instance's status for LuCI and other rpcd users.
+`uptime` is in seconds, and `reflectors` counts the active reflectors that are ready to probe. Each enabled shaper has its own entry, with `max_kbps` included if you've set a cap. Once unRAVEL has set a rate, `rate_kbps` shows that last rate (simulated in dry run). `traffic_kbps` shows the current sample when one is available.
 
-Without ubusd, unRAVEL logs that it isn't publishing status and carries on.
+If the ubus socket is missing at startup, unRAVEL logs a message and carries on. For LuCI and other rpcd clients, the `unravel` read permission covers the `status` method on every instance. [rpcd ACL](dist/openwrt/unravel.rpcd.json)
 
 ## Control laws
 
@@ -279,6 +257,29 @@ name = "script"
 [law.script]
 path = "/etc/unravel/minimal.lua"
 ```
+
+### Trying the cake-autorate law
+
+The experimental `cake.lua` script uses cake-autorate's rate control and defaults. unRAVEL still picks and replaces the reflectors. You'll need a build with Lua support.
+
+The example uses `/usr/share/unravel/laws/cake.lua`. If your package hasn't installed it there, copy it from `laws/cake.lua` in the release archive or from the source tree. [dist/laws/cake.lua](dist/laws/cake.lua)
+
+Add a maximum for each direction you shape to your existing `config network` section. Adjust these percentages to suit your link.
+
+```uci
+    option download_max_percent '400'
+    option upload_max_percent '175'
+```
+
+Then replace the SQMA `config law` section with this one. You can put tuning options such as `download_delay_ms` and `high_load_level` in the same section. Try it with `dry_run` on first.
+
+```uci
+config law
+    option type 'script'
+    option path '/usr/share/unravel/laws/cake.lua'
+```
+
+At startup the script logs the largest packet size it will use for each direction. On Linux, unRAVEL works this out from the interface MTU and CAKE's overhead and ATM or PTM framing. At low rates, sending a packet takes longer, so the script raises its delay thresholds and measures load over a longer window. If it can't get the packet size, it uses 1500 bytes. Set `download_wire_packet_bytes` or `upload_wire_packet_bytes` in the law section if you need to override it.
 
 ## Reflectors and measurement protocols
 
@@ -342,6 +343,8 @@ Every line has `host` and `instance` tags. When you enable the exporter, it send
 Use `role=active` to pick out active reflectors from the probe metrics. Candidate probes have `role=candidate`.
 
 For SQMA, `unravel_law` with `series=baseline` has the `baseline_ewma` and `recent_ewma` fields, tagged by `reflector` and `direction`. The `delta` series has `delta_delay`, tagged by `direction`.
+
+The cake-autorate script sends `unravel_law` with `series=cake` after each load window. It usually reports on every traffic sample, less often on slow links. The tags are `direction` and `reason`. The reason records the strongest action since the last sample (`bufferbloat`, `high_load`, `decay` or `hold`). Each sample has `rate_kbps`, `achieved_kbps`, `load`, `avg_delta_ms` and `delayed`.
 
 ## License
 
