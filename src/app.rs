@@ -37,6 +37,8 @@ struct PreparedWorkers {
     manager: ReflectorManager,
     law: Box<dyn Law>,
     law_ctx: LawContext,
+    #[cfg(all(feature = "ubus", unix))]
+    status: Option<crate::status::Status>,
 }
 
 pub(crate) struct App {
@@ -150,6 +152,14 @@ impl App {
             settings.reflectors.num_reflectors as usize,
             LawStore::new(folder.join(settings.law.name.as_str())),
         );
+        #[cfg(all(feature = "ubus", unix))]
+        let status = crate::status::Status::new(
+            Arc::clone(&runtime),
+            applied_rx.clone(),
+            instance,
+            settings.law.name.as_str(),
+            settings.advanced_settings.dry_run,
+        );
         let manager = ReflectorManager::new(
             &settings,
             cadence.probe,
@@ -168,6 +178,8 @@ impl App {
                 manager,
                 law,
                 law_ctx,
+                #[cfg(all(feature = "ubus", unix))]
+                status,
             },
             exporter,
             csv_writer,
@@ -274,7 +286,13 @@ impl PreparedWorkers {
             manager,
             law,
             law_ctx,
+            #[cfg(all(feature = "ubus", unix))]
+            status,
         } = self;
+        #[cfg(all(feature = "ubus", unix))]
+        if let Some(status) = status {
+            workers.spawn(async move { ("ubus status", status.run().await) });
+        }
         workers.spawn(async move { ("runtime sampler", runtime.run().await) });
         workers.spawn(async move {
             let result = engine.run().await;

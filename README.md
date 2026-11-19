@@ -215,6 +215,43 @@ unRAVEL starts by setting the enabled shapers to their minimum rates. Once it's 
 
 Ctrl+C or SIGTERM stops the program and attempts to restore the enabled shapers to your configured base rates. When running through the OpenWrt service, use `/etc/init.d/unravel stop` to stop it.
 
+### Status
+
+On OpenWrt, each running instance publishes its state on ubus: `unravel` for the unnamed instance and `unravel.<name>` for a named one.
+
+```sh
+ubus call unravel status
+```
+
+```json
+{
+	"version": "0.5.0-rc1",
+	"instance": "default",
+	"law": "sqma",
+	"dry_run": false,
+	"uptime": 3605,
+	"reflectors": 5,
+	"download": {
+		"interface": "ifb4wan",
+		"base_kbps": 100000,
+		"min_kbps": 20000,
+		"rate_kbps": 87341,
+		"traffic_kbps": 41210
+	},
+	"upload": {
+		"interface": "wan",
+		"base_kbps": 20000,
+		"min_kbps": 4000,
+		"rate_kbps": 18922,
+		"traffic_kbps": 1530
+	}
+}
+```
+
+`uptime` is in seconds and `reflectors` counts the active ones. A direction only appears when it's shaped, and `max_kbps` only when a maximum is configured. `rate_kbps` is the rate last set (simulated in dry run), and `traffic_kbps` is the latest traffic sample; either is left out until there is one. The package's rpcd ACL, `unravel`, grants read access to every instance's status for LuCI and other rpcd users.
+
+Without ubusd, unRAVEL logs that it isn't publishing status and carries on.
+
 ## Control laws
 
 SQMA is the default. If you want to change its delay thresholds or sampling interval, put the options in `config law` with `option type 'sqma'` on OpenWrt, or in `[law.sqma]` in TOML. [OpenWrt example config](dist/openwrt/unravel.config)

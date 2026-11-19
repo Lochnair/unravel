@@ -42,6 +42,8 @@ pub(crate) struct Shaper {
     /// qdisc at startup. `None` where the platform can't tell.
     #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     pub(crate) wire_packet_bytes: Option<u32>,
+    /// The last rate set, simulated in dry run.
+    rate: watch::Sender<Option<f64>>,
 }
 
 impl Shaper {
@@ -64,7 +66,19 @@ impl Shaper {
             min_kbps,
             max_kbps,
             wire_packet_bytes,
+            rate: watch::channel(None).0,
         }
+    }
+
+    #[cfg_attr(not(all(feature = "ubus", unix)), allow(dead_code))]
+    pub(crate) fn interface(&self) -> &str {
+        &self.interface
+    }
+
+    /// The rate last set, simulated in dry run, if any has been.
+    #[cfg_attr(not(all(feature = "ubus", unix)), allow(dead_code))]
+    pub(crate) fn rate_kbps(&self) -> Option<f64> {
+        *self.rate.borrow()
     }
 }
 
@@ -250,7 +264,13 @@ impl Runtime {
         }
     }
 
-    pub(super) fn shaper(&self, direction: Direction) -> Option<&Shaper> {
+    /// The latest traffic sample, if the last one succeeded.
+    #[cfg_attr(not(all(feature = "ubus", unix)), allow(dead_code))]
+    pub(crate) fn traffic(&self) -> Option<TrafficRates> {
+        *self.traffic_tx.borrow()
+    }
+
+    pub(crate) fn shaper(&self, direction: Direction) -> Option<&Shaper> {
         match direction {
             Direction::Download => self.download.as_ref(),
             Direction::Upload => self.upload.as_ref(),
@@ -288,6 +308,7 @@ impl Runtime {
 
         self.platform
             .set_rate(&shaper.interface, rate_kbps.round() as u64, self.dry_run)?;
+        shaper.rate.send_replace(Some(rate_kbps));
         self.metrics.send(Metric::rate(direction, rate_kbps));
 
         Ok(())

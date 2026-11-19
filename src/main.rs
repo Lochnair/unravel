@@ -18,6 +18,8 @@ mod platform;
 mod reflector_manager;
 mod runtime;
 mod settings;
+#[cfg(all(feature = "ubus", unix))]
+mod status;
 mod time;
 
 use crate::app::App;

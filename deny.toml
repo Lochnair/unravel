@@ -44,7 +44,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+allow-git = ["https://github.com/Lochnair/tokio-ubus"]
 
 [sources.allow-org]
 github = []
