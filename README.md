@@ -35,8 +35,6 @@ apk add unravel
 
 The package includes the binary, reflector inventory, UCI configuration and init script. Edit `/etc/config/unravel` before starting the service.
 
-The configuration examples below are for `master`. If you're installing from the feed, start with the config the package ships. If you're building with the SDK, check `PKG_SOURCE_VERSION` for the source revision the recipe builds. [OpenWrt package recipe](https://github.com/Lochnair/openwrt-feeds/blob/main/net/unravel/Makefile)
-
 The feed only publishes APK packages. For older OpenWrt releases using opkg, build an `.ipk` with the SDK below.
 
 ### Building with the OpenWrt SDK
