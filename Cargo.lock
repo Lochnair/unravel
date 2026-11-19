@@ -861,7 +861,7 @@ dependencies = [
 [[package]]
 name = "tokio-ubus"
 version = "0.1.0"
-source = "git+https://github.com/Lochnair/tokio-ubus?rev=a46f9d8bd0fab1498bd422dfb8d25d08fb96a737#a46f9d8bd0fab1498bd422dfb8d25d08fb96a737"
+source = "git+https://github.com/Lochnair/tokio-ubus?rev=cc6faef809a92fd80a76d0d6897773811b61e4a2#cc6faef809a92fd80a76d0d6897773811b61e4a2"
 dependencies = [
  "log",
  "thiserror",
