@@ -203,7 +203,7 @@ ubus call unravel.wan2 status
 
 ```json
 {
-	"version": "0.5.0-rc1",
+	"version": "0.6.0-rc1",
 	"instance": "default",
 	"law": "sqma",
 	"dry_run": false,
