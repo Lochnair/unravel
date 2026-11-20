@@ -79,31 +79,40 @@ impl Evidence {
     /// step can requalify; repeated transitions or a run of rejected timing
     /// should open replacement qualification even while RTT replies continue.
     pub fn timing_unhealthy(&self, now: Instant, max_age: Duration) -> bool {
-        let recent = self
+        let (mut changes, mut recent, mut rejected) = (0, 0, 0);
+        for e in self
             .outcomes
             .iter()
             .rev()
             .filter(|e| now.saturating_duration_since(e.completed_at) <= max_age)
-            .collect::<Vec<_>>();
-        let repeated_changes = recent
-            .iter()
-            .filter(|e| {
-                Some(e.started_at) != self.first_reference
-                    && matches!(e.outcome,
-                MeasurementOutcome::Reply { one_way: Some(owd), .. }
-                if owd.status == OneWayStatus::ReferenceChanged)
-            })
-            .count()
-            >= 2;
-        let rejected_streak = recent.len() >= STREAK
-            && recent.iter().take(STREAK).all(|e| {
-                valid_rtt(e).is_some()
-                    && matches!(e.outcome,
-                MeasurementOutcome::Reply { one_way: Some(owd), .. }
-                if matches!(owd.status, OneWayStatus::Unusable(
-                    OneWayRejection::InconsistentTimestamps | OneWayRejection::Discontinuity)))
-            });
-        repeated_changes || rejected_streak
+        {
+            let MeasurementOutcome::Reply {
+                one_way: Some(owd), ..
+            } = e.outcome
+            else {
+                recent += 1;
+                continue;
+            };
+            if owd.status == OneWayStatus::ReferenceChanged
+                && Some(e.started_at) != self.first_reference
+            {
+                changes += 1;
+            }
+            // Counts the newest STREAK outcomes only.
+            if recent < STREAK
+                && valid_rtt(e).is_some()
+                && matches!(
+                    owd.status,
+                    OneWayStatus::Unusable(
+                        OneWayRejection::InconsistentTimestamps | OneWayRejection::Discontinuity
+                    )
+                )
+            {
+                rejected += 1;
+            }
+            recent += 1;
+        }
+        changes >= 2 || rejected == STREAK
     }
 
     pub fn quality(
@@ -124,13 +133,16 @@ impl Evidence {
         {
             return None;
         }
-        let mut rtts = Vec::with_capacity(min_samples);
+        // The window holds at most WINDOW outcomes, so the samples fit on the stack.
+        let mut samples = [0.0; WINDOW];
+        let mut count = 0;
         let mut directional = true;
         for event in self.outcomes.iter().rev().take(min_samples) {
             if now.saturating_duration_since(event.started_at) > horizon {
                 return None;
             }
-            rtts.push(valid_rtt(event)?);
+            samples[count] = valid_rtt(event)?;
+            count += 1;
             match event.outcome {
                 MeasurementOutcome::Reply {
                     one_way: Some(owd), ..
@@ -146,7 +158,8 @@ impl Evidence {
                 _ => directional = false,
             }
         }
-        rtts.sort_by(f64::total_cmp);
+        let rtts = &mut samples[..count];
+        rtts.sort_unstable_by(f64::total_cmp);
         let mid = rtts.len() / 2;
         let rtt = if rtts.len().is_multiple_of(2) {
             rtts[mid - 1] / 2.0 + rtts[mid] / 2.0

@@ -281,6 +281,10 @@ pub struct ReflectorManager {
     rng: fastrand::Rng,
     desired: watch::Sender<MeasurementPlan>,
     applied: watch::Receiver<AppliedState>,
+    /// The engine's last applied state, cloned only when it changes.
+    applied_state: AppliedState,
+    /// Slots changed since the plan was last published.
+    unpublished: bool,
     measurements: broadcast::Receiver<MeasurementEvent>,
     metrics: MetricsSender,
 }
@@ -349,6 +353,8 @@ impl ReflectorManager {
             rng,
             desired,
             applied,
+            applied_state: AppliedState::default(),
+            unpublished: true,
             measurements,
             metrics,
         };
@@ -418,10 +424,16 @@ impl ReflectorManager {
                 .is_some_and(|s| !s.failed && s.class == self.mode);
             let old = self.active[slot].replace(next);
             self.candidates[candidate] = old.filter(|_| keep).map(|old| old.enter(now));
+            self.unpublished = true;
         }
         // One class per active set: whatever a switch did not replace is retired.
         for slot in &mut self.active {
-            slot.take_if(|live| class(&self.inventory[live.inventory].target) != self.mode);
+            if slot
+                .take_if(|live| class(&self.inventory[live.inventory].target) != self.mode)
+                .is_some()
+            {
+                self.unpublished = true;
+            }
         }
 
         // Candidates: fill empty and failed slots, periodically rotate the
@@ -451,9 +463,14 @@ impl ReflectorManager {
                     Some(entry.peer()),
                 ));
                 self.candidates[slot] = Some(Live::new(target, now));
+                self.unpublished = true;
             }
         }
-        self.publish()
+        if self.unpublished {
+            self.publish()?;
+            self.unpublished = false;
+        }
+        Ok(())
     }
 
     /// Round-robin across protocol groups, each a shuffled deck.
@@ -566,6 +583,7 @@ impl ReflectorManager {
         let mut maintenance = tokio::time::interval(Duration::from_secs(1));
         maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            let mut refresh = false;
             tokio::select! {
                 pool = async {
                     match &mut self.pool_discovery {
@@ -586,10 +604,18 @@ impl ReflectorManager {
                     }
                     Err(broadcast::error::RecvError::Closed) => return Err(ChannelClosed.into()),
                 },
-                changed = self.applied.changed() => changed.map_err(|_| ChannelClosed)?,
+                changed = self.applied.changed() => {
+                    changed.map_err(|_| ChannelClosed)?;
+                    refresh = true;
+                }
                 _ = maintenance.tick() => {}
             }
-            let applied = self.applied.borrow_and_update().clone();
+            // A closed channel still holds its last value.
+            if refresh || self.applied.has_changed().unwrap_or(true) {
+                self.applied_state = self.applied.borrow_and_update().clone();
+            }
+            // Moved out for the pass, as select borrows the manager mutably.
+            let applied = std::mem::take(&mut self.applied_state);
             let revision = self.desired.borrow().revision;
             anyhow::ensure!(
                 applied.rejected_revision != Some(revision),
@@ -599,6 +625,7 @@ impl ReflectorManager {
             if applied.revision == revision {
                 self.select(&applied, Instant::now())?;
             }
+            self.applied_state = applied;
         }
     }
 }
