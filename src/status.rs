@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-//! The instance's state on ubus, for `ubus call unravel status` and LuCI.
+//! The instance's state on ubus, for `ubus call unravel.wan status` and LuCI.
 
 use std::{path::Path, sync::Arc, time::Instant};
 
@@ -11,7 +11,7 @@ use tokio::sync::watch;
 use tokio_ubus::{DEFAULT_SOCKET, Object, Server, Table};
 
 use crate::{
-    DEFAULT_INSTANCE, VERSION,
+    VERSION,
     measurement::plan::AppliedState,
     runtime::{Direction, Runtime},
 };
@@ -30,8 +30,7 @@ struct State {
 }
 
 impl Status {
-    /// The status object, `unravel` for the unnamed instance and
-    /// `unravel.<instance>` for a named one, or `None` without ubusd.
+    /// The status object `unravel.<instance>`, or `None` without ubusd.
     pub(crate) fn new(
         runtime: Arc<Runtime>,
         applied: watch::Receiver<AppliedState>,
@@ -43,10 +42,6 @@ impl Status {
             info!("No ubus socket at {DEFAULT_SOCKET}; not publishing status");
             return None;
         }
-        let name = match instance {
-            DEFAULT_INSTANCE => "unravel".to_owned(),
-            instance => format!("unravel.{instance}"),
-        };
         let state = Arc::new(State {
             runtime,
             applied,
@@ -55,7 +50,7 @@ impl Status {
             dry_run,
             started: Instant::now(),
         });
-        let object = Object::new(name).method("status", move |_| {
+        let object = Object::new(format!("unravel.{instance}")).method("status", move |_| {
             let status = state.table();
             async move { Ok(Some(status)) }
         });

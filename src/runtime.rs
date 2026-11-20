@@ -143,7 +143,7 @@ impl Runtime {
             }),
             platform,
             metrics,
-            dry_run: settings.advanced_settings.dry_run,
+            dry_run: settings.dry_run,
         })
     }
 

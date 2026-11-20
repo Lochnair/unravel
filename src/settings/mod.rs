@@ -25,6 +25,13 @@ pub(crate) use validation::{
     ValidationReport, validate_greater_than_zero_f64, validate_zero_or_greater_f64,
 };
 
+pub(crate) fn valid_instance_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 struct FlexiBool(bool);
 
 impl FromStr for FlexiBool {
@@ -147,13 +154,15 @@ struct ReflectorRow {
 #[derive(Clone, Debug, Deserialize, UciConfig)]
 #[uci(package = "unravel")]
 pub(crate) struct Settings {
+    #[serde(default, deserialize_with = "deserialize_flex_bool")]
+    #[uci(instance_option)]
+    pub(crate) dry_run: bool,
+
     #[serde(default)]
     #[uci(section)]
     pub(crate) law: LawSettings,
 
-    // In UCI each `network` section is an instance, and refers to the other
-    // sections it uses by name.
-    #[uci(section, anchor)]
+    #[uci(section = "instance", instance)]
     pub(crate) network: NetworkSettings,
 
     #[serde(default)]
@@ -167,10 +176,6 @@ pub(crate) struct Settings {
     #[serde(default)]
     #[uci(section)]
     pub(crate) observability: ObservabilitySettings,
-
-    #[serde(default)]
-    #[uci(section)]
-    pub(crate) advanced_settings: AdvancedSettings,
 }
 
 // In UCI the law is chosen with `option type`, and the rest of the `law`
@@ -199,32 +204,34 @@ impl Default for LawSettings {
 }
 
 impl Settings {
-    /// Loads the settings of `instance`, or of the unnamed instance.
-    #[cfg_attr(
-        not(any(all(feature = "uci", unix), feature = "toml")),
-        allow(unused_variables)
-    )]
-    pub(crate) fn load(instance: Option<&str>) -> Result<Self, ConfigError> {
+    /// Loads UCI, TOML and environment settings for the named instance.
+    pub(crate) fn load(instance: &str) -> Result<Self, ConfigError> {
+        Self::load_from(
+            instance,
+            std::path::Path::new("/etc/config"),
+            std::path::Path::new("/etc/unravel"),
+            Environment::with_prefix("UNRAVEL"),
+        )
+    }
+
+    fn load_from(
+        _instance: &str,
+        _uci_dir: &std::path::Path,
+        _toml_dir: &std::path::Path,
+        environment: Environment,
+    ) -> Result<Self, ConfigError> {
         let builder = Config::builder();
 
         #[cfg(all(feature = "uci", unix))]
-        let builder = builder.add_source(
-            UciSource::from_schema::<Self>()
-                .with_instance(instance)
-                .required(false),
-        );
+        let builder = builder.add_source(UciSource::from_schema::<Self>(_instance, _uci_dir));
 
         #[cfg(feature = "toml")]
         let builder = builder.add_source(
-            config::File::with_name(&format!(
-                "/etc/unravel/{}.toml",
-                instance.unwrap_or("config")
-            ))
-            .required(false),
+            config::File::from(_toml_dir.join(format!("{_instance}.toml"))).required(false),
         );
 
         let builder = builder.add_source(
-            Environment::with_prefix("UNRAVEL")
+            environment
                 .separator("__")
                 .try_parsing(true)
                 .list_separator(",")
@@ -464,15 +471,6 @@ impl Default for ObservabilitySettings {
             host_tag: default_host_tag(),
         }
     }
-}
-
-// The control law's tuning lives under `law.<name>`; keys that used to be
-// here are rejected rather than silently ignored.
-#[derive(Clone, Debug, Default, Deserialize, UciSection)]
-#[serde(default, deny_unknown_fields)]
-pub(crate) struct AdvancedSettings {
-    #[serde(deserialize_with = "deserialize_flex_bool")]
-    pub(crate) dry_run: bool,
 }
 
 fn default_min_percent() -> f64 {

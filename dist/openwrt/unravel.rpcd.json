@@ -3,7 +3,6 @@
 		"description": "Read the status of every unRAVEL instance",
 		"read": {
 			"ubus": {
-				"unravel": [ "status" ],
 				"unravel.*": [ "status" ]
 			}
 		}

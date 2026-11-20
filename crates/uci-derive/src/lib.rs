@@ -19,7 +19,7 @@ use syn::{Data, DeriveInput, Field, Fields, FieldsNamed, LitStr, Token, parse_ma
 /// `#[uci(rename = "...")]` on a field changes the UCI option name only.
 ///
 /// `#[uci(sections = "...")]` on a `Vec<T>` field collects every section of
-/// that type, named or anonymous, into the field. `T` must derive
+/// that type owned by the selected instance into the field. `T` must derive
 /// `UciSection` too.
 ///
 /// Container attributes:
@@ -50,22 +50,16 @@ pub fn derive_uci_section(input: TokenStream) -> TokenStream {
 /// #[uci(package = "unravel")]
 /// ```
 ///
-/// Every field must specify its UCI section:
-///
+/// Section fields derive `UciSection`. One section is the named instance.
+/// Other sections belong to it through their `instance` option.
+/// Root settings stored directly on the instance use `instance_option`.
 /// ```ignore
+/// #[uci(section = "instance", instance)]
+/// network: NetworkSettings,
+/// #[uci(instance_option)]
+/// dry_run: bool,
 /// #[uci(section)]
-/// network: NetworkSettings,
-///
-/// #[uci(section = "advanced_settings")]
-/// advanced: AdvancedSettings,
-/// ```
-///
-/// At most one field may add `anchor`: a section of that type is an instance,
-/// and names the other sections it uses with options named after their types.
-///
-/// ```ignore
-/// #[uci(section, anchor)]
-/// network: NetworkSettings,
+/// law: LawSettings,
 /// ```
 #[proc_macro_derive(UciConfig, attributes(uci))]
 pub fn derive_uci_config(input: TokenStream) -> TokenStream {
@@ -307,7 +301,8 @@ fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
     let package = parse_package_name(input)?;
 
     let mut sections = Vec::with_capacity(fields.named.len());
-    let mut anchor_seen = false;
+    let mut instance_options = Vec::new();
+    let mut instance_section_seen = false;
 
     for field in &fields.named {
         let field_ident = field
@@ -320,22 +315,35 @@ fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         let config_section_name = field_ident.unraw().to_string();
         let config_section_name = LitStr::new(&config_section_name, field_ident.span());
 
-        let (uci_section_name, anchor) = parse_section_name(field)?;
-        if anchor {
-            if anchor_seen {
+        let attributes = parse_config_field(field, &config_section_name)?;
+        let (uci_section_name, instance) = match attributes {
+            ConfigField::InstanceOption => {
+                instance_options.push(quote! {
+                    crate::settings::uci_schema::UciOptionMapping {
+                        uci_option: #config_section_name,
+                        config_field: #config_section_name,
+                    }
+                });
+                continue;
+            }
+            ConfigField::Section { name, instance } => (name, instance),
+        };
+
+        if instance {
+            if instance_section_seen {
                 return Err(syn::Error::new_spanned(
                     field,
-                    "only one section can be the `anchor`",
+                    "only one section can be the instance section",
                 ));
             }
-            anchor_seen = true;
+            instance_section_seen = true;
         }
 
         sections.push(quote! {
             crate::settings::uci_schema::UciSectionMapping {
                 uci_section: #uci_section_name,
                 config_section: #config_section_name,
-                anchor: #anchor,
+                instance: #instance,
                 options: <
                     #field_type as
                     crate::settings::uci_schema::UciSectionSchema
@@ -356,6 +364,13 @@ fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
         });
     }
 
+    if !instance_section_seen {
+        return Err(syn::Error::new_spanned(
+            struct_name,
+            "UciConfig requires an instance section",
+        ));
+    }
+
     let (impl_generics, type_generics, where_clause) = input.generics.split_for_impl();
 
     Ok(quote! {
@@ -367,6 +382,12 @@ fn expand_uci_config(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStrea
             #where_clause
         {
             const UCI_PACKAGE: &'static str = #package;
+
+            const UCI_INSTANCE_OPTIONS: &'static [
+                crate::settings::uci_schema::UciOptionMapping
+            ] = &[
+                #(#instance_options),*
+            ];
 
             const UCI_SECTIONS: &'static [
                 crate::settings::uci_schema::UciSectionMapping
@@ -431,17 +452,15 @@ fn parse_package_name(input: &DeriveInput) -> syn::Result<LitStr> {
     })
 }
 
-fn parse_section_name(field: &Field) -> syn::Result<(LitStr, bool)> {
-    let field_ident = field
-        .ident
-        .as_ref()
-        .expect("named fields always have identifiers");
+enum ConfigField {
+    Section { name: LitStr, instance: bool },
+    InstanceOption,
+}
 
-    let default_name = field_ident.unraw().to_string();
-    let default_name = LitStr::new(&default_name, field_ident.span());
-
+fn parse_config_field(field: &Field, default_name: &LitStr) -> syn::Result<ConfigField> {
     let mut section = None;
-    let mut anchor = false;
+    let mut instance = false;
+    let mut instance_option = false;
 
     for attribute in &field.attrs {
         if !attribute.path().is_ident("uci") {
@@ -453,41 +472,40 @@ fn parse_section_name(field: &Field) -> syn::Result<(LitStr, bool)> {
                 if section.is_some() {
                     return Err(meta.error("duplicate `section` attribute"));
                 }
-
-                if meta.input.peek(Token![=]) {
-                    let value: LitStr = meta.value()?.parse()?;
-
-                    if value.value().is_empty() {
-                        return Err(syn::Error::new(value.span(), "`section` cannot be empty"));
-                    }
-
-                    section = Some(value);
+                section = Some(if meta.input.peek(Token![=]) {
+                    parse_non_empty(&meta, "section")?
                 } else {
-                    section = Some(default_name.clone());
-                }
-
+                    default_name.clone()
+                });
                 return Ok(());
             }
 
-            if meta.path.is_ident("anchor") {
-                if anchor {
-                    return Err(meta.error("duplicate `anchor` attribute"));
+            if meta.path.is_ident("instance") {
+                if instance {
+                    return Err(meta.error("duplicate `instance` attribute"));
                 }
-                anchor = true;
+                instance = true;
                 return Ok(());
             }
 
-            Err(meta.error("expected `section`, `section = \"...\"` or `anchor`"))
+            if meta.path.is_ident("instance_option") {
+                if instance_option {
+                    return Err(meta.error("duplicate `instance_option` attribute"));
+                }
+                instance_option = true;
+                return Ok(());
+            }
+
+            Err(meta.error("expected `section`, `instance` or `instance_option`"))
         })?;
     }
 
-    let section = section.ok_or_else(|| {
-        syn::Error::new_spanned(
+    match (section, instance_option, instance) {
+        (Some(name), false, instance) => Ok(ConfigField::Section { name, instance }),
+        (None, true, false) => Ok(ConfigField::InstanceOption),
+        _ => Err(syn::Error::new_spanned(
             field,
-            "UciConfig fields require `#[uci(section)]` \
-             or `#[uci(section = \"...\")]`",
-        )
-    })?;
-
-    Ok((section, anchor))
+            "expected `#[uci(section)]`, optionally with `instance`, or `#[uci(instance_option)]`",
+        )),
+    }
 }

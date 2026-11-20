@@ -23,8 +23,7 @@ enum Message {
 
 struct SimpleLogger {
     sender: mpsc::SyncSender<Message>,
-    /// `[name] ` for a named instance, so instances sharing syslog can be
-    /// told apart. Empty for the unnamed instance.
+    /// Identifies the instance when several processes share syslog.
     prefix: String,
 }
 
@@ -88,7 +87,7 @@ pub(crate) fn finish(error: Option<&anyhow::Error>) {
     let _ = completion.recv_timeout(deadline.saturating_duration_since(Instant::now()));
 }
 
-pub(crate) fn init(instance: Option<&str>) -> anyhow::Result<()> {
+pub(crate) fn init(instance: &str) -> anyhow::Result<()> {
     let (sender, receiver) = mpsc::sync_channel::<Message>(1024);
     let worker = thread::Builder::new()
         .name("unravel-logger".to_owned())
@@ -120,9 +119,7 @@ pub(crate) fn init(instance: Option<&str>) -> anyhow::Result<()> {
     // finish() may time out; the worker is never joined.
     drop(worker);
 
-    let prefix = instance
-        .map(|name| format!("[{name}] "))
-        .unwrap_or_default();
+    let prefix = format!("[{instance}] ");
     log::set_logger(LOGGER.get_or_init(|| SimpleLogger { sender, prefix }))?;
     log::set_max_level(LevelFilter::Error);
     Ok(())

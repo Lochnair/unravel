@@ -19,11 +19,12 @@
 --
 -- Needs a maximum rate for each shaped direction:
 --
---   config network
+--   config instance 'wan'
 --   	option download_max_percent '400'
 --   	option upload_max_percent '175'
 --
 --   config law
+--   	option instance 'wan'
 --   	option type 'script'
 --   	option path '/usr/share/unravel/laws/cake.lua'
 --

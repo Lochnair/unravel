@@ -95,14 +95,16 @@ For a TOML-only build with IRTT support, run `cargo build --release --locked --n
 
 On OpenWrt, edit `/etc/config/unravel`. If you use `uci set`, run `uci commit unravel` before restarting the service so it reads the updated file. If you're upgrading an existing installation, start with the [migration guide](MIGRATION.md).
 
-On builds with TOML support, `/etc/unravel/config.toml` overrides settings from UCI. Environment variables override both, for example `UNRAVEL__NETWORK__UPLOAD_INTERFACE=wan`.
+For an instance named `wan`, unRAVEL reads its settings from UCI first, then applies `/etc/unravel/wan.toml` on builds with TOML support. Environment variables override both, for example `UNRAVEL__NETWORK__UPLOAD_INTERFACE=wan`.
 
 ### UCI
 
 Set your interface names and bandwidths in `/etc/config/unravel`.
 
 ```uci
-config network
+config instance 'wan'
+    option enabled '1'
+    option dry_run '0'
     option download_interface 'ifb4wan'
     option upload_interface 'wan'
     option download_base_kbits '50000'
@@ -111,6 +113,7 @@ config network
     option upload_min_percent '20'
 
 config output
+    option instance 'wan'
     option log_level 'info'
 ```
 
@@ -122,9 +125,11 @@ To cap either shaper, set `download_max_percent` or `upload_max_percent` to at l
 
 ### TOML
 
-For a manual install, put the equivalent settings in `/etc/unravel/config.toml`.
+For a manual install, put the equivalent settings for `wan` in `/etc/unravel/wan.toml`.
 
 ```toml
+dry_run = false
+
 [network]
 download_interface = "ifb4wan"
 upload_interface = "wan"
@@ -143,32 +148,42 @@ If you only want to control upload, set `option download_interface 'none'` in UC
 
 ### Running more than one WAN
 
-Give each WAN its own `config network` section with the interfaces and base rates for that link. The OpenWrt init script starts an instance for each enabled section. Use an anonymous `config network` for the unnamed instance. Names can contain letters, digits and underscores. Leave `default` for the unnamed instance.
+Give each WAN a named `config instance` section with the interfaces and base rates for that link. Use ASCII letters, digits and underscores in instance names. The OpenWrt init script starts each enabled instance. Set `option enabled '0'` to skip it.
 
-For example, this adds a second WAN and gives it its own SQMA delay settings.
+This example adds a second WAN with its own SQMA settings and reflector inventory.
 
 ```uci
-config network 'wan2'
+config instance 'wan2'
     option download_interface 'ifb4wan2'
     option upload_interface 'wan2'
     option download_base_kbits '30000'
     option upload_base_kbits '5000'
-    option law 'wan2_law'
 
-config law 'wan2_law'
+config law
+    option instance 'wan2'
     option type 'sqma'
     option download_delay_ms '20'
+
+config reflectors
+    option instance 'wan2'
+    list files '/etc/unravel/wan2-reflectors.csv'
+    list countries 'NO'
+
+config bootstrap_reflector
+    option instance 'wan2'
+    option host 'global.irtt.lochnair.net'
+    list protocols 'irtt'
 ```
 
-`option law 'wan2_law'` tells this instance which `config law` section to use. You can refer to named `output`, `reflectors`, `observability` and `advanced_settings` sections the same way. Named instances use built-in defaults for sections they leave out. The unnamed instance uses the anonymous sections unless its `network` section names a different one. Inline `reflector` and `bootstrap_reflector` sections are shared.
+Each subordinate section needs an `option instance` naming its owner. It can appear anywhere in the file and can be anonymous. Each instance can have one `law`, `reflectors`, `output` and `observability` section. Missing sections and options use built-in defaults. Use as many `reflector` and `bootstrap_reflector` sections as needed for each instance. Different instances can independently point to the same CSV or Lua file.
 
-On Linux, set `measurement_bind_device` in the instance's network settings if you need to bind its probes to a particular interface. To skip an instance when the OpenWrt service starts, set `option enabled '0'` under its `config network`.
+Invalid instance names, duplicate section names, unknown section types and missing or invalid ownership links make the UCI package invalid. Duplicate singleton sections and invalid options within owned sections prevent the owning instance from starting.
 
-For a manual start, use `/usr/sbin/unravel --instance wan2`. If your build supports TOML, this instance reads `/etc/unravel/wan2.toml`.
+On Linux, set `measurement_bind_device` on an instance if you need to bind its probes to a particular interface. To start the second WAN manually, run `/usr/sbin/unravel --instance wan2`. With TOML support, its override file is `/etc/unravel/wan2.toml`.
 
 ## Running it
 
-To try it without changing CAKE's rates, set `option dry_run '1'` under `config advanced_settings`, or `dry_run = true` under `[advanced_settings]` in TOML. Dry run still needs the configured interfaces and CAKE qdiscs. It sends probes and SQMA still writes its CSV files if statistics are enabled. Turn off `dry_run` when you're ready to let unRAVEL change the rates.
+To try it without changing CAKE's rates, set `option dry_run '1'` in the UCI instance section, set `dry_run = true` before any TOML table headers, or set `UNRAVEL__DRY_RUN=true`. Dry run still needs the configured interfaces and CAKE qdiscs. It sends probes and SQMA still writes its CSV files if statistics are enabled. Turn off `dry_run` when you're ready to let unRAVEL change the rates.
 
 After configuring the OpenWrt package, start the service and enable it at boot:
 
@@ -181,10 +196,10 @@ To try it in the foreground, stop the service first, then run the binary:
 
 ```sh
 /etc/init.d/unravel stop
-/usr/sbin/unravel
+/usr/sbin/unravel --instance wan
 ```
 
-For a manual install on another Linux system, run `sudo /usr/sbin/unravel`. A manual binary install doesn't include a service definition.
+For a manual install on another Linux system, run `sudo /usr/sbin/unravel --instance wan`. Every invocation requires `--instance`. A manual binary install doesn't include a service definition.
 
 unRAVEL starts by setting the enabled shapers to their minimum rates. Once it's running, try a download or upload and watch the rates with `tc -s qdisc show dev wan` or the same command for the download interface.
 
@@ -192,17 +207,17 @@ Ctrl+C or SIGTERM stops the program and attempts to restore the enabled shapers 
 
 ### Checking status on OpenWrt
 
-With the `ubus` build feature enabled, you can check the current rates and active reflector count without stopping the service. Use `unravel` for the unnamed instance and `unravel.<name>` for a named one. For example, if you added `wan2` above, use the second command.
+With the `ubus` build feature enabled, you can check the current rates and active reflector count without stopping the service. The status object is `unravel.<instance>`.
 
 ```sh
-ubus call unravel status
+ubus call unravel.wan status
 ubus call unravel.wan2 status
 ```
 
 ```json
 {
 	"version": "0.6.0-rc1",
-	"instance": "default",
+	"instance": "wan",
 	"law": "sqma",
 	"dry_run": false,
 	"uptime": 3605,
@@ -230,7 +245,7 @@ If the ubus socket is missing at startup, unRAVEL logs a message and carries on.
 
 ## Control laws
 
-SQMA is the default. If you want to change its delay thresholds or sampling interval, put the options in `config law` with `option type 'sqma'` on OpenWrt, or in `[law.sqma]` in TOML. [OpenWrt example config](dist/openwrt/unravel.config)
+SQMA is the default. If you want to change its delay thresholds or sampling interval, put the options in the instance's `config law` with `option type 'sqma'` on OpenWrt, or in `[law.sqma]` in TOML. [OpenWrt example config](dist/openwrt/unravel.config)
 
 If you want to keep SQMA's learned safe rates across a service restart, set `option save_history '1'` in that UCI section or `save_history = true` in `[law.sqma]`. SQMA writes `sqma/history.txt` under the instance's output directory. It restores history up to six hours old if the base rate and history size still match. Use a persistent `output.folder` if you want the history to survive a reboot.
 
@@ -242,6 +257,7 @@ Copy the script to `/etc/unravel/minimal.lua` and set `config law` as follows.
 
 ```uci
 config law
+    option instance 'wan'
     option type 'script'
     option path '/etc/unravel/minimal.lua'
 ```
@@ -262,7 +278,7 @@ The experimental `cake.lua` script uses cake-autorate's rate control and default
 
 The example uses `/usr/share/unravel/laws/cake.lua`. If your package hasn't installed it there, copy it from `laws/cake.lua` in the release archive or from the source tree. [dist/laws/cake.lua](dist/laws/cake.lua)
 
-Add a maximum for each direction you shape to your existing `config network` section. Adjust these percentages to suit your link.
+Add a maximum for each direction you shape to your existing `config instance` section. Adjust these percentages to suit your link.
 
 ```uci
     option download_max_percent '400'
@@ -273,6 +289,7 @@ Then replace the SQMA `config law` section with this one. You can put tuning opt
 
 ```uci
 config law
+    option instance 'wan'
     option type 'script'
     option path '/usr/share/unravel/laws/cake.lua'
 ```
@@ -293,11 +310,12 @@ You can add your own reflectors with `[[reflectors.entries]]` in TOML or repeate
 
 ```uci
 config reflector
+    option instance 'wan'
     option host 'global.irtt.lochnair.net'
     list protocols 'irtt'
 ```
 
-This adds to the CSV inventory. To skip file loading and use the built-in bootstrap hosts plus any inline entries, use `[reflectors]` with `files = []` in TOML, or a `config reflectors` section with `option files 'none'` in UCI. UCI drops empty string options, so `option files ''` won't disable file loading.
+This adds to the instance’s CSV inventory. Use `config bootstrap_reflector` with the same fields, or `[[reflectors.bootstrap]]` in TOML, to replace the built-in bootstrap list for that instance. To skip file loading and use the built-in bootstrap hosts plus any inline entries, use `[reflectors]` with `files = []` in TOML, or a `config reflectors` section with `option files 'none'` in UCI. UCI drops empty string options, so `option files ''` won't disable file loading.
 
 To load a different CSV file in UCI, use `list files '/path/to/reflectors.csv'` under `config reflectors`. For IRTT entries, absent or blank `irtt_hmac` values use unauthenticated sessions.
 
@@ -305,18 +323,18 @@ unRAVEL checks directional timestamps before passing the results to the control 
 
 ## Logs and statistics
 
-Logs go to stdout at `info` by default. On OpenWrt, the init script sends them to the system log unless you set `option use_syslog '0'` in the instance's `output` section. Named instances prefix each log line with their name.
+Logs go to stdout at `info` by default. On OpenWrt, the init script sends them to the system log unless you set `option use_syslog '0'` in the instance's `output` section. Each log line starts with the instance name.
 
 SQMA writes two CSV files by default.
 
-- `/tmp/unravel/default/stats.csv` contains traffic load, delay above baseline and shaping rates.
-- `/tmp/unravel/default/speedhist.csv` contains the speed history snapshots.
+- `/tmp/unravel/wan/stats.csv` contains traffic load, delay above baseline and shaping rates.
+- `/tmp/unravel/wan/speedhist.csv` contains the speed history snapshots.
 
 SQMA recreates these files on startup. Set `output.suppress_statistics = true` to turn them off. Each instance writes under `<output.folder>/<instance>/`, so a named instance such as `wan2` uses `/tmp/unravel/wan2/` by default. The law's saved state goes in a subfolder named after the law.
 
 ## Metrics
 
-unRAVEL can send InfluxDB line protocol over UDP or TCP. Set `enabled`, `protocol`, `host` and `port` in `config observability` on OpenWrt or in `[observability]` in TOML. Change the address to match your collector.
+unRAVEL can send InfluxDB line protocol over UDP or TCP. Set `enabled`, `protocol`, `host` and `port` in the instance’s `config observability` on OpenWrt or in `[observability]` in TOML. Change the address to match your collector.
 
 ```toml
 [observability]

@@ -55,7 +55,7 @@ pub(crate) struct App {
 impl App {
     pub(crate) async fn prepare(settings: Settings, instance: &str) -> anyhow::Result<Self> {
         settings.validate()?;
-        if settings.advanced_settings.dry_run {
+        if settings.dry_run {
             info!("*** MONITORING MODE ACTIVE — qdisc rates will NOT be changed ***");
         }
 
@@ -158,7 +158,7 @@ impl App {
             applied_rx.clone(),
             instance,
             settings.law.name.as_str(),
-            settings.advanced_settings.dry_run,
+            settings.dry_run,
         );
         let manager = ReflectorManager::new(
             &settings,
@@ -184,7 +184,7 @@ impl App {
             exporter,
             csv_writer,
             metrics,
-            dry_run: settings.advanced_settings.dry_run,
+            dry_run: settings.dry_run,
             measurement_stop,
             measurement_done,
         })

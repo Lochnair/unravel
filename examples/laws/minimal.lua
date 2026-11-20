@@ -2,6 +2,7 @@
 -- and leaves them there.
 --
 --   config law
+--   	option instance 'wan'
 --   	option type 'script'
 --   	option path '/etc/unravel/minimal.lua'
 
@@ -10,7 +11,7 @@ local law = {
   cadence = { probe = 0.5, traffic = 0.5, timer = 1.0 },
 }
 
--- Optional. `config` is the law section minus `path`.
+-- Optional. `config` contains the script-specific law parameters.
 function law:init(config, ctx)
   for _, direction in ipairs({ "download", "upload" }) do
     local base = ctx:base(direction)

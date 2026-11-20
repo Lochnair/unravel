@@ -16,9 +16,8 @@ pub(crate) struct UciSectionMapping {
     /// Top-level config-rs / Serde settings key.
     pub(crate) config_section: &'static str,
 
-    /// A section of this type is an instance. It has an option named after
-    /// each other section type, naming the section of that type it uses.
-    pub(crate) anchor: bool,
+    /// This section declares a named instance. Other sections carry an owner.
+    pub(crate) instance: bool,
 
     pub(crate) options: &'static [UciOptionMapping],
 
@@ -54,6 +53,7 @@ pub(crate) trait UciSectionSchema {
 }
 
 pub(crate) trait UciConfigSchema {
+    const UCI_INSTANCE_OPTIONS: &'static [UciOptionMapping];
     const UCI_PACKAGE: &'static str;
     const UCI_SECTIONS: &'static [UciSectionMapping];
 }
