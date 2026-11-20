@@ -282,9 +282,9 @@ dependencies = [
 
 [[package]]
 name = "icmp-socket2"
-version = "0.6.5"
+version = "0.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f07530a7effbec3886c45f5308683a7c012540b62ea45dd940a716cf82782ab"
+checksum = "1d8cd32b05efcf267d7372e08a1f09a4e81034b0aac90794850b84a82d53dddb"
 dependencies = [
  "async-trait",
  "nix",
