@@ -31,7 +31,7 @@ use crate::{
         },
         plan::AppliedState,
     },
-    runtime::{DelaySignal, Direction, Runtime, TrafficRates},
+    runtime::{DelayReports, Direction, Runtime, TrafficRates},
 };
 
 /// One history slot per this long...
@@ -162,7 +162,7 @@ impl State {
             if let Some(load) = load {
                 entry.push("traffic_kbps", kbps(load));
             }
-            if let Some(delay) = *shaper.delay().borrow() {
+            if let Some(delay) = shaper.delay().latest {
                 entry.push("delay_us", us(delay.delay_ms));
                 if let Some(threshold) = delay.threshold_ms {
                     entry.push("delay_threshold_us", us(threshold));
@@ -267,21 +267,25 @@ struct Slot {
 struct DirectionHistory {
     slots: VecDeque<Slot>,
     traffic: Mean,
-    delay: Mean,
-    /// Whether the law has reported a delay yet. Without one the history
-    /// leaves `delay_us` out rather than sending nulls.
-    reports_delay: bool,
+    /// The law's delay reports when the last slot closed. Without any the
+    /// history leaves `delay_us` out rather than sending nulls.
+    delay: DelayReports,
 }
 
 impl DirectionHistory {
-    fn close_slot(&mut self, rate_kbps: Option<f64>) {
+    fn close_slot(&mut self, rate_kbps: Option<f64>, delay: DelayReports) {
         if self.slots.len() == HISTORY_SLOTS {
             self.slots.pop_front();
         }
+        // The mean of every report made during the slot.
+        let reports = delay.count - self.delay.count;
+        let delay_ms =
+            (reports > 0).then(|| (delay.total_ms - self.delay.total_ms) / reports as f64);
+        self.delay = delay;
         self.slots.push_back(Slot {
             rate_kbps,
             traffic_kbps: self.traffic.take(),
-            delay_ms: self.delay.take(),
+            delay_ms,
         });
     }
 
@@ -294,7 +298,7 @@ impl DirectionHistory {
                 "traffic_kbps",
                 series(|s| s.traffic_kbps.map(kbps32).into()),
             );
-        if self.reports_delay {
+        if self.delay.count > 0 {
             table.push("delay_us", series(|s| s.delay_ms.map(us32).into()));
         }
         table
@@ -392,9 +396,6 @@ struct Sampler {
 impl Sampler {
     async fn run(mut self) -> anyhow::Result<()> {
         let mut traffic = self.runtime.traffic_updates();
-        let delay = |direction| self.runtime.shaper(direction).map(|s| s.delay());
-        let mut download_delay = delay(Direction::Download);
-        let mut upload_delay = delay(Direction::Upload);
         let mut ticker =
             time::interval_at(time::Instant::now() + HISTORY_INTERVAL, HISTORY_INTERVAL);
         ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -408,12 +409,6 @@ impl Sampler {
                     if let Some(sample) = sample {
                         self.add_traffic(sample);
                     }
-                }
-                signal = next_delay(&mut download_delay) => {
-                    self.add_delay(Direction::Download, signal?);
-                }
-                signal = next_delay(&mut upload_delay) => {
-                    self.add_delay(Direction::Upload, signal?);
                 }
                 event = self.measurements.recv() => match event {
                     Ok(event) => self.lock().reflectors.entry(event.target.clone()).or_default().record(&event),
@@ -437,9 +432,11 @@ impl Sampler {
         let applied = self.applied.borrow();
         let mut recorded = self.lock();
         for direction in [Direction::Download, Direction::Upload] {
-            let rate = self.runtime.shaper(direction).and_then(|s| s.rate_kbps());
+            let Some(shaper) = self.runtime.shaper(direction) else {
+                continue;
+            };
             if let Some(history) = recorded.direction(direction) {
-                history.close_slot(rate);
+                history.close_slot(shaper.rate_kbps(), shaper.delay());
             }
         }
         // Forget reflectors the manager has dropped.
@@ -461,27 +458,6 @@ impl Sampler {
                 history.traffic.add(kbps);
             }
         }
-    }
-
-    fn add_delay(&self, direction: Direction, signal: Option<DelaySignal>) {
-        let Some(signal) = signal else { return };
-        if let Some(history) = self.lock().direction(direction) {
-            history.delay.add(signal.delay_ms);
-            history.reports_delay = true;
-        }
-    }
-}
-
-/// The next delay report, or never without a shaper for the direction.
-async fn next_delay(
-    receiver: &mut Option<watch::Receiver<Option<DelaySignal>>>,
-) -> anyhow::Result<Option<DelaySignal>> {
-    match receiver {
-        Some(receiver) => {
-            receiver.changed().await.context("Delay channel closed")?;
-            Ok(*receiver.borrow_and_update())
-        }
-        None => std::future::pending().await,
     }
 }
 

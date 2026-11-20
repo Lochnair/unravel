@@ -44,8 +44,8 @@ pub(crate) struct Shaper {
     pub(crate) wire_packet_bytes: Option<u32>,
     /// The last rate set, simulated in dry run.
     rate: watch::Sender<Option<f64>>,
-    /// The law's last delay signal, if it reports one.
-    delay: watch::Sender<Option<DelaySignal>>,
+    /// The law's delay reports.
+    delay: watch::Sender<DelayReports>,
 }
 
 /// What a law last saw as delay for one direction: milliseconds above its
@@ -54,6 +54,17 @@ pub(crate) struct Shaper {
 pub(crate) struct DelaySignal {
     pub(crate) delay_ms: f64,
     pub(crate) threshold_ms: Option<f64>,
+}
+
+/// Every delay report a law has made for one direction. The running totals
+/// let a reader that looks only now and then average all the reports since it
+/// last looked, not just the ones it happened to see.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[cfg_attr(not(all(feature = "ubus", unix)), allow(dead_code))]
+pub(crate) struct DelayReports {
+    pub(crate) latest: Option<DelaySignal>,
+    pub(crate) total_ms: f64,
+    pub(crate) count: u64,
 }
 
 impl Shaper {
@@ -77,7 +88,7 @@ impl Shaper {
             max_kbps,
             wire_packet_bytes,
             rate: watch::channel(None).0,
-            delay: watch::channel(None).0,
+            delay: watch::channel(DelayReports::default()).0,
         }
     }
 
@@ -92,10 +103,10 @@ impl Shaper {
         *self.rate.borrow()
     }
 
-    /// The law's delay signal, as it reports it.
+    /// The law's delay reports so far.
     #[cfg_attr(not(all(feature = "ubus", unix)), allow(dead_code))]
-    pub(crate) fn delay(&self) -> watch::Receiver<Option<DelaySignal>> {
-        self.delay.subscribe()
+    pub(crate) fn delay(&self) -> DelayReports {
+        *self.delay.borrow()
     }
 }
 
@@ -316,10 +327,14 @@ impl Runtime {
             threshold_ms.is_none_or(f64::is_finite),
             "Invalid delay threshold: {threshold_ms:?}"
         );
-        shaper.delay.send_replace(Some(DelaySignal {
-            delay_ms,
-            threshold_ms,
-        }));
+        shaper.delay.send_modify(|reports| {
+            reports.latest = Some(DelaySignal {
+                delay_ms,
+                threshold_ms,
+            });
+            reports.total_ms += delay_ms;
+            reports.count += 1;
+        });
         Ok(())
     }
 
