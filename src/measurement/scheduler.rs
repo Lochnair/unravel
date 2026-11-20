@@ -122,12 +122,14 @@ impl ProbeScheduler {
 
     /// Skips missed grid slots; at most one opportunity survives per target.
     /// Coincident deadlines are served in rotating target order.
+    /// Fills `due` and `withdrawn`, which must start empty.
     pub fn opportunities(
         &mut self,
         now: Instant,
-    ) -> (Vec<MeasurementTarget>, Vec<MeasurementTarget>) {
-        let mut due = Vec::new();
-        let mut withdrawn = Vec::new();
+        due: &mut Vec<MeasurementTarget>,
+        withdrawn: &mut Vec<MeasurementTarget>,
+    ) {
+        debug_assert!(due.is_empty() && withdrawn.is_empty());
         for (target, state) in &mut self.targets {
             if now >= state.next {
                 if state.pending.take().is_some() {
@@ -148,7 +150,6 @@ impl ProbeScheduler {
         if let Some(first) = due.first() {
             self.cursor = Some(first.clone());
         }
-        (due, withdrawn)
     }
 
     pub fn committed(&mut self, target: &MeasurementTarget, accepted_at: Instant) {

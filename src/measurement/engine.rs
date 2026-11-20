@@ -37,6 +37,9 @@ pub struct MeasurementEngine {
     measurements: broadcast::Sender<MeasurementEvent>,
     stop: watch::Receiver<bool>,
     icmp_status: BTreeMap<MeasurementTarget, bool>,
+    /// Scratch for each pass's due and withdrawn targets, kept for capacity.
+    due: Vec<MeasurementTarget>,
+    withdrawn: Vec<MeasurementTarget>,
     timer: Pin<Box<tokio::time::Sleep>>,
     rejected_revision: Option<u64>,
     integrity: MeasurementIntegrity,
@@ -92,6 +95,8 @@ impl MeasurementEngine {
             measurements,
             stop,
             icmp_status: BTreeMap::new(),
+            due: Vec::new(),
+            withdrawn: Vec::new(),
             timer: Box::pin(tokio::time::sleep(std::time::Duration::ZERO)),
             rejected_revision: None,
             integrity: MeasurementIntegrity::default(),
@@ -156,25 +161,46 @@ impl MeasurementEngine {
         self.irtt.discard(target);
     }
 
+    fn is_ready(&self, target: &MeasurementTarget) -> bool {
+        match target {
+            MeasurementTarget::IcmpEcho(_) | MeasurementTarget::IcmpTimestamps(_) => {
+                self.icmp_status[target]
+            }
+            #[cfg(feature = "irtt")]
+            MeasurementTarget::Irtt { .. } => self.irtt.is_ready(target),
+            #[cfg(not(feature = "irtt"))]
+            MeasurementTarget::Irtt { .. } => false,
+        }
+    }
+
+    /// Whether the published state already says what a new one would.
+    fn status_published(&self) -> bool {
+        let current = self.applied.borrow();
+        current.revision == self.plan.revision
+            && current.rejected_revision == self.rejected_revision
+            && current.targets.len() == self.plan.assignments.len()
+            && current
+                .targets
+                .iter()
+                .zip(&self.plan.assignments)
+                .all(|(published, assignment)| {
+                    published.assignment == *assignment
+                        && published.ready == self.is_ready(&assignment.target)
+                })
+    }
+
     fn publish_status(&self) {
+        // Runs on every engine wakeup; build a new state only when it differs.
+        if self.status_published() {
+            return;
+        }
         let targets = self
             .plan
             .assignments
             .iter()
-            .map(|assignment| {
-                let ready = match &assignment.target {
-                    MeasurementTarget::IcmpEcho(_) | MeasurementTarget::IcmpTimestamps(_) => {
-                        self.icmp_status[&assignment.target]
-                    }
-                    #[cfg(feature = "irtt")]
-                    MeasurementTarget::Irtt { .. } => self.irtt.is_ready(&assignment.target),
-                    #[cfg(not(feature = "irtt"))]
-                    MeasurementTarget::Irtt { .. } => false,
-                };
-                AppliedTarget {
-                    assignment: assignment.clone(),
-                    ready,
-                }
+            .map(|assignment| AppliedTarget {
+                assignment: assignment.clone(),
+                ready: self.is_ready(&assignment.target),
             })
             .collect();
         let state = AppliedState {
@@ -197,19 +223,29 @@ impl MeasurementEngine {
         let now = Instant::now();
         let mut completions = self.icmp.expire(now);
         // Bound ICMP receive work even on a continuously readable raw socket.
+        // Pending leaves the socket holding our waker; only a spent budget
+        // needs another pass.
+        let mut drained = false;
         for _ in 0..32 {
             match self.icmp.poll_receive(cx) {
                 Poll::Ready(Ok(Some(event))) => completions.push(event),
                 Poll::Ready(Ok(None)) => {}
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => break,
+                Poll::Pending => {
+                    drained = true;
+                    break;
+                }
             }
+        }
+        if !drained {
             cx.waker().wake_by_ref();
         }
         #[cfg(feature = "irtt")]
         self.irtt.poll_maintenance(cx, now, &mut completions);
-        let (due, withdrawn) = self.scheduler.opportunities(now);
-        for target in withdrawn {
+        let mut due = std::mem::take(&mut self.due);
+        self.scheduler
+            .opportunities(now, &mut due, &mut self.withdrawn);
+        while let Some(target) = self.withdrawn.pop() {
             self.discard(&target);
         }
         // A correlated reply proves ICMP receive readiness. A later send error
@@ -221,7 +257,7 @@ impl MeasurementEngine {
                 *ready = true;
             }
         }
-        for target in due {
+        for target in due.drain(..) {
             match &target {
                 MeasurementTarget::IcmpEcho(_) | MeasurementTarget::IcmpTimestamps(_) => {
                     match self.icmp.poll_send(&target, cx) {
@@ -254,6 +290,7 @@ impl MeasurementEngine {
                 MeasurementTarget::Irtt { .. } => unreachable!("validated plan"),
             }
         }
+        self.due = due;
         // Consumers must see readiness before the first usable measurement.
         self.publish_status();
         self.sync_clock()?;
@@ -299,12 +336,21 @@ impl MeasurementEngine {
             })
             .min();
         if let Some(deadline) = deadline {
-            self.timer.as_mut().reset(deadline.into());
-            if self.timer.as_mut().poll(cx).is_ready() {
-                cx.waker().wake_by_ref();
-            }
+            self.arm_timer(deadline, cx);
         }
         Poll::Pending
+    }
+
+    /// Resetting re-registers with the timer driver, so skip it when the
+    /// pending deadline is already the one we want.
+    fn arm_timer(&mut self, deadline: Instant, cx: &mut Context<'_>) {
+        let deadline = deadline.into();
+        if self.timer.deadline() != deadline || self.timer.is_elapsed() {
+            self.timer.as_mut().reset(deadline);
+        }
+        if self.timer.as_mut().poll(cx).is_ready() {
+            cx.waker().wake_by_ref();
+        }
     }
 
     pub async fn run(mut self) -> anyhow::Result<()> {
@@ -379,10 +425,7 @@ impl MeasurementEngine {
                     return Poll::Ready(());
                 }
                 if let Some(deadline) = self.irtt.next_deadline() {
-                    self.timer.as_mut().reset(deadline.into());
-                    if self.timer.as_mut().poll(cx).is_ready() {
-                        cx.waker().wake_by_ref();
-                    }
+                    self.arm_timer(deadline, cx);
                 }
                 Poll::Pending
             })
