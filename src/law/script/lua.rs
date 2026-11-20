@@ -13,12 +13,12 @@ use std::{
 
 use anyhow::Context;
 use mlua::{
-    Function, HookTriggers, IntoLua, Lua, LuaOptions, StdLib, Table, UserData, UserDataMethods,
-    VmState,
+    BorrowedStr, Function, HookTriggers, IntoLua, Lua, LuaOptions, StdLib, Table, UserData,
+    UserDataMethods, VmState,
 };
 
 use super::{Backend, Event, OPTIONAL_HOOKS, REQUIRED_HOOKS, ScriptCadence, ScriptCtx, Value};
-use crate::law::Cadence;
+use crate::law::{Cadence, LawContext};
 
 /// The instruction hook fires every this many VM instructions...
 const INSTRUCTIONS_PER_TICK: u32 = 10_000;
@@ -151,7 +151,7 @@ impl Backend for LuaBackend {
         let law = self.law.clone();
         let lua = &self.lua;
         lua.scope(|scope| {
-            let ctx = scope.create_userdata(LuaCtx(ctx))?;
+            let ctx = scope.create_userdata_ref(ctx.law)?;
             match event {
                 Event::Init(config) => function.call::<()>((law, to_lua(lua, config)?, ctx)),
                 Event::Measurement(m) => {
@@ -206,59 +206,71 @@ fn to_lua(lua: &Lua, value: &Value) -> mlua::Result<mlua::Value> {
     })
 }
 
-struct LuaCtx<'a>(&'a ScriptCtx<'a>);
-
-impl UserData for LuaCtx<'_> {
+// The ctx is the law's own context, so its type is 'static and mlua builds
+// its metatable once. A scoped non-'static type would get a fresh metatable,
+// with every method, on each hook call.
+impl UserData for LawContext {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("set_rate", |_, this, (direction, kbps): (String, f64)| {
-            this.0
-                .set_rate(&direction, kbps)
-                .map_err(mlua::Error::external)
-        });
+        methods.add_method(
+            "set_rate",
+            |_, law, (direction, kbps): (BorrowedStr, f64)| {
+                ctx(law)
+                    .set_rate(&direction, kbps)
+                    .map_err(mlua::Error::external)
+            },
+        );
         methods.add_method(
             "report_delay",
-            |_, this, (direction, delay_ms, threshold_ms): (String, f64, Option<f64>)| {
-                this.0
+            |_, law, (direction, delay_ms, threshold_ms): (BorrowedStr, f64, Option<f64>)| {
+                ctx(law)
                     .report_delay(&direction, delay_ms, threshold_ms)
                     .map_err(mlua::Error::external)
             },
         );
-        methods.add_method("base", |_, this, direction: String| {
-            this.0.base(&direction).map_err(mlua::Error::external)
+        methods.add_method("base", |_, law, direction: BorrowedStr| {
+            ctx(law).base(&direction).map_err(mlua::Error::external)
         });
-        methods.add_method("min", |_, this, direction: String| {
-            this.0.min(&direction).map_err(mlua::Error::external)
+        methods.add_method("min", |_, law, direction: BorrowedStr| {
+            ctx(law).min(&direction).map_err(mlua::Error::external)
         });
-        methods.add_method("max", |_, this, direction: String| {
-            this.0.max(&direction).map_err(mlua::Error::external)
+        methods.add_method("max", |_, law, direction: BorrowedStr| {
+            ctx(law).max(&direction).map_err(mlua::Error::external)
         });
-        methods.add_method("wire_packet_bytes", |_, this, direction: String| {
-            this.0
+        methods.add_method("wire_packet_bytes", |_, law, direction: BorrowedStr| {
+            ctx(law)
                 .wire_packet_bytes(&direction)
                 .map_err(mlua::Error::external)
         });
-        methods.add_method("num_reflectors", |_, this, ()| Ok(this.0.num_reflectors()));
-        methods.add_method("log", |_, this, (level, message): (String, String)| {
-            this.0.log(&level, &message).map_err(mlua::Error::external)
-        });
-        methods.add_method("store_read", |_, this, name: String| {
-            this.0.store_read(&name).map_err(mlua::Error::external)
+        methods.add_method("num_reflectors", |_, law, ()| Ok(ctx(law).num_reflectors()));
+        methods.add_method(
+            "log",
+            |_, law, (level, message): (BorrowedStr, BorrowedStr)| {
+                ctx(law)
+                    .log(&level, &message)
+                    .map_err(mlua::Error::external)
+            },
+        );
+        methods.add_method("store_read", |_, law, name: BorrowedStr| {
+            ctx(law).store_read(&name).map_err(mlua::Error::external)
         });
         methods.add_method(
             "store_write",
-            |_, this, (name, contents): (String, String)| {
-                this.0
+            |_, law, (name, contents): (BorrowedStr, BorrowedStr)| {
+                ctx(law)
                     .store_write(&name, &contents)
                     .map_err(mlua::Error::external)
             },
         );
-        methods.add_method("event", |_, this, (name, reason): (String, String)| {
-            this.0.event(&name, &reason);
-            Ok(())
-        });
+        methods.add_method(
+            "event",
+            |_, law, (name, reason): (BorrowedStr, BorrowedStr)| {
+                ctx(law).event(&name, &reason);
+                Ok(())
+            },
+        );
         methods.add_method(
             "metric",
-            |_, this, (series, fields, tags): (String, Table, Option<Table>)| {
+            |_, law, (series, fields, tags): (BorrowedStr, Table, Option<Table>)| {
                 // Sorted, so a series' lines keep one key order.
                 let mut fields: Vec<(String, f64)> = fields.pairs().collect::<Result<_, _>>()?;
                 fields.sort_by(|a, b| a.0.cmp(&b.0));
@@ -267,13 +279,13 @@ impl UserData for LuaCtx<'_> {
                     None => Vec::new(),
                 };
                 tags.sort();
-                this.0.metric(&series, fields, tags);
+                ctx(law).metric(&series, fields, tags);
                 Ok(())
             },
         );
-        methods.add_method("active_reflectors", |lua, this, ()| {
+        methods.add_method("active_reflectors", |lua, law, ()| {
             let list = lua.create_table()?;
-            for (reflector, protocol) in this.0.active_reflectors() {
+            for (reflector, protocol) in ctx(law).active_reflectors() {
                 let entry = lua.create_table()?;
                 entry.set("reflector", reflector)?;
                 entry.set("protocol", protocol)?;
@@ -282,4 +294,8 @@ impl UserData for LuaCtx<'_> {
             Ok(list)
         });
     }
+}
+
+fn ctx(law: &LawContext) -> ScriptCtx<'_> {
+    ScriptCtx { law }
 }
