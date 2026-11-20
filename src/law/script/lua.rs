@@ -215,6 +215,14 @@ impl UserData for LuaCtx<'_> {
                 .set_rate(&direction, kbps)
                 .map_err(mlua::Error::external)
         });
+        methods.add_method(
+            "report_delay",
+            |_, this, (direction, delay_ms, threshold_ms): (String, f64, Option<f64>)| {
+                this.0
+                    .report_delay(&direction, delay_ms, threshold_ms)
+                    .map_err(mlua::Error::external)
+            },
+        );
         methods.add_method("base", |_, this, direction: String| {
             this.0.base(&direction).map_err(mlua::Error::external)
         });

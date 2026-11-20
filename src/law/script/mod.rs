@@ -21,7 +21,7 @@ use tokio::{sync::broadcast::error::RecvError, time};
 use crate::{
     error::ChannelClosed,
     law::{Cadence, Law, LawContext},
-    measurement::model::{MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayStatus},
+    measurement::model::{MeasurementEvent, MeasurementOutcome, OneWayStatus},
     metrics::Metric,
     runtime::{Direction, TrafficRates},
 };
@@ -136,6 +136,16 @@ impl ScriptCtx<'_> {
         self.law.set_rate(parse_direction(direction)?, rate_kbps)
     }
 
+    pub fn report_delay(
+        &self,
+        direction: &str,
+        delay_ms: f64,
+        threshold_ms: Option<f64>,
+    ) -> anyhow::Result<()> {
+        self.law
+            .report_delay(parse_direction(direction)?, delay_ms, threshold_ms)
+    }
+
     pub fn base(&self, direction: &str) -> anyhow::Result<Option<f64>> {
         let direction = parse_direction(direction)?;
         Ok(self.law.shaper(direction).map(|s| s.base_kbps))
@@ -205,7 +215,7 @@ impl ScriptCtx<'_> {
             .borrow()
             .active_targets()
             .iter()
-            .map(|target| (reflector_name(target), target.protocol().to_string()))
+            .map(|target| (target.name(), target.protocol().to_string()))
             .collect()
     }
 }
@@ -372,14 +382,6 @@ async fn tick(timer: &mut Option<time::Interval>) {
     }
 }
 
-/// The IP, or `ip:port` for IRTT, where one IP can serve several endpoints.
-fn reflector_name(target: &MeasurementTarget) -> String {
-    match target {
-        MeasurementTarget::Irtt { endpoint, .. } => endpoint.to_string(),
-        target => target.peer().to_string(),
-    }
-}
-
 fn measurement(event: &MeasurementEvent, ctx: &LawContext, sent: f64, t: f64) -> Measurement {
     let role = if ctx.applied.borrow().is_active(&event.target) {
         "active"
@@ -391,7 +393,7 @@ fn measurement(event: &MeasurementEvent, ctx: &LawContext, sent: f64, t: f64) ->
         MeasurementOutcome::Loss => None,
     };
     Measurement {
-        reflector: reflector_name(&event.target),
+        reflector: event.target.name(),
         protocol: event.target.protocol().to_string(),
         role,
         sent,

@@ -743,10 +743,12 @@ impl SqmaLaw {
                 state.current_kbps = next;
             }
 
+            let delta = deltas[deltas.len() / 2];
+            ctx.report_delay(direction, delta, Some(delay_ms))?;
             ctx.metrics.send(
                 Metric::law("delta")
                     .tag("direction", direction.as_str())
-                    .field("delta_delay", deltas[deltas.len() / 2]),
+                    .field("delta_delay", delta),
             );
         }
 

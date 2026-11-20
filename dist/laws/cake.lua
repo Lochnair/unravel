@@ -379,6 +379,7 @@ local function adjust(self, s, now, ctx)
   local c = self.config
   local delayed, avg = tally(self, s.name)
   s.delayed, s.avg_delta = delayed, avg
+  ctx:report_delay(s.name, avg, s.delay_ms)
   local bb_refractory = c.bufferbloat_refractory_ms / 1000
   -- Upstream assumes a traffic sample every 200 ms.
   local load_fresh = s.traffic_t ~= nil and now - s.traffic_t <= FRESHNESS_S

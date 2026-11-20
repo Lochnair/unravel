@@ -64,6 +64,19 @@ impl MeasurementTarget {
         }
     }
 
+    /// The IP, or `ip:port` for IRTT, where one IP can serve several
+    /// endpoints. With the protocol it identifies the target.
+    #[cfg_attr(
+        not(any(feature = "lua", all(feature = "ubus", unix))),
+        allow(dead_code)
+    )]
+    pub fn name(&self) -> String {
+        match self {
+            Self::Irtt { endpoint, .. } => endpoint.to_string(),
+            target => target.peer().to_string(),
+        }
+    }
+
     pub fn protocol(&self) -> MeasurementProtocol {
         match self {
             Self::IcmpEcho(_) => MeasurementProtocol::IcmpEcho,

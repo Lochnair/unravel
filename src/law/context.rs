@@ -63,6 +63,17 @@ impl LawContext {
         self.runtime.set_rate(direction, rate_kbps)
     }
 
+    /// Shows `delay_ms` above the law's baseline, and the threshold it
+    /// reacts to, on the status page. Laws call it whenever they decide.
+    pub fn report_delay(
+        &self,
+        direction: Direction,
+        delay_ms: f64,
+        threshold_ms: Option<f64>,
+    ) -> anyhow::Result<()> {
+        self.runtime.report_delay(direction, delay_ms, threshold_ms)
+    }
+
     pub fn shaper(&self, direction: Direction) -> Option<&Shaper> {
         self.runtime.shaper(direction)
     }

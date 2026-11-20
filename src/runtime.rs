@@ -44,6 +44,16 @@ pub(crate) struct Shaper {
     pub(crate) wire_packet_bytes: Option<u32>,
     /// The last rate set, simulated in dry run.
     rate: watch::Sender<Option<f64>>,
+    /// The law's last delay signal, if it reports one.
+    delay: watch::Sender<Option<DelaySignal>>,
+}
+
+/// What a law last saw as delay for one direction: milliseconds above its
+/// baseline, and the threshold it reacts to, if it has a single one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DelaySignal {
+    pub(crate) delay_ms: f64,
+    pub(crate) threshold_ms: Option<f64>,
 }
 
 impl Shaper {
@@ -67,6 +77,7 @@ impl Shaper {
             max_kbps,
             wire_packet_bytes,
             rate: watch::channel(None).0,
+            delay: watch::channel(None).0,
         }
     }
 
@@ -79,6 +90,12 @@ impl Shaper {
     #[cfg_attr(not(all(feature = "ubus", unix)), allow(dead_code))]
     pub(crate) fn rate_kbps(&self) -> Option<f64> {
         *self.rate.borrow()
+    }
+
+    /// The law's delay signal, as it reports it.
+    #[cfg_attr(not(all(feature = "ubus", unix)), allow(dead_code))]
+    pub(crate) fn delay(&self) -> watch::Receiver<Option<DelaySignal>> {
+        self.delay.subscribe()
     }
 }
 
@@ -270,11 +287,40 @@ impl Runtime {
         *self.traffic_tx.borrow()
     }
 
+    /// Every traffic sample, `None` after a failed one.
+    #[cfg_attr(not(all(feature = "ubus", unix)), allow(dead_code))]
+    pub(crate) fn traffic_updates(&self) -> watch::Receiver<Option<TrafficRates>> {
+        self.traffic_tx.subscribe()
+    }
+
     pub(crate) fn shaper(&self, direction: Direction) -> Option<&Shaper> {
         match direction {
             Direction::Download => self.download.as_ref(),
             Direction::Upload => self.upload.as_ref(),
         }
+    }
+
+    /// Publishes the law's delay signal for `direction`. Only status readers
+    /// see it; it changes nothing about shaping.
+    pub(crate) fn report_delay(
+        &self,
+        direction: Direction,
+        delay_ms: f64,
+        threshold_ms: Option<f64>,
+    ) -> anyhow::Result<()> {
+        let shaper = self
+            .shaper(direction)
+            .ok_or_else(|| anyhow::anyhow!("No shaper configured for {direction:?}"))?;
+        anyhow::ensure!(delay_ms.is_finite(), "Invalid delay: {delay_ms}");
+        anyhow::ensure!(
+            threshold_ms.is_none_or(f64::is_finite),
+            "Invalid delay threshold: {threshold_ms:?}"
+        );
+        shaper.delay.send_replace(Some(DelaySignal {
+            delay_ms,
+            threshold_ms,
+        }));
+        Ok(())
     }
 
     pub(super) fn set_rate(&self, direction: Direction, rate_kbps: f64) -> anyhow::Result<()> {

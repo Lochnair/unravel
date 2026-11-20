@@ -110,6 +110,8 @@ impl App {
         let (engine_done, measurement_done) = watch::channel(false);
         let (measurement_tx, measurement_rx) = broadcast::channel(256);
         let manager_measurements = measurement_tx.subscribe();
+        #[cfg(all(feature = "ubus", unix))]
+        let status_measurements = measurement_tx.subscribe();
         let (traffic_tx, traffic_rx) = watch::channel(None);
 
         let (metrics, exporter) = if settings.observability.enabled {
@@ -156,6 +158,7 @@ impl App {
         let status = crate::status::Status::new(
             Arc::clone(&runtime),
             applied_rx.clone(),
+            status_measurements,
             instance,
             settings.law.name.as_str(),
             settings.dry_run,

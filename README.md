@@ -207,7 +207,7 @@ Ctrl+C or SIGTERM stops the program and attempts to restore the enabled shapers 
 
 ### Checking status on OpenWrt
 
-With the `ubus` build feature enabled, you can check the current rates and active reflector count without stopping the service. The status object is `unravel.<instance>`.
+With the `ubus` build feature enabled, you can check the current rates, the law's delay readings and the reflectors without stopping the service. The status object is `unravel.<instance>`.
 
 ```sh
 ubus call unravel.wan status
@@ -227,21 +227,71 @@ ubus call unravel.wan2 status
 		"base_kbps": 100000,
 		"min_kbps": 20000,
 		"rate_kbps": 87341,
-		"traffic_kbps": 41210
+		"traffic_kbps": 41210,
+		"delay_us": 2140,
+		"delay_threshold_us": 15000
 	},
 	"upload": {
 		"interface": "wan",
 		"base_kbps": 20000,
 		"min_kbps": 4000,
 		"rate_kbps": 18922,
-		"traffic_kbps": 1530
+		"traffic_kbps": 1530,
+		"delay_us": 640,
+		"delay_threshold_us": 15000
 	}
 }
 ```
 
-`uptime` is in seconds, and `reflectors` counts the active reflectors that are ready to probe. Each enabled shaper has its own entry, with `max_kbps` included if you've set a cap. Once unRAVEL has set a rate, `rate_kbps` shows that last rate (simulated in dry run). `traffic_kbps` shows the current sample when one is available.
+`uptime` is in seconds, and `reflectors` counts the active reflectors that are ready to probe. Each enabled shaper has its own entry, with `max_kbps` included if you've set a cap. Once unRAVEL has set a rate, `rate_kbps` shows that last rate (simulated in dry run). `traffic_kbps` shows the current sample when one is available. `delay_us` is the delay above baseline that the law last acted on, in microseconds, and `delay_threshold_us` is the threshold it compares that delay to. Both appear once the law reports them, and both built-in laws do.
 
-If the ubus socket is missing at startup, unRAVEL logs a message and carries on. For LuCI and other rpcd clients, the `unravel` read permission covers the `status` method on every instance. [rpcd ACL](dist/openwrt/unravel.rpcd.json)
+`history` returns the last `window` seconds (ten minutes) of each direction, one value every `interval` seconds, oldest first. `rate_kbps` is the rate at the end of each interval, while `traffic_kbps` and `delay_us` are averages over it. A `null` marks an interval without a value.
+
+```sh
+ubus call unravel.wan history
+```
+
+```json
+{
+	"interval": 2,
+	"window": 600,
+	"download": {
+		"rate_kbps": [ 87341, 88120, 90004 ],
+		"traffic_kbps": [ 41210, 52977, 61340 ],
+		"delay_us": [ 2140, 1980, 3310 ]
+	},
+	"upload": { "...": "..." }
+}
+```
+
+`reflectors` lists every reflector being probed, active ones first. The figures cover the reflector's last 20 probes: loss, the latest RTT and the average and minimum RTT, jitter (the mean change between replies), and how long ago the last reply came. `one_way` is the state of the last one-way measurement, `usable` or why it was rejected.
+
+```sh
+ubus call unravel.wan reflectors
+```
+
+```json
+{
+	"reflectors": [
+		{
+			"reflector": "109.224.229.159:2112",
+			"protocol": "irtt",
+			"role": "active",
+			"ready": true,
+			"probes": 20,
+			"loss_pct": 0,
+			"rtt_us": 32176,
+			"rtt_avg_us": 32711,
+			"rtt_min_us": 31643,
+			"jitter_us": 1372,
+			"last_reply_ms": 84,
+			"one_way": "usable"
+		}
+	]
+}
+```
+
+If the ubus socket is missing at startup, unRAVEL logs a message and carries on. For LuCI and other rpcd clients, the `unravel` read permission covers all three methods on every instance. [rpcd ACL](dist/openwrt/unravel.rpcd.json)
 
 ## Control laws
 
@@ -252,6 +302,8 @@ If you want to keep SQMA's learned safe rates across a service restart, set `opt
 ### Using a Lua script
 
 If you want to try your own rate control, select the `script` law in a build with Lua support. The default Cargo build includes it. The script gets probe results and traffic samples and decides when to change the rates. The example sets the shapers to their base rates and leaves them there. [examples/laws/minimal.lua](examples/laws/minimal.lua)
+
+If your script works out a delay signal, call `ctx:report_delay(direction, delay_ms, threshold_ms)` whenever it decides, so `ubus call unravel.wan status` and the LuCI status page can show it. The threshold is optional. The cake-autorate law reports its average delay and its delay threshold.
 
 Copy the script to `/etc/unravel/minimal.lua` and set `config law` as follows.
 
