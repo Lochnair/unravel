@@ -17,7 +17,7 @@ use icmp_socket2::{
 };
 use log::debug;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, Ipv4Addr},
     task::{Context, Poll},
@@ -58,7 +58,10 @@ pub struct IcmpDriver {
     inflight: HashMap<InFlightProbeKey, InFlightProbe>,
     // Keep retired sequence leases until their original timeout too. Replacing
     // a target must never attribute its late reply to a new probe.
-    used: HashMap<InFlightProbeKey, Instant>,
+    used: HashSet<InFlightProbeKey>,
+    /// The same leases by expiry. Every lease has the same timeout and send
+    /// times only grow, so the oldest is always at the front.
+    lease_expiry: VecDeque<(Instant, InFlightProbeKey)>,
     prepared: HashMap<MeasurementTarget, PreparedProbe>,
 }
 
@@ -89,7 +92,8 @@ impl IcmpDriver {
             identifier,
             next_sequence: 0,
             inflight: HashMap::new(),
-            used: HashMap::new(),
+            used: HashSet::new(),
+            lease_expiry: VecDeque::new(),
             prepared: HashMap::new(),
         })
     }
@@ -135,7 +139,9 @@ impl IcmpDriver {
             Poll::Ready(Ok(_accepted_bytes)) => {
                 let prepared = self.prepared.remove(target).unwrap();
                 let key = (target.clone(), prepared.sequence);
-                self.used.insert(key.clone(), sent_at + PROBE_TIMEOUT);
+                self.used.insert(key.clone());
+                self.lease_expiry
+                    .push_back((sent_at + PROBE_TIMEOUT, key.clone()));
                 self.inflight.insert(
                     key,
                     InFlightProbe {
@@ -149,12 +155,18 @@ impl IcmpDriver {
     }
 
     fn prepare(&mut self, target: &MeasurementTarget) -> anyhow::Result<()> {
-        self.used.retain(|_, until| *until > Instant::now());
+        let now = Instant::now();
+        while let Some((until, key)) = self.lease_expiry.front()
+            && *until <= now
+        {
+            self.used.remove(key);
+            self.lease_expiry.pop_front();
+        }
         let sequence = (0..=u16::MAX)
             .find_map(|_| {
                 let sequence = self.next_sequence;
                 self.next_sequence = sequence.wrapping_add(1);
-                (!self.used.contains_key(&(target.clone(), sequence))
+                (!self.used.contains(&(target.clone(), sequence))
                     && !self
                         .prepared
                         .get(target)
