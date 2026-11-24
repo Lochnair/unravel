@@ -341,6 +341,7 @@ impl Metrics {
     pub async fn new(
         settings: Settings,
         instance: &str,
+        law_name: &str,
         metrics_rx: mpsc::Receiver<(Metric, u64)>,
         metrics_dropped: Arc<AtomicU32>,
     ) -> anyhow::Result<Self> {
@@ -366,7 +367,7 @@ impl Metrics {
             escape(instance)
         );
         let tags = LineTags {
-            law: format!("{common},law={}", escape(settings.law.name.as_str())),
+            law: format!("{common},law={}", escape(law_name)),
             common,
         };
         Ok(Self {

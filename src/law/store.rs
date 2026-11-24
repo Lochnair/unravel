@@ -2,7 +2,10 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 
@@ -13,8 +16,14 @@ pub struct LawStore {
 }
 
 impl LawStore {
-    pub(crate) fn new(dir: PathBuf) -> Self {
-        Self { dir }
+    pub(crate) fn new(folder: &Path, name: &str) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            valid_path_component(name),
+            "Invalid law store directory name {name:?}"
+        );
+        Ok(Self {
+            dir: folder.join(name),
+        })
     }
 
     /// The whole file, or `None` if it does not exist.
@@ -68,9 +77,13 @@ impl LawStore {
 
     fn path(&self, name: &str) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(
-            !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0']),
+            valid_path_component(name),
             "Invalid law store file name {name:?}"
         );
         Ok(self.dir.join(name))
     }
+}
+
+fn valid_path_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }

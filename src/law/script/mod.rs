@@ -229,6 +229,7 @@ fn parse_direction(direction: &str) -> anyhow::Result<Direction> {
 }
 
 pub(super) struct ScriptLaw {
+    name: String,
     backend: Box<dyn Backend>,
     cadence: ScriptCadence,
     config: Value,
@@ -248,6 +249,17 @@ impl ScriptLaw {
             None => anyhow::bail!("law.script.path is required"),
         };
 
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| {
+                !stem.is_empty()
+                    && !stem.ends_with('.')
+                    && stem.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            })
+            .with_context(|| format!("Invalid script filename stem in {path:?}"))?;
         let backend = load(&path).with_context(|| format!("Loading {}", path.display()))?;
         let cadence = backend
             .cadence()
@@ -262,6 +274,7 @@ impl ScriptLaw {
         }
 
         Ok(Self {
+            name: format!("script-{stem}"),
             backend,
             cadence,
             config: Value::Map(entries),
@@ -299,6 +312,10 @@ fn load(path: &Path) -> anyhow::Result<Box<dyn Backend>> {
 
 #[async_trait::async_trait]
 impl Law for ScriptLaw {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
     fn cadence(&self) -> Cadence {
         self.cadence.cadence
     }

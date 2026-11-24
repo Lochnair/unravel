@@ -22,8 +22,7 @@ pub(crate) enum LawKind {
 }
 
 impl LawKind {
-    /// The name in the config, which also names the law's own table, its
-    /// store folder and its metrics tag.
+    /// The name in the config, which also names the law's own table.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             LawKind::Script => "script",
@@ -55,6 +54,7 @@ pub struct Cadence {
 
 #[async_trait::async_trait]
 pub trait Law: Send {
+    fn name(&self) -> &str;
     fn cadence(&self) -> Cadence;
 
     async fn run(self: Box<Self>, ctx: LawContext) -> anyhow::Result<()>;

@@ -377,6 +377,10 @@ pub(crate) struct SqmaLaw {
 
 #[async_trait::async_trait]
 impl Law for SqmaLaw {
+    fn name(&self) -> &str {
+        "sqma"
+    }
+
     fn cadence(&self) -> Cadence {
         let tick = Duration::from_secs_f64(self.settings.tick_interval);
         Cadence {

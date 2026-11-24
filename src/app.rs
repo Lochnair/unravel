@@ -90,6 +90,7 @@ impl App {
             );
         }
         let folder = Path::new(settings.output.folder.trim()).join(instance);
+        let store = LawStore::new(&folder, law.name())?;
         let csv_writer = match records {
             Some(records) => {
                 tokio::fs::create_dir_all(&folder)
@@ -117,8 +118,14 @@ impl App {
         let (metrics, exporter) = if settings.observability.enabled {
             let dropped = Arc::new(AtomicU32::new(0));
             let (tx, rx) = mpsc::channel(1000);
-            let exporter =
-                Metrics::new(settings.clone(), instance, rx, Arc::clone(&dropped)).await?;
+            let exporter = Metrics::new(
+                settings.clone(),
+                instance,
+                law.name(),
+                rx,
+                Arc::clone(&dropped),
+            )
+            .await?;
             (
                 MetricsSender::new(tx, dropped, &settings.observability),
                 Some(exporter),
@@ -152,7 +159,7 @@ impl App {
             applied_rx.clone(),
             traffic_rx,
             settings.reflectors.num_reflectors as usize,
-            LawStore::new(folder.join(settings.law.name.as_str())),
+            store,
         );
         #[cfg(all(feature = "ubus", unix))]
         let status = crate::status::Status::new(
