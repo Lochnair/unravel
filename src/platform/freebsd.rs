@@ -105,6 +105,27 @@ impl Platform {
             tx_bytes: ifmd.ifmd_data.ifi_obytes,
         })
     }
+
+    pub(crate) fn set_rate(
+        &self,
+        interface: &str,
+        bandwidth_kbit: u64,
+        dry_run: bool,
+    ) -> Result<(), Infallible> {
+        debug!(
+            "Ignoring traffic-control rate request of {} kbit/s for interface {} (dry_run={})",
+            bandwidth_kbit, interface, dry_run
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_shaper(&self, _interface: &str) -> Result<(), Infallible> {
+        Ok(())
+    }
+
+    pub(crate) fn wire_packet_bytes(&self, _interface: &str) -> Result<Option<u32>, Infallible> {
+        Ok(None)
+    }
 }
 
 pub(crate) fn warn_platform_limitations() {

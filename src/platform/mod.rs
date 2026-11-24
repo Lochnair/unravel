@@ -8,26 +8,12 @@ pub(crate) struct InterfaceStats {
     pub(crate) tx_bytes: u64,
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "macos"))]
-mod noop;
+#[cfg_attr(target_os = "linux", path = "linux.rs")]
+#[cfg_attr(target_os = "freebsd", path = "freebsd.rs")]
+#[cfg_attr(target_os = "macos", path = "macos.rs")]
+mod imp;
 
-#[cfg(target_os = "freebsd")]
-mod freebsd;
+pub(crate) use imp::{Platform, warn_platform_limitations};
 
-#[cfg(target_os = "linux")]
-mod linux;
-
-#[cfg(target_os = "macos")]
-mod macos;
-
-#[cfg(not(any(target_os = "freebsd", target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
 compile_error!("unRAVEL supports only Linux, FreeBSD, and macOS");
-
-#[cfg(target_os = "freebsd")]
-pub(crate) use freebsd::{Platform, warn_platform_limitations};
-
-#[cfg(target_os = "linux")]
-pub(crate) use linux::{Platform, warn_platform_limitations};
-
-#[cfg(target_os = "macos")]
-pub(crate) use macos::{Platform, warn_platform_limitations};

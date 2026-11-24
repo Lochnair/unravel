@@ -2,11 +2,13 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use std::convert::Infallible;
 use std::ffi::{CString, NulError};
 use std::io;
 use std::mem::size_of;
 use std::ptr;
 
+use log::debug;
 use log::warn;
 use thiserror::Error;
 
@@ -62,6 +64,27 @@ impl Platform {
 
         let response = route_interface_list(interface_index)?;
         parse_route_messages(&response, interface_index)
+    }
+
+    pub(crate) fn set_rate(
+        &self,
+        interface: &str,
+        bandwidth_kbit: u64,
+        dry_run: bool,
+    ) -> Result<(), Infallible> {
+        debug!(
+            "Ignoring traffic-control rate request of {} kbit/s for interface {} (dry_run={})",
+            bandwidth_kbit, interface, dry_run
+        );
+        Ok(())
+    }
+
+    pub(crate) fn validate_shaper(&self, _interface: &str) -> Result<(), Infallible> {
+        Ok(())
+    }
+
+    pub(crate) fn wire_packet_bytes(&self, _interface: &str) -> Result<Option<u32>, Infallible> {
+        Ok(None)
     }
 }
 
