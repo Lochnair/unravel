@@ -796,31 +796,34 @@ impl SqmaLaw {
             // reference invalidations without changing the active shaper rates.
             if let Some(state) = self.reflectors.get(&event.target)
                 && event.started_at > state.last_started_at
-                && (one_way.is_some_and(|o| o.status == OneWayStatus::ReferenceChanged)
-                    || one_way.is_some() != (state.mode == MeasurementMode::Directional))
+                && one_way.is_some_and(|o| o.status == OneWayStatus::ReferenceChanged)
             {
                 self.reflectors.remove(&event.target);
             }
             return Ok(());
         }
-        if let Some(OneWayLatency {
-            status: OneWayStatus::Unusable(reason),
-            ..
-        }) = one_way
-        {
+        let rejection = one_way.and_then(|latency| match latency.status {
+            OneWayStatus::Unusable(reason) => Some(reason),
+            _ => None,
+        });
+        let missing_timing =
+            one_way.is_none() && !matches!(event.target, MeasurementTarget::IcmpEcho(_));
+        if missing_timing || rejection.is_some() {
             // A delayed observation must not invalidate more recent history.
-            if reason != OneWayRejection::OutOfOrder
+            if rejection != Some(OneWayRejection::OutOfOrder)
                 && let Some(state) = self.reflectors.get_mut(&event.target)
                 && event.started_at > state.last_started_at
             {
                 state.valid = false;
                 state.last_started_at = event.started_at;
             }
-            ctx.metrics.send(Metric::event(
-                "directional_rejected",
-                reason.reason(),
-                Some(event.target.peer()),
-            ));
+            if let Some(reason) = rejection {
+                ctx.metrics.send(Metric::event(
+                    "directional_rejected",
+                    reason.reason(),
+                    Some(event.target.peer()),
+                ));
+            }
             return Ok(());
         }
         let Some(rtt_ms) = event.rtt_ms() else {
@@ -832,28 +835,17 @@ impl SqmaLaw {
         {
             return Ok(());
         }
-        let mode = if one_way.is_some() {
-            MeasurementMode::Directional
-        } else {
-            MeasurementMode::Rtt
-        };
         if let Some(state) = self.reflectors.get(&event.target) {
             if event.started_at <= state.last_started_at {
                 return Ok(());
             }
-            let changed = one_way.is_some_and(|o| o.status == OneWayStatus::ReferenceChanged);
-            if changed || state.mode != mode {
+            if one_way.is_some_and(|o| o.status == OneWayStatus::ReferenceChanged) {
                 // Rebuild only this target from its accepted new reference,
                 // as for a newly active target. Other reflectors remain usable.
                 self.reflectors.remove(&event.target);
-                let reason = if changed {
-                    "directional_reference_changed"
-                } else {
-                    "measurement_mode_changed"
-                };
                 ctx.metrics.send(Metric::event(
                     "measurement_recovery",
-                    reason,
+                    "directional_reference_changed",
                     Some(event.target.peer()),
                 ));
             }
@@ -862,9 +854,7 @@ impl SqmaLaw {
         let state = self
             .reflectors
             .entry(event.target.clone())
-            .or_insert_with(|| {
-                ReflectorState::new(sample, event.started_at, event.completed_at, mode)
-            });
+            .or_insert_with(|| ReflectorState::new(sample, event.started_at, event.completed_at));
         state.update(
             sample,
             event.started_at,
@@ -913,12 +903,6 @@ impl EwmaStats {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MeasurementMode {
-    Directional,
-    Rtt,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct ReflectorState {
     pub baseline: EwmaStats,
@@ -926,23 +910,16 @@ pub struct ReflectorState {
     /// Freshness of usable data, independent of raw reply liveness.
     pub last_usable_at: Instant,
     last_started_at: Instant,
-    mode: MeasurementMode,
     pub valid: bool,
 }
 
 impl ReflectorState {
-    fn new(
-        sample: EwmaStats,
-        started_at: Instant,
-        received_at: Instant,
-        mode: MeasurementMode,
-    ) -> Self {
+    fn new(sample: EwmaStats, started_at: Instant, received_at: Instant) -> Self {
         Self {
             baseline: sample,
             recent: sample,
             last_usable_at: received_at,
             last_started_at: started_at,
-            mode,
             valid: true,
         }
     }
@@ -956,7 +933,7 @@ impl ReflectorState {
         fast_factor: f64,
     ) {
         if received_at.saturating_duration_since(self.last_usable_at) > STALE_AFTER {
-            *self = Self::new(sample, started_at, received_at, self.mode);
+            *self = Self::new(sample, started_at, received_at);
         }
         self.last_usable_at = received_at;
         self.last_started_at = started_at;

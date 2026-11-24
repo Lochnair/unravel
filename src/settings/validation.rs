@@ -228,17 +228,6 @@ impl ReflectorSettings {
         if self.num_reflectors == 0 {
             report.error("reflectors.num_reflectors", "must be greater than 0");
         }
-        // Switching needs two candidates qualified at once (see the manager's
-        // MIN_SWITCH_CANDIDATES); one slot can replace failed reflectors of the
-        // current class but never change class.
-        if self.num_candidates == 1 && self.num_reflectors >= 2 {
-            report.warning(
-                "reflectors.num_candidates",
-                "a single candidate cannot switch between directional and RTT-only \
-                 measurement; use 0 for a static set or at least 2",
-            );
-        }
-
         if !std::time::Duration::try_from_secs_f64(self.candidate_period).is_ok_and(|period| {
             !period.is_zero() && std::time::Instant::now().checked_add(period).is_some()
         }) {

@@ -131,3 +131,18 @@ pub(super) async fn discover(
     }
     Ok(inventory)
 }
+
+pub(super) fn merge(
+    inventory: &mut Vec<InventoryTarget>,
+    discovered: Vec<InventoryTarget>,
+) -> anyhow::Result<()> {
+    for entry in discovered {
+        if let Some(existing) = inventory.iter_mut().find(|old| old.key() == entry.key()) {
+            existing.merge(entry)?;
+        } else {
+            // Append only: live measurements retain their inventory identity.
+            inventory.push(entry);
+        }
+    }
+    Ok(())
+}

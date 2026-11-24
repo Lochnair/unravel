@@ -3,19 +3,15 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::measurement::{
-    model::{MeasurementEvent, MeasurementOutcome, OneWayRejection, OneWayStatus},
+    model::{
+        MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayRejection, OneWayStatus,
+    },
     plan::AppliedTarget,
 };
 use std::time::{Duration, Instant};
 
 pub(super) const WINDOW: usize = 9;
 pub(super) const STREAK: usize = 3;
-
-#[derive(Debug)]
-pub(super) struct Quality {
-    pub rtt: f64,
-    pub directional: bool,
-}
 
 pub(super) struct Evidence {
     since: Instant,
@@ -86,28 +82,26 @@ impl Evidence {
             .rev()
             .filter(|e| now.saturating_duration_since(e.completed_at) <= max_age)
         {
-            let MeasurementOutcome::Reply {
-                one_way: Some(owd), ..
-            } = e.outcome
-            else {
+            let MeasurementOutcome::Reply { one_way, .. } = e.outcome else {
                 recent += 1;
                 continue;
             };
-            if owd.status == OneWayStatus::ReferenceChanged
+            if one_way.is_some_and(|owd| owd.status == OneWayStatus::ReferenceChanged)
                 && Some(e.started_at) != self.first_reference
             {
                 changes += 1;
             }
-            // Counts the newest STREAK outcomes only.
-            if recent < STREAK
-                && valid_rtt(e).is_some()
-                && matches!(
+            let bad_timing = match one_way {
+                Some(owd) => matches!(
                     owd.status,
                     OneWayStatus::Unusable(
                         OneWayRejection::InconsistentTimestamps | OneWayRejection::Discontinuity
                     )
-                )
-            {
+                ),
+                None => !matches!(e.target, MeasurementTarget::IcmpEcho(_)),
+            };
+            // Counts the newest STREAK outcomes only.
+            if recent < STREAK && bad_timing && valid_rtt(e).is_some() {
                 rejected += 1;
             }
             recent += 1;
@@ -115,12 +109,7 @@ impl Evidence {
         changes >= 2 || rejected == STREAK
     }
 
-    pub fn quality(
-        &self,
-        status: &AppliedTarget,
-        now: Instant,
-        min_samples: usize,
-    ) -> Option<Quality> {
+    pub fn quality(&self, status: &AppliedTarget, now: Instant, min_samples: usize) -> Option<f64> {
         let period = status.assignment.schedule.period;
         let freshness = period.saturating_mul(3);
         let horizon = period.saturating_mul((min_samples + 1) as u32);
@@ -136,26 +125,27 @@ impl Evidence {
         // The window holds at most WINDOW outcomes, so the samples fit on the stack.
         let mut samples = [0.0; WINDOW];
         let mut count = 0;
-        let mut directional = true;
+        let directional = !matches!(status.assignment.target, MeasurementTarget::IcmpEcho(_));
         for event in self.outcomes.iter().rev().take(min_samples) {
             if now.saturating_duration_since(event.started_at) > horizon {
                 return None;
             }
             samples[count] = valid_rtt(event)?;
             count += 1;
-            match event.outcome {
-                MeasurementOutcome::Reply {
+            if directional {
+                let MeasurementOutcome::Reply {
                     one_way: Some(owd), ..
-                } => {
-                    if matches!(owd.status, OneWayStatus::Unusable(_))
-                        || self
-                            .reference_since
-                            .is_some_and(|since| event.started_at < since)
-                    {
-                        return None;
-                    }
+                } = event.outcome
+                else {
+                    return None;
+                };
+                if matches!(owd.status, OneWayStatus::Unusable(_))
+                    || self
+                        .reference_since
+                        .is_some_and(|since| event.started_at < since)
+                {
+                    return None;
                 }
-                _ => directional = false,
             }
         }
         let rtts = &mut samples[..count];
@@ -166,7 +156,7 @@ impl Evidence {
         } else {
             rtts[mid]
         };
-        Some(Quality { rtt, directional })
+        Some(rtt)
     }
 }
 

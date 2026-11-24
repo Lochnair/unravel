@@ -12,8 +12,8 @@
 -- mean delay nears the threshold. Otherwise it decays back towards base.
 --
 -- Reflector selection, health and replacement are left to unravel. A
--- reflector that is swapped out, or whose one-way times are rejected or move
--- to a new reference, loses its votes and starts a new baseline. Late
+-- reflector that is swapped out, or whose one-way times are missing, rejected
+-- or move to a new reference, loses its votes and starts a new baseline. Late
 -- replies and old traffic samples are not acted on. Upstream sleep mode is
 -- not ported.
 --
@@ -247,9 +247,8 @@ function law:init(config, ctx)
     end
   end
 
-  -- Per reflector: { sent = last accepted send time, mode = "one_way" |
-  -- "rtt", download = ms, upload = ms }. Without mode, the reflector waits
-  -- for its next usable reply to start a new baseline from.
+  -- Per reflector: { sent = last accepted send time, download = ms, upload = ms }.
+  -- A reflector without a baseline waits for its next usable reply.
   self.baselines = {}
   -- The last detection_window votes, oldest first:
   -- { key = reflector, download = { delta, delayed }, upload = ... }
@@ -309,33 +308,29 @@ local function observe(self, m)
     return nil
   end
 
-  local down, up, mode
+  local down, up
   if m.one_way == "usable" then
-    down, up, mode = m.down_ms, m.up_ms, "one_way"
-  elseif m.one_way == nil and m.rtt_ms then
-    -- No one-way times: half the RTT each way, as upstream does for ICMP.
-    down, up, mode = m.rtt_ms / 2, m.rtt_ms / 2, "rtt"
+    down, up = m.down_ms, m.up_ms
+  elseif m.protocol == "icmp-echo" and m.rtt_ms then
+    down, up = m.rtt_ms / 2, m.rtt_ms / 2
   elseif m.one_way == "reference_changed" then
     -- The one-way times moved to a new reference: start over from here.
     remove_votes(self, k)
-    self.baselines[k] = { sent = m.sent, mode = "one_way", download = m.down_ms, upload = m.up_ms }
+    self.baselines[k] = { sent = m.sent, download = m.down_ms, upload = m.up_ms }
     return nil
   elseif m.one_way == "out_of_order" then
     -- Late, but says nothing about the reflector's newer replies.
     return nil
   else
-    -- Rejected one-way times: the next usable ones may sit at a new
-    -- offset, so start over, as SQMA does.
+    -- Missing or rejected one-way times invalidate the reflector's votes.
     forget(self, k, m.sent)
     return nil
   end
 
-  if b == nil or b.mode ~= mode then
+  if b == nil or b.download == nil then
     -- Upstream starts at 100 ms; the first reply avoids a long false
-    -- bufferbloat on paths with more delay than that. Votes from the other
-    -- mode were against the old baseline.
-    remove_votes(self, k)
-    self.baselines[k] = { sent = m.sent, mode = mode, download = down, upload = up }
+    -- bufferbloat on paths with more delay than that.
+    self.baselines[k] = { sent = m.sent, download = down, upload = up }
     return 0, 0
   end
 
