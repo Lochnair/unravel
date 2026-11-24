@@ -2,20 +2,37 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use super::Class;
 use crate::measurement::{
-    model::{
-        MeasurementEvent, MeasurementOutcome, MeasurementTarget, OneWayRejection, OneWayStatus,
-    },
+    model::{MeasurementEvent, MeasurementOutcome, OneWayRejection, OneWayStatus},
     plan::AppliedTarget,
 };
 use std::time::{Duration, Instant};
 
 pub(super) const WINDOW: usize = 9;
 pub(super) const STREAK: usize = 3;
+// Each median is an observed sample.
+const _: () = assert!(STREAK % 2 == 1 && WINDOW % 2 == 1 && STREAK <= WINDOW);
+
+/// Median RTTs, each qualified independently.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Qualifications {
+    /// Over the newest STREAK outcomes: enough to fill an empty or failed slot.
+    pub recovery: Option<Duration>,
+    /// Over the full WINDOW: enough to replace a healthy active reflector.
+    pub improvement: Option<Duration>,
+}
+
+/// What the evidence says about a target in one pass.
+pub(super) struct Assessment {
+    /// Before Live applies the failure debounce.
+    pub unhealthy: bool,
+    pub quality: Qualifications,
+}
 
 pub(super) struct Evidence {
     since: Instant,
-    pub last_reply: Option<Instant>,
+    last_reply: Option<Instant>,
     outcomes: Vec<MeasurementEvent>,
     first_reference: Option<Instant>,
     reference_since: Option<Instant>,
@@ -37,7 +54,7 @@ impl Evidence {
         if event.started_at < self.since {
             return;
         }
-        if valid_rtt(&event).is_some() {
+        if event.rtt().is_some() {
             self.last_reply = Some(
                 self.last_reply
                     .map_or(event.completed_at, |at| at.max(event.completed_at)),
@@ -74,7 +91,7 @@ impl Evidence {
     /// RTT liveness and directional service health are independent. An isolated
     /// step can requalify; repeated transitions or a run of rejected timing
     /// should open replacement qualification even while RTT replies continue.
-    pub fn timing_unhealthy(&self, now: Instant, max_age: Duration) -> bool {
+    fn timing_unhealthy(&self, now: Instant, max_age: Duration) -> bool {
         let (mut changes, mut recent, mut rejected) = (0, 0, 0);
         for e in self
             .outcomes
@@ -98,10 +115,10 @@ impl Evidence {
                         OneWayRejection::InconsistentTimestamps | OneWayRejection::Discontinuity
                     )
                 ),
-                None => !matches!(e.target, MeasurementTarget::IcmpEcho(_)),
+                None => Class::of(&e.target) == Class::Directional,
             };
             // Counts the newest STREAK outcomes only.
-            if recent < STREAK && bad_timing && valid_rtt(e).is_some() {
+            if recent < STREAK && bad_timing && e.rtt().is_some() {
                 rejected += 1;
             }
             recent += 1;
@@ -109,57 +126,83 @@ impl Evidence {
         changes >= 2 || rejected == STREAK
     }
 
-    pub fn quality(&self, status: &AppliedTarget, now: Instant, min_samples: usize) -> Option<f64> {
-        let period = status.assignment.schedule.period;
-        let freshness = period.saturating_mul(3);
-        let horizon = period.saturating_mul((min_samples + 1) as u32);
-        if !status.ready
-            || self.timing_unhealthy(now, period.saturating_mul((WINDOW + 1) as u32))
-            || self
-                .last_reply
-                .is_none_or(|at| now.saturating_duration_since(at) > freshness)
-            || self.outcomes.len() < min_samples
-        {
-            return None;
+    /// Health and qualification for one pass. Health counts silence from role
+    /// entry; qualification needs an actual recent reply.
+    pub fn assess(
+        &self,
+        now: Instant,
+        entered_at: Instant,
+        period: Duration,
+        status: Option<&AppliedTarget>,
+    ) -> Assessment {
+        // The manager publishes the role's period and selects only once the
+        // engine has applied that plan.
+        debug_assert!(status.is_none_or(|s| s.assignment.schedule.period == period));
+        let grace = period.saturating_mul(3);
+        let fresh = |at: Instant| now.saturating_duration_since(at) <= grace;
+        let ready = status.filter(|s| s.ready);
+        let timing_unhealthy = ready.is_some()
+            && self.timing_unhealthy(now, period.saturating_mul((WINDOW + 1) as u32));
+
+        let reply_or_entry = self.last_reply.map_or(entered_at, |at| at.max(entered_at));
+        let unhealthy = now.saturating_duration_since(entered_at) >= grace
+            && (ready.is_none() || !fresh(reply_or_entry) || timing_unhealthy);
+
+        let quality = match ready {
+            Some(status) if !timing_unhealthy && self.last_reply.is_some_and(fresh) => {
+                self.qualify(now, period, Class::of(&status.assignment.target))
+            }
+            _ => Qualifications::default(),
+        };
+        Assessment { unhealthy, quality }
+    }
+
+    /// Medians over the newest STREAK and WINDOW outcomes, where each of them
+    /// is usable and the oldest was sent within that window's horizon.
+    fn qualify(&self, now: Instant, period: Duration, class: Class) -> Qualifications {
+        // The newest contiguous run of usable samples.
+        let mut rtts = [Duration::ZERO; WINDOW];
+        let mut usable = 0;
+        for (rtt, event) in rtts.iter_mut().zip(self.outcomes.iter().rev()) {
+            let Some(sample) = event
+                .rtt()
+                .filter(|_| class == Class::Echo || self.one_way_usable(event))
+            else {
+                break;
+            };
+            *rtt = sample;
+            usable += 1;
         }
-        // The window holds at most WINDOW outcomes, so the samples fit on the stack.
-        let mut samples = [0.0; WINDOW];
-        let mut count = 0;
-        let directional = !matches!(status.assignment.target, MeasurementTarget::IcmpEcho(_));
-        for event in self.outcomes.iter().rev().take(min_samples) {
-            if now.saturating_duration_since(event.started_at) > horizon {
+        let mut median = |samples: usize| {
+            if usable < samples {
                 return None;
             }
-            samples[count] = valid_rtt(event)?;
-            count += 1;
-            if directional {
-                let MeasurementOutcome::Reply {
-                    one_way: Some(owd), ..
-                } = event.outcome
-                else {
-                    return None;
-                };
-                if matches!(owd.status, OneWayStatus::Unusable(_))
-                    || self
-                        .reference_since
-                        .is_some_and(|since| event.started_at < since)
-                {
-                    return None;
-                }
+            let oldest = &self.outcomes[self.outcomes.len() - samples];
+            let horizon = period.saturating_mul((samples + 1) as u32);
+            if now.saturating_duration_since(oldest.started_at) > horizon {
+                return None;
             }
-        }
-        let rtts = &mut samples[..count];
-        rtts.sort_unstable_by(f64::total_cmp);
-        let mid = rtts.len() / 2;
-        let rtt = if rtts.len().is_multiple_of(2) {
-            rtts[mid - 1] / 2.0 + rtts[mid] / 2.0
-        } else {
-            rtts[mid]
+            Some(*rtts[..samples].select_nth_unstable(samples / 2).1)
         };
-        Some(rtt)
+        let recovery = median(STREAK);
+        // Selecting within the shorter prefix keeps the full window's samples.
+        let improvement = median(WINDOW);
+        Qualifications {
+            recovery,
+            improvement,
+        }
     }
-}
 
-fn valid_rtt(event: &MeasurementEvent) -> Option<f64> {
-    event.rtt_ms()
+    /// Directional samples need usable one-way timing from the current reference.
+    fn one_way_usable(&self, event: &MeasurementEvent) -> bool {
+        let usable = matches!(
+            event.outcome,
+            MeasurementOutcome::Reply { one_way: Some(owd), .. }
+                if !matches!(owd.status, OneWayStatus::Unusable(_))
+        );
+        usable
+            && self
+                .reference_since
+                .is_none_or(|since| event.started_at >= since)
+    }
 }

@@ -8,7 +8,7 @@ use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
@@ -189,6 +189,18 @@ pub enum MeasurementOutcome {
 }
 
 impl MeasurementEvent {
+    /// Usable RTT. A protocol RTT is authoritative and invalid when negative;
+    /// otherwise the local elapsed time. Losses return None.
+    pub fn rtt(&self) -> Option<Duration> {
+        let MeasurementOutcome::Reply { round_trip, .. } = self.outcome else {
+            return None;
+        };
+        match round_trip {
+            Some(rtt) => u64::try_from(rtt.as_nanos()).ok().map(Duration::from_nanos),
+            None => self.completed_at.checked_duration_since(self.started_at),
+        }
+    }
+
     /// Usable RTT in milliseconds. Raw protocol values remain in `outcome`.
     /// Invalid RTTs and losses return None; directional rejection does not affect RTT.
     pub fn rtt_ms(&self) -> Option<f64> {

@@ -14,7 +14,7 @@ use crate::{
     metrics::{Metric, MetricsSender},
     settings::Settings,
 };
-use evidence::{Evidence, STREAK, WINDOW};
+use evidence::{Assessment, Evidence, Qualifications, WINDOW};
 use inventory::{InventoryGroup, InventoryTarget, discover};
 use log::{debug, info, warn};
 use std::{
@@ -39,11 +39,55 @@ const POLICY_INTERVAL: Duration = Duration::from_secs(30);
 // are probed faster than candidates, so without it a link-wide blip would fail
 // every active while the candidates still looked qualified.
 const DEBOUNCE: Duration = Duration::from_secs(2);
-// Evidence tiers: index into `Seat::rtt`, and the reason a slot is open.
-const SAMPLES: [usize; 2] = [STREAK, WINDOW];
-const REASON: [&str; 2] = ["health", "quality"];
-const RECOVERY: usize = 0;
-const IMPROVEMENT: usize = 1;
+/// What a protocol measures, declared best-first so `min` finds the preferred class.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Class {
+    /// One-way delay as well as RTT.
+    Directional,
+    /// RTT only; used when too few directional peers qualify.
+    Echo,
+}
+
+impl Class {
+    fn of(target: &MeasurementTarget) -> Self {
+        match target {
+            MeasurementTarget::IcmpEcho(_) => Self::Echo,
+            MeasurementTarget::IcmpTimestamps(_) | MeasurementTarget::Irtt { .. } => {
+                Self::Directional
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromotionKind {
+    /// Fills an empty or failed slot, judged over the newest STREAK outcomes.
+    Recovery,
+    /// Replaces a healthy active reflector, judged over the full WINDOW.
+    Improvement,
+}
+
+impl PromotionKind {
+    fn rtt(self, quality: Qualifications) -> Option<Duration> {
+        match self {
+            Self::Recovery => quality.recovery,
+            Self::Improvement => quality.improvement,
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Recovery => "health",
+            Self::Improvement => "quality",
+        }
+    }
+}
+
+struct Promotion {
+    slot: usize,
+    candidate: usize,
+    kind: PromotionKind,
+}
 
 /// A target under measurement. Evidence follows it across role changes.
 struct Live {
@@ -53,16 +97,21 @@ struct Live {
     unhealthy_since: Option<Instant>,
 }
 
-/// Everything the decision needs to know about one live target.
-#[derive(Clone, Debug)]
-struct Seat {
-    ip: IpAddr,
-    /// RTT only: the lower class, used when too few directional peers qualify.
-    echo: bool,
-    preference: usize,
+/// One live target as this pass's selection sees it.
+struct Seat<'a> {
+    entry: &'a InventoryTarget,
     failed: bool,
-    /// Median RTT when qualified over `SAMPLES[tier]` outcomes.
-    rtt: [Option<f64>; 2],
+    quality: Qualifications,
+}
+
+impl Seat<'_> {
+    fn class(&self) -> Class {
+        Class::of(&self.entry.target)
+    }
+
+    fn ip(&self) -> IpAddr {
+        self.entry.target.peer()
+    }
 }
 
 impl Live {
@@ -86,143 +135,194 @@ impl Live {
             .is_some_and(|at| now.saturating_duration_since(at) >= DEBOUNCE)
     }
 
-    fn assess(
+    fn assess<'a>(
         &mut self,
-        entry: &InventoryTarget,
+        entry: &'a InventoryTarget,
         period: Duration,
         applied: &AppliedState,
         now: Instant,
-    ) -> Seat {
+    ) -> Seat<'a> {
         let status = applied
             .targets
             .iter()
             .find(|s| s.assignment.target == entry.target);
-        let grace = period.saturating_mul(3);
-        let last_reply = self
-            .evidence
-            .last_reply
-            .map_or(self.entered_at, |at| at.max(self.entered_at));
-        let unhealthy = now.saturating_duration_since(self.entered_at) >= grace
-            && (now.saturating_duration_since(last_reply) > grace
-                || status.is_none_or(|s| !s.ready)
-                || self
-                    .evidence
-                    .timing_unhealthy(now, period.saturating_mul((WINDOW + 1) as u32)));
+        let Assessment { unhealthy, quality } =
+            self.evidence.assess(now, self.entered_at, period, status);
         self.unhealthy_since = unhealthy.then(|| self.unhealthy_since.unwrap_or(now));
-        let rtt = SAMPLES.map(|samples| self.evidence.quality(status?, now, samples));
         Seat {
-            ip: entry.target.peer(),
-            echo: matches!(entry.target, MeasurementTarget::IcmpEcho(_)),
-            preference: entry.preference,
+            entry,
             failed: self.failed(now),
-            rtt,
+            quality,
         }
     }
 }
 
-/// Choose promotions as (active slot, candidate slot, evidence tier).
+/// The class first, then the fastest RTT within it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ClassRtt {
+    class: Class,
+    rtt: Duration,
+}
+
+/// Where a reflector ranked for a slot comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Active,
+    Candidate(usize),
+}
+
+struct RankEntry {
+    source: Source,
+    baseline: ClassRtt,
+    preference: usize,
+}
+
+/// The slot's active reflector as the improvement pass sees it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ActiveRtt {
+    Measured(Duration),
+    Missing,
+}
+
+/// Which healthy slot the periodic pass improves: the greatest wins.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ImprovementPriority {
+    SameClass(ActiveRtt),
+    DirectionalUpgrade(ActiveRtt),
+}
+
+/// Choose this pass's promotions from the assessed seats.
 fn select_promotions(
     active: &[Option<Seat>],
     candidates: &[Option<Seat>],
     periodic: bool,
     rng: &mut fastrand::Rng,
-) -> Vec<(usize, usize, usize)> {
-    let open = |slot: &usize| active[*slot].as_ref().is_none_or(|s| s.failed);
-    let mut ips = active
+) -> Vec<Promotion> {
+    // Each slot's effective IP. A winner reserves its IP at once, which also
+    // keeps it out of every later contest.
+    let mut active_ips = active
         .iter()
-        .map(|s| s.as_ref().map(|s| s.ip))
+        .map(|seat| seat.as_ref().map(Seat::ip))
         .collect::<Vec<_>>();
     let mut promotions = Vec::new();
 
     // Fill empty or failed slots.
-    for slot in (0..active.len()).filter(open) {
-        let tier = RECOVERY;
-        if let Some(candidate) = challenger(active, candidates, &ips, &promotions, slot, tier, rng)
+    for (slot, seat) in active.iter().enumerate() {
+        if seat.as_ref().is_some_and(|s| !s.failed) {
+            continue;
+        }
+        let kind = PromotionKind::Recovery;
+        if let Some(candidate) =
+            select_replacement(slot, seat.as_ref(), kind, candidates, &active_ips, rng)
         {
-            ips[slot] = candidates[candidate].as_ref().map(|seat| seat.ip);
-            promotions.push((slot, candidate, tier));
+            active_ips[slot] = candidates[candidate].as_ref().map(Seat::ip);
+            promotions.push(Promotion {
+                slot,
+                candidate,
+                kind,
+            });
         }
     }
 
-    // Periodically make one improvement: a directional upgrade of an echo slot
-    // first, otherwise the slowest slot that has a better challenger.
+    // Periodically improve one slot that was healthy at the start of the pass.
     if periodic {
-        let tier = IMPROVEMENT;
-        let is_upgrade = |&(slot, candidate): &(usize, usize)| {
-            active[slot].as_ref().is_some_and(|s| s.echo)
-                && candidates[candidate].as_ref().is_some_and(|s| !s.echo)
-        };
-        let incumbent_rtt = |&(slot, _): &(usize, usize)| {
-            active[slot]
-                .as_ref()
-                .and_then(|s| s.rtt[tier])
-                .unwrap_or(f64::INFINITY)
-        };
-        let best = (0..active.len())
-            .filter(|slot| !open(slot))
-            .filter_map(|slot| {
-                let candidate = challenger(active, candidates, &ips, &promotions, slot, tier, rng)?;
-                Some((slot, candidate))
+        let best = active
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, seat)| {
+                let current = seat.as_ref().filter(|s| !s.failed)?;
+                let kind = PromotionKind::Improvement;
+                let candidate =
+                    select_replacement(slot, Some(current), kind, candidates, &active_ips, rng)?;
+                let rtt = current
+                    .quality
+                    .improvement
+                    .map_or(ActiveRtt::Missing, ActiveRtt::Measured);
+                let upgrade = current.class() == Class::Echo
+                    && candidates[candidate].as_ref()?.class() == Class::Directional;
+                let priority = if upgrade {
+                    ImprovementPriority::DirectionalUpgrade(rtt)
+                } else {
+                    ImprovementPriority::SameClass(rtt)
+                };
+                Some((
+                    priority,
+                    Promotion {
+                        slot,
+                        candidate,
+                        kind,
+                    },
+                ))
             })
-            .max_by(|a, b| {
-                is_upgrade(a)
-                    .cmp(&is_upgrade(b))
-                    .then_with(|| incumbent_rtt(a).total_cmp(&incumbent_rtt(b)))
-            });
-        promotions.extend(best.map(|(slot, candidate)| (slot, candidate, tier)));
+            .max_by_key(|(priority, _)| *priority)
+            .map(|(_, promotion)| promotion);
+        promotions.extend(best);
     }
     promotions
 }
 
-/// The candidate that should take `slot` at `tier`, if any beats the incumbent.
-fn challenger(
-    active: &[Option<Seat>],
-    candidates: &[Option<Seat>],
-    ips: &[Option<IpAddr>],
-    promotions: &[(usize, usize, usize)],
+/// The candidate that should replace the slot's active reflector, if any outranks it.
+fn select_replacement(
     slot: usize,
-    tier: usize,
+    active: Option<&Seat>,
+    kind: PromotionKind,
+    candidates: &[Option<Seat>],
+    active_ips: &[Option<IpAddr>],
     rng: &mut fastrand::Rng,
 ) -> Option<usize> {
-    let incumbent = active[slot].as_ref();
-    // Echo never displaces a healthy directional incumbent.
-    let protected = incumbent.is_some_and(|s| !s.failed && !s.echo);
-    // An incumbent that qualifies competes on equal terms.
-    let pool = candidates
-        .iter()
-        .enumerate()
-        .filter_map(|(candidate, seat)| Some((Some(candidate), seat.as_ref()?)))
-        .filter(|(candidate, seat)| {
-            !(protected && seat.echo)
-                && !promotions.iter().any(|p| Some(p.1) == *candidate)
-                && !ips
-                    .iter()
-                    .enumerate()
-                    .any(|(other, ip)| other != slot && *ip == Some(seat.ip))
+    // A healthy directional active reflector never gives way to echo.
+    let worst_allowed = active
+        .filter(|s| !s.failed)
+        .map_or(Class::Echo, Seat::class);
+    let held_elsewhere = |ip| {
+        active_ips
+            .iter()
+            .enumerate()
+            .any(|(other, held)| other != slot && *held == Some(ip))
+    };
+    let rank_entry = |source, seat: &Seat| {
+        Some(RankEntry {
+            source,
+            baseline: ClassRtt {
+                class: seat.class(),
+                rtt: kind.rtt(seat.quality)?,
+            },
+            preference: seat.entry.preference,
         })
-        .chain(incumbent.map(|seat| (None, seat)))
-        .filter_map(|(source, seat)| Some((source, seat.rtt[tier]?, seat)))
-        .collect::<Vec<_>>();
-    rank(&pool, rng)
+    };
+
+    let mut pool = Vec::new();
+    for (index, seat) in candidates.iter().enumerate() {
+        let Some(seat) = seat else { continue };
+        if seat.class() > worst_allowed || held_elsewhere(seat.ip()) {
+            continue;
+        }
+        pool.extend(rank_entry(Source::Candidate(index), seat));
+    }
+    // A qualified active reflector competes on equal terms.
+    pool.extend(active.and_then(|seat| rank_entry(Source::Active, seat)));
+
+    match rank(pool, rng)? {
+        Source::Active => None,
+        Source::Candidate(index) => Some(index),
+    }
 }
 
-/// Directional before echo, then the RTT shortlist, then protocol preference.
-/// The incumbent (`None`) keeps its slot if shortlisted; otherwise a random
-/// pick spreads load.
-fn rank(pool: &[(Option<usize>, f64, &Seat)], rng: &mut fastrand::Rng) -> Option<usize> {
-    // Echo competes only when nothing directional qualifies.
-    let echo = pool.iter().all(|c| c.2.echo);
-    let pool = pool.iter().filter(|c| c.2.echo == echo);
-    let best = pool.clone().map(|c| c.1).min_by(f64::total_cmp)?;
-    let shortlist = pool.filter(|c| c.1 <= best + 5.0_f64.max(best * 0.20));
-    let preference = shortlist.clone().map(|c| c.2.preference).min()?;
-    let shortlist = shortlist
-        .filter(|c| c.2.preference == preference)
-        .collect::<Vec<_>>();
-    if shortlist.iter().any(|c| c.0.is_none()) {
-        return None;
+/// The best class's fastest RTT sets the shortlist ceiling, and protocol
+/// preference narrows it. The active reflector keeps its slot if it is a
+/// finalist; otherwise a random finalist spreads load.
+fn rank(mut pool: Vec<RankEntry>, rng: &mut fastrand::Rng) -> Option<Source> {
+    let best = pool.iter().map(|e| e.baseline).min()?;
+    let ceiling = best
+        .rtt
+        .saturating_add(Duration::from_millis(5).max(best.rtt / 5));
+    pool.retain(|e| e.baseline.class == best.class && e.baseline.rtt <= ceiling);
+    let preference = pool.iter().map(|e| e.preference).min()?;
+    pool.retain(|e| e.preference == preference);
+    if pool.iter().any(|e| e.source == Source::Active) {
+        return Some(Source::Active);
     }
-    shortlist[rng.usize(..shortlist.len())].0
+    Some(pool[rng.usize(..pool.len())].source)
 }
 
 type PoolDiscovery = Pin<Box<dyn Future<Output = anyhow::Result<Vec<InventoryTarget>>> + Send>>;
@@ -338,8 +438,11 @@ impl ReflectorManager {
             .map(|live| live.inventory)
             .collect::<Vec<_>>();
 
-        for (slot, candidate, tier) in
-            select_promotions(&active, &candidates, periodic, &mut self.rng)
+        for Promotion {
+            slot,
+            candidate,
+            kind,
+        } in select_promotions(&active, &candidates, periodic, &mut self.rng)
         {
             let next = self.candidates[candidate].take().unwrap().enter(now);
             let entry = &self.inventory[next.inventory].target;
@@ -347,22 +450,23 @@ impl ReflectorManager {
             info!(
                 "Promoting {peer} ({}) into active slot {slot}: {}",
                 entry.protocol(),
-                REASON[tier]
+                kind.reason()
             );
             self.metrics.send(Metric::event(
                 "reflector_promoted",
-                REASON[tier],
+                kind.reason(),
                 Some(peer),
             ));
-            // A healthy incumbent stays under measurement.
-            let keep = active[slot].as_ref().is_some_and(|s| !s.failed);
+            // Improvement replaces a healthy active reflector, which stays
+            // under measurement; recovery replaces an empty or failed one.
             let old = self.active[slot].replace(next);
+            let keep = kind == PromotionKind::Improvement;
             self.candidates[candidate] = old.filter(|_| keep).map(|old| old.enter(now));
             self.unpublished = true;
         }
         // Candidates: fill empty and failed slots, periodically rotate the
         // oldest resident. A slot only changes if exploration has a target.
-        // Computed after promotions, so a just-demoted incumbent is not rotated.
+        // Computed after promotions, so a just-demoted active reflector is not rotated.
         let evaluation = POLICY_INTERVAL.max(self.candidate_period.saturating_mul(WINDOW as u32));
         let resident = |live: &Live| now.saturating_duration_since(live.entered_at) >= evaluation;
         let oldest = (0..self.candidates.len())
