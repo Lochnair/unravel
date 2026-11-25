@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::Error};
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -62,8 +62,12 @@ impl MeasurementTarget {
 }
 
 /// A blank key means an unauthenticated session; any other is kept byte for byte.
+/// Serde's own type errors quote the value, so they are replaced: an unquoted
+/// numeric key would otherwise reach the startup log.
 fn nonblank<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Arc<str>>, D::Error> {
-    Ok(Option::<Arc<str>>::deserialize(deserializer)?.filter(|key| !key.trim().is_empty()))
+    let key = Option::<Arc<str>>::deserialize(deserializer)
+        .map_err(|_| D::Error::custom("authentication must be a string"))?;
+    Ok(key.filter(|key| !key.trim().is_empty()))
 }
 
 // Never derived: authentication keys stay out of logs and errors.
