@@ -2,11 +2,13 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use crate::measurement::model::MeasurementTarget;
 use crate::settings::ReflectorSettings;
 
 use super::{NetworkSettings, ObservabilitySettings, OutputSettings, Settings};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::net::IpAddr;
 
 const WARN_DOWNLOAD_MIN_KBITS: f64 = 1_000.0;
 const WARN_UPLOAD_MIN_KBITS: f64 = 500.0;
@@ -236,44 +238,23 @@ impl ReflectorSettings {
                 "must be a nonzero representable duration",
             );
         }
-        if self.files.is_empty() && self.entries.is_empty() && self.bootstrap.is_empty() {
-            report.error(
-                "reflectors",
-                "at least one reflector file, inline entry, or bootstrap entry is required",
-            );
-        }
-
-        for (index, reflector) in self.entries.iter().enumerate() {
-            if reflector.host.trim().is_empty() {
+        // The inventory owns duplicates and conflicts; these are per target.
+        for target in &self.entries {
+            let MeasurementTarget::Irtt { endpoint, .. } = target else {
+                continue;
+            };
+            if endpoint.port() == 0 {
                 report.error(
                     "reflectors.entries",
-                    format!("entry {index} must have a nonempty host"),
+                    format!("{target:?} must have a nonzero port"),
                 );
             }
-            if reflector.protocols.is_empty() {
+            if let IpAddr::V6(ip) = endpoint.ip()
+                && ip.to_ipv4_mapped().is_some()
+            {
                 report.error(
                     "reflectors.entries",
-                    format!("entry {index} must have at least one measurement protocol"),
-                );
-            }
-        }
-
-        for (index, file) in self.files.iter().enumerate() {
-            if file.trim().is_empty() {
-                report.error(
-                    "reflectors.files",
-                    format!("entry {index} must not be empty"),
-                );
-            }
-        }
-
-        for (index, country) in self.countries.iter().enumerate() {
-            if country.len() != 2 || !country.bytes().all(|c| c.is_ascii_alphabetic()) {
-                report.error(
-                    "reflectors.countries",
-                    format!(
-                        "entry {index} ({country:?}) must be an ISO 3166-1 alpha-2 country code"
-                    ),
+                    format!("{target:?} must use its plain IPv4 address"),
                 );
             }
         }

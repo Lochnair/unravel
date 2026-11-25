@@ -203,7 +203,7 @@ impl State {
                 };
                 let mut entry = Table::new()
                     .with("reflector", assignment.target.name())
-                    .with("protocol", assignment.target.protocol().to_string())
+                    .with("protocol", assignment.target.protocol_name())
                     .with("role", role)
                     .with("ready", target.ready);
                 if let Some(probes) = recorded.reflectors.get(&assignment.target) {

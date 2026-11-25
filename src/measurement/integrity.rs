@@ -118,7 +118,7 @@ impl MeasurementIntegrity {
             return;
         }
         let rtt = rtt.unwrap();
-        let precision = if matches!(event.target, MeasurementTarget::IcmpTimestamps(_)) {
+        let precision = if matches!(event.target, MeasurementTarget::IcmpTimestamps { .. }) {
             4.0
         } else {
             1.0

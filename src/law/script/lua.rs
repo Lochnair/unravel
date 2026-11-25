@@ -157,7 +157,7 @@ impl Backend for LuaBackend {
                 Event::Measurement(m) => {
                     let t = lua.create_table()?;
                     t.set("reflector", m.reflector.as_str())?;
-                    t.set("protocol", m.protocol.as_str())?;
+                    t.set("protocol", m.protocol)?;
                     t.set("role", m.role)?;
                     t.set("sent", m.sent)?;
                     t.set("t", m.t)?;

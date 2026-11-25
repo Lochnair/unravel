@@ -12,7 +12,7 @@ Use your old settings to fill in the new configuration. Check the option changes
 | --- | --- | --- |
 | UCI configuration | `/etc/config/sqm-autorate-rust` (or `/etc/config/sqm-autorate` in v0.4.1) | `/etc/config/unravel` |
 | TOML configuration | `/etc/sqm-autorate-rust/config.toml` | `/etc/unravel/<instance>.toml` |
-| Reflector inventory | `/etc/sqm-autorate-rust/reflectors.csv` | `/etc/unravel/reflectors.csv` |
+| Reflector inventory | `/etc/sqm-autorate-rust/reflectors.csv` | `config reflector` sections, or JSON pool files in `reflectors.files` |
 
 Update any scripts or service overrides that set environment variables. For example, `SQMA__NETWORK__DOWNLOAD_INTERFACE` becomes `UNRAVEL__NETWORK__DOWNLOAD_INTERFACE`. If you're coming from v0.4.1, add the section name as well. `SQMA_DOWNLOAD_INTERFACE` goes to the same new name.
 
@@ -24,7 +24,7 @@ If you already run an earlier build of `unravel`, check these settings too. Unkn
 
 1. Replace each UCI `config network` with `config instance '<name>'`, keeping its interface and rate options. Choose a name such as `wan` for a previously anonymous instance. Names use ASCII letters, digits and underscores.
 2. Move each instance's selected `law`, `reflectors`, `output` and `observability` settings into its own sections. Add `option instance '<name>'` to each section and remove the profile reference options from the instance. If several WANs used one profile, copy its settings into a section for each owner. Each of these section types can appear at most once for a given owner.
-3. Assign every `config reflector` and `config bootstrap_reflector` to an instance with `option instance '<name>'`. Copy entries to each WAN that needs them. Set CSV files and country filters in each WAN's owned `reflectors` section. Multiple instances may reference the same external CSV or Lua file.
+3. Assign every `config reflector` to an instance with `option instance '<name>'`. Copy entries to each WAN that needs them. Set reflector pool files in each WAN's owned `reflectors` section. Multiple instances may reference the same reflector pool or Lua file.
 4. Remove `advanced_settings` from UCI and TOML. Put `option dry_run '1'` or `'0'` directly in the UCI instance section. In TOML, place `dry_run = true` or `false` at the top of the file before table headers. Rename `UNRAVEL__ADVANCED_SETTINGS__DRY_RUN` to `UNRAVEL__DRY_RUN`.
 5. Rename the old `/etc/unravel/config.toml` to `/etc/unravel/<name>.toml` and use `unravel --instance <name>` for manual starts and service wrappers. The TOML table for network settings is still `[network]`.
 6. Update ubus clients to call `unravel.<name>`. The old unnamed `unravel` object and anonymous instance are removed. An instance named `default` uses the same conventions as any other name.
@@ -45,9 +45,17 @@ If you set `history_file`, see [CSV files and saved history](#csv-files-and-save
 
 ### Reflectors
 
-Remove `measurement_type` and `peer_reselection_time`. unRAVEL uses each reflector's configured `protocols` to choose how to probe it and tries replacement candidates in the background. Use `reflectors.num_candidates` and `reflectors.candidate_period` to change how many candidates it probes and how often. The defaults are three candidates and three seconds per candidate. Set `num_candidates` to `0` to keep the startup set fixed, or use at least `2` to allow protocol switching with multiple active reflectors.
+Remove `measurement_type` and `peer_reselection_time`. unRAVEL probes each reflector with its configured `protocol` and tries replacement candidates in the background. Use `reflectors.num_candidates` and `reflectors.candidate_period` to change how many candidates it probes and how often. The defaults are three candidates and three seconds per candidate. Set `num_candidates` to `0` to keep the startup set fixed, or use at least `2` to allow protocol switching with multiple active reflectors.
 
-If you're coming from v0.4.1, replace `reflectors-icmp.csv` with the bundled inventory, or convert your own list to the format in [reflectors.csv](reflectors.csv). The name for ICMP echo is `icmp-echo`. Replace `advanced_settings.reflector_list_file` with `reflectors.files` and move `num_reflectors` from `advanced_settings` to `reflectors`.
+If you're coming from v0.4.1, replace `reflectors-icmp.csv` with the bundled inventory, or convert your own list to the JSON pool format in the [README](README.md#reflectors-and-measurement-protocols). The name for ICMP echo is `icmp-echo`. Replace `advanced_settings.reflector_list_file` with `reflectors.files` and move `num_reflectors` from `advanced_settings` to `reflectors`.
+
+The reflector configuration changed in this release, and old entries stop the service from starting:
+
+- Replace CSV pool files with JSON. Each record has a `protocol` and an `endpoint`, plus an optional `authentication` for IRTT. Point `reflectors.files` at the new file. No pool file ships any more, and `files` is empty by default: remove `list files '/etc/unravel/reflectors.csv'` and copy the `config reflector` sections from the [shipped configuration](dist/openwrt/unravel.config).
+- Replace `host` with `endpoint`, and `protocols` with a single `protocol`. Repeat an entry for each protocol a host supports. Use IP addresses rather than host names. IRTT endpoints need their port, for example `192.0.2.10:2112`.
+- Rename `irtt_hmac` to `authentication`, and remove `irtt_port`.
+- Remove `config bootstrap_reflector` sections and `[[reflectors.bootstrap]]` tables, or turn them into ordinary reflectors. An unknown section type makes the whole UCI package invalid, so every instance fails to start until it's gone. unRAVEL now picks its starting reflectors from the inventory.
+- Remove `countries` and the `country` column. The shipped reflectors are anycast, so they suit any location.
 
 ### CSV files and saved history
 

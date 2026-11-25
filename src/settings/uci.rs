@@ -343,6 +343,7 @@ impl Source for UciSource {
 mod tests {
     use super::*;
     use crate::law::LawKind;
+    use crate::measurement::model::MeasurementTarget;
     use crate::settings::{ReflectorSettings, Settings};
     use config::{Config, Environment};
 
@@ -405,39 +406,41 @@ config instance 'wan'
     #[test]
     fn maps_only_sections_owned_by_the_selected_instance() {
         let dir = TestDir::new();
-        let no = dir.0.join("no.csv");
-        let eu = dir.0.join("eu.csv");
-        let header = "host,country,protocols,irtt_port,irtt_hmac";
-        fs::write(&no, format!("{header}\ninventory.no,NO,icmp-echo,,\n")).unwrap();
-        fs::write(&eu, format!("{header}\ninventory.eu,DE,irtt,2112,\n")).unwrap();
+        let no = dir.0.join("no.json");
+        let eu = dir.0.join("eu.json");
+        fs::write(
+            &no,
+            r#"[{"protocol": "icmp-echo", "endpoint": "192.0.2.1"}]"#,
+        )
+        .unwrap();
+        fs::write(
+            &eu,
+            r#"[{"protocol": "irtt", "endpoint": "192.0.2.2:2112"}]"#,
+        )
+        .unwrap();
         let no = no.to_str().unwrap();
         let eu = eu.to_str().unwrap();
         let contents = format!(
             "{WAN}
 config reflector
     option instance 'default'
-    option host 'extra.eu'
-    list protocols 'irtt'
-    list protocols 'icmp-echo'
+    option protocol 'icmp-timestamps'
+    option endpoint '192.0.2.3'
 config reflectors
     option instance 'wan'
     list files '{no}'
-    list countries 'NO'
 config reflectors
     option instance 'default'
     list files '{eu}'
-config bootstrap_reflector
+config reflector
     option instance 'wan'
-    option host 'bootstrap.no'
-    list protocols 'irtt'
-config bootstrap_reflector
-    option instance 'default'
-    option host 'bootstrap.eu'
-    list protocols 'icmp-echo'
+    option protocol 'irtt'
+    option endpoint '[2001:db8::1]:2112'
+    option authentication '007'
 config reflector 'extra'
     option instance 'default'
-    option host 'other.eu'
-    list protocols 'irtt'
+    option protocol 'irtt'
+    option endpoint '192.0.2.4:3112'
 config law 'satellite'
     option instance 'default'
     option type 'script'
@@ -461,10 +464,18 @@ config output
         assert_eq!(wan.network.upload_interface, "wan");
         assert_eq!(wan.law.name, LawKind::Sqma);
         assert_eq!(wan.reflectors.files, [no]);
-        assert_eq!(wan.reflectors.countries, ["NO"]);
-        assert_eq!(wan.reflectors.entries.len(), 1);
-        assert_eq!(wan.reflectors.entries[0].host, "inventory.no");
-        assert_eq!(wan.reflectors.bootstrap[0].host, "bootstrap.no");
+        assert_eq!(
+            wan.reflectors.entries,
+            [
+                MeasurementTarget::Irtt {
+                    endpoint: "[2001:db8::1]:2112".parse().unwrap(),
+                    authentication: Some("007".into()),
+                },
+                MeasurementTarget::IcmpEcho {
+                    endpoint: "192.0.2.1".parse().unwrap(),
+                },
+            ]
+        );
         assert_eq!(wan.output.folder, "/tmp/unravel");
         assert!(!wan.observability.enabled);
 
@@ -474,21 +485,14 @@ config output
         assert_eq!(settings.network.upload_interface, "sat");
         assert_eq!(settings.law.name, LawKind::Script);
         assert_eq!(settings.reflectors.files, [eu]);
-        assert!(settings.reflectors.countries.is_empty());
-        assert_eq!(settings.reflectors.bootstrap[0].host, "bootstrap.eu");
         assert_eq!(
             settings
                 .reflectors
                 .entries
                 .iter()
-                .map(|entry| entry.host.as_str())
+                .map(MeasurementTarget::name)
                 .collect::<Vec<_>>(),
-            ["extra.eu", "other.eu", "inventory.eu"]
-        );
-        assert_eq!(
-            sat.get::<Vec<String>>("reflectors.entries[0].protocols")
-                .unwrap(),
-            ["irtt", "icmp-echo"]
+            ["192.0.2.3", "192.0.2.4:3112", "192.0.2.2:2112"]
         );
         assert_eq!(settings.output.folder, "/tmp/satellite");
         assert_eq!(sat.get_string("law.script.arbitrary").unwrap(), "007");
@@ -521,10 +525,7 @@ config output
             settings.reflectors.files,
             ReflectorSettings::default().files
         );
-        assert_eq!(
-            settings.reflectors.bootstrap[0].host,
-            ReflectorSettings::default().bootstrap[0].host
-        );
+        assert!(settings.reflectors.entries.is_empty());
         assert_eq!(settings.output.folder, "/tmp/unravel");
         assert!(!settings.observability.enabled);
     }
@@ -539,7 +540,7 @@ config output
                 "failed to parse UCI package",
             ),
             (
-                "config reflector\n option host 'example.net'",
+                "config reflector\n option endpoint '192.0.2.1'",
                 "@reflector[0] must specify one owner",
             ),
             (
@@ -551,7 +552,7 @@ config output
                 "@law[0] must specify one owner",
             ),
             (
-                "config bootstrap_reflector 'seed'\n option instance 'missing'",
+                "config reflector 'seed'\n option instance 'missing'",
                 "seed.instance names nonexistent instance \"missing\"",
             ),
             (

@@ -1,0 +1,76 @@
+# Settings for the instance named wan: /etc/unravel/wan.toml
+
+dry_run = false
+
+[network]
+download_interface = "ifb4wan"
+upload_interface = "wan"
+download_base_kbits = 50000
+upload_base_kbits = 10000
+download_min_percent = 20
+upload_min_percent = 20
+
+[reflectors]
+num_reflectors = 5
+
+# Anycast reflectors on separate networks. Each ICMP host is listed for
+# timestamps and for echo, the fallback when a link drops timestamps.
+# Add pool files with files = ["/path/to/pool.json"].
+
+[[reflectors.entries]]
+protocol = "irtt"
+endpoint = "109.224.229.159:2112"
+
+# Quad9
+[[reflectors.entries]]
+protocol = "icmp-timestamps"
+endpoint = "9.9.9.9"
+
+[[reflectors.entries]]
+protocol = "icmp-echo"
+endpoint = "9.9.9.9"
+
+# AdGuard
+[[reflectors.entries]]
+protocol = "icmp-timestamps"
+endpoint = "94.140.14.14"
+
+[[reflectors.entries]]
+protocol = "icmp-echo"
+endpoint = "94.140.14.14"
+
+# CleanBrowsing
+[[reflectors.entries]]
+protocol = "icmp-timestamps"
+endpoint = "185.228.168.9"
+
+[[reflectors.entries]]
+protocol = "icmp-echo"
+endpoint = "185.228.168.9"
+
+# Hurricane Electric
+[[reflectors.entries]]
+protocol = "icmp-timestamps"
+endpoint = "74.82.42.42"
+
+[[reflectors.entries]]
+protocol = "icmp-echo"
+endpoint = "74.82.42.42"
+
+# Comodo
+[[reflectors.entries]]
+protocol = "icmp-timestamps"
+endpoint = "8.26.56.26"
+
+[[reflectors.entries]]
+protocol = "icmp-echo"
+endpoint = "8.26.56.26"
+
+# DNS.SB
+[[reflectors.entries]]
+protocol = "icmp-timestamps"
+endpoint = "185.222.222.222"
+
+[[reflectors.entries]]
+protocol = "icmp-echo"
+endpoint = "185.222.222.222"

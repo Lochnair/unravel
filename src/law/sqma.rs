@@ -626,9 +626,9 @@ impl SqmaLaw {
             up.push(up_delta);
 
             debug!(
-                "Reflector: {} ({:?}) down_delay: {} up_delay: {}",
+                "Reflector: {} ({}) down_delay: {} up_delay: {}",
                 target.peer(),
-                target.protocol(),
+                target.protocol_name(),
                 down_delta,
                 up_delta
             );
@@ -807,7 +807,7 @@ impl SqmaLaw {
             _ => None,
         });
         let missing_timing =
-            one_way.is_none() && !matches!(event.target, MeasurementTarget::IcmpEcho(_));
+            one_way.is_none() && !matches!(event.target, MeasurementTarget::IcmpEcho { .. });
         if missing_timing || rejection.is_some() {
             // A delayed observation must not invalidate more recent history.
             if rejection != Some(OneWayRejection::OutOfOrder)

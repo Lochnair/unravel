@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use crate::law::LawKind;
-use crate::measurement::model::MeasurementProtocol;
+use crate::measurement::model::MeasurementTarget;
 use config::{Config, ConfigError, Environment};
 use log::Level;
 use serde::{Deserialize, Deserializer, de};
@@ -132,25 +132,6 @@ impl FromStr for ObservabilityProtocol {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, UciSection)]
-pub(crate) struct ReflectorDefinition {
-    pub(crate) host: String,
-    pub(crate) country: Option<String>,
-    pub(crate) protocols: Vec<MeasurementProtocol>,
-    pub(crate) irtt_port: Option<u16>,
-    #[allow(dead_code)]
-    pub(crate) irtt_hmac: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReflectorRow {
-    host: String,
-    country: Option<String>,
-    protocols: String,
-    irtt_port: Option<u16>,
-    irtt_hmac: Option<String>,
-}
-
 #[derive(Clone, Debug, Deserialize, UciConfig)]
 #[uci(package = "unravel")]
 pub(crate) struct Settings {
@@ -235,8 +216,7 @@ impl Settings {
                 .separator("__")
                 .try_parsing(true)
                 .list_separator(",")
-                .with_list_parse_key("reflectors.files")
-                .with_list_parse_key("reflectors.countries"),
+                .with_list_parse_key("reflectors.files"),
         );
         Self::from_config(builder.build()?)
     }
@@ -319,17 +299,15 @@ impl NetworkSettings {
 }
 
 #[derive(Clone, Debug, Deserialize, UciSection)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct ReflectorSettings {
+    /// JSON pools, each an array of measurement targets.
     #[serde(deserialize_with = "deserialize_reflector_files")]
     pub(crate) files: Vec<String>,
-    pub(crate) countries: Vec<String>,
 
+    /// Inline targets, joined by the pool files' targets once loaded.
     #[uci(sections = "reflector")]
-    pub(crate) entries: Vec<ReflectorDefinition>,
-
-    #[uci(sections = "bootstrap_reflector")]
-    pub(crate) bootstrap: Vec<ReflectorDefinition>,
+    pub(crate) entries: Vec<MeasurementTarget>,
 
     pub(crate) num_reflectors: u8,
     pub(crate) num_candidates: usize,
@@ -339,73 +317,52 @@ pub(crate) struct ReflectorSettings {
 impl ReflectorSettings {
     fn load_files(&mut self) -> Result<(), ConfigError> {
         for path in &self.files {
-            let mut reader = csv::Reader::from_path(path)
-                .map_err(|error| ConfigError::Message(error.to_string()))?;
-            for row in reader.deserialize::<ReflectorRow>() {
-                let row = row.map_err(|error| ConfigError::Message(error.to_string()))?;
-                let protocols = row
-                    .protocols
-                    .split(['|', ';'])
-                    .map(str::trim)
-                    .filter(|protocol| !protocol.is_empty())
-                    .map(MeasurementProtocol::from_str)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| ConfigError::Message(error.to_string()))?;
-                if protocols.is_empty() {
-                    return Err(ConfigError::Message(format!(
-                        "reflector row in {path} has no protocols"
-                    )));
-                }
-                self.entries.push(ReflectorDefinition {
-                    host: row.host,
-                    country: row.country,
-                    protocols,
-                    irtt_port: row.irtt_port,
-                    irtt_hmac: row.irtt_hmac,
-                });
-            }
+            let pool = std::fs::read(path).map_err(|error| {
+                ConfigError::Message(format!("reading reflector pool {path}: {error}"))
+            })?;
+            let targets: Vec<MeasurementTarget> =
+                serde_json::from_slice(&pool).map_err(|error| {
+                    ConfigError::Message(format!("parsing reflector pool {path}: {error}"))
+                })?;
+            self.entries.extend(targets);
         }
-
         Ok(())
     }
 }
 
 impl Default for ReflectorSettings {
     fn default() -> Self {
-        let icmp = |host: &str| ReflectorDefinition {
-            host: host.to_owned(),
-            country: None,
-            protocols: vec![
-                MeasurementProtocol::IcmpEcho,
-                MeasurementProtocol::IcmpTimestamps,
-            ],
-            irtt_port: None,
-            irtt_hmac: None,
-        };
-
-        let irtt = |host: &str, country: Option<&str>| ReflectorDefinition {
-            host: host.to_owned(),
-            country: country.map(str::to_owned),
-            protocols: vec![MeasurementProtocol::Irtt],
-            irtt_port: Some(2112),
-            irtt_hmac: None,
-        };
-
         Self {
-            files: vec!["/etc/unravel/reflectors.csv".into()],
-            countries: Vec::new(),
+            files: Vec::new(),
             entries: Vec::new(),
-            bootstrap: vec![
-                irtt("global.irtt.lochnair.net", None),
-                icmp("9.9.9.9"),
-                icmp("94.140.14.14"),
-                icmp("74.82.42.42"),
-            ],
             num_reflectors: 5,
             num_candidates: 3,
             candidate_period: 3.0,
         }
     }
+}
+
+// Each `config reflector` section is one target; serde enforces which
+// options its protocol takes.
+#[cfg(all(feature = "uci", unix))]
+impl uci_schema::UciSectionSchema for MeasurementTarget {
+    const UCI_OPTIONS: &'static [uci_schema::UciOptionMapping] = &[
+        uci_schema::UciOptionMapping {
+            uci_option: "protocol",
+            config_field: "protocol",
+        },
+        uci_schema::UciOptionMapping {
+            uci_option: "endpoint",
+            config_field: "endpoint",
+        },
+        uci_schema::UciOptionMapping {
+            uci_option: "authentication",
+            config_field: "authentication",
+        },
+    ];
+    const UCI_EXTERNAL_OPTIONS: &'static [&'static str] = &[];
+    const UCI_PASSTHROUGH_KEY: Option<&'static str> = None;
+    const UCI_REPEATED: &'static [uci_schema::UciRepeatedSectionMapping] = &[];
 }
 
 // `use_syslog` is read by the OpenWrt init script, which uses it to decide

@@ -177,18 +177,18 @@ impl IcmpDriver {
                 anyhow::anyhow!("ICMP sequence space exhausted for {}", target.peer())
             })?;
         let correlation = match target {
-            MeasurementTarget::IcmpTimestamps(_) => {
+            MeasurementTarget::IcmpTimestamps { .. } => {
                 ClockSample::<Realtime>::now().as_time_since_midnight() as u64
             }
             _ => fastrand::u64(..),
         };
         let packet = match target {
-            MeasurementTarget::IcmpEcho(_) => Icmpv4Packet::with_echo_request(
+            MeasurementTarget::IcmpEcho { .. } => Icmpv4Packet::with_echo_request(
                 self.identifier,
                 sequence,
                 correlation.to_be_bytes().to_vec(),
             )?,
-            MeasurementTarget::IcmpTimestamps(_) => {
+            MeasurementTarget::IcmpTimestamps { .. } => {
                 let originate = correlation as u32;
                 Icmpv4Packet::with_timestamp_request(self.identifier, sequence, originate, 0, 0)?
             }
@@ -284,7 +284,7 @@ impl IcmpDriver {
                     });
                 }
 
-                let key = (MeasurementTarget::IcmpEcho(peer), sequence);
+                let key = (MeasurementTarget::IcmpEcho { endpoint: peer }, sequence);
                 if self
                     .inflight
                     .get(&key)
@@ -344,7 +344,10 @@ impl IcmpDriver {
                     ));
                 }
 
-                let key = (MeasurementTarget::IcmpTimestamps(peer), sequence);
+                let key = (
+                    MeasurementTarget::IcmpTimestamps { endpoint: peer },
+                    sequence,
+                );
                 if self
                     .inflight
                     .get(&key)

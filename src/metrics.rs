@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::measurement::model::{MeasurementProtocol, MeasurementRole};
+use crate::measurement::model::{MeasurementRole, MeasurementTarget};
 use crate::runtime::Direction;
 use crate::settings::Settings;
 use crate::settings::{ObservabilityProtocol, ObservabilitySettings};
@@ -118,7 +118,7 @@ pub enum Metric {
     /// One reply, sent by the measurement engine whatever law runs.
     Ping {
         reflector: IpAddr,
-        protocol: MeasurementProtocol,
+        protocol: &'static str,
         role: MeasurementRole,
         rtt: f64,
         /// Raw one-way times in ms (up, down), when the protocol has them.
@@ -127,7 +127,7 @@ pub enum Metric {
     /// One lost probe, sent by the measurement engine.
     Loss {
         reflector: IpAddr,
-        protocol: MeasurementProtocol,
+        protocol: &'static str,
         role: MeasurementRole,
     },
     /// A rate applied to the shaper, sent by the runtime when it is set.
@@ -159,25 +159,24 @@ pub enum Metric {
 
 impl Metric {
     pub fn ping(
-        reflector: IpAddr,
-        protocol: MeasurementProtocol,
+        target: &MeasurementTarget,
         role: MeasurementRole,
         rtt: f64,
         one_way: Option<(f64, f64)>,
     ) -> Self {
         Metric::Ping {
-            reflector,
-            protocol,
+            reflector: target.peer(),
+            protocol: target.protocol_name(),
             role,
             rtt,
             one_way,
         }
     }
 
-    pub fn loss(reflector: IpAddr, protocol: MeasurementProtocol, role: MeasurementRole) -> Self {
+    pub fn loss(target: &MeasurementTarget, role: MeasurementRole) -> Self {
         Metric::Loss {
-            reflector,
-            protocol,
+            reflector: target.peer(),
+            protocol: target.protocol_name(),
             role,
         }
     }

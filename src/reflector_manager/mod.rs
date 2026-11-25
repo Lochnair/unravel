@@ -3,36 +3,32 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod evidence;
-mod inventory;
+pub mod inventory;
 use crate::{
     error::ChannelClosed,
     measurement::{
-        model::{MeasurementEvent, MeasurementProtocol, MeasurementRole, MeasurementTarget},
+        model::{MeasurementEvent, MeasurementRole, MeasurementTarget},
         plan::{AppliedState, MeasurementAssignment, MeasurementPlan},
         scheduler::{ProbeSchedule, evenly_spaced_offset},
     },
     metrics::{Metric, MetricsSender},
-    settings::Settings,
+    settings::ReflectorSettings,
 };
 use evidence::{Assessment, Evidence, Qualifications, WINDOW};
-use inventory::{InventoryGroup, InventoryTarget, discover};
+use inventory::InventoryGroup;
 use log::{debug, info, warn};
 use std::{
-    collections::HashSet,
-    future::Future,
+    mem::discriminant,
     net::IpAddr,
-    pin::Pin,
     time::{Duration, Instant},
 };
 use tokio::sync::{broadcast, watch};
 
-// Preference only breaks ties within a class's RTT shortlist.
-const PROTOCOLS: &[MeasurementProtocol] = &[
-    #[cfg(feature = "irtt")]
-    MeasurementProtocol::Irtt,
-    MeasurementProtocol::IcmpTimestamps,
-    MeasurementProtocol::IcmpEcho,
-];
+/// Protocol preference is the target's variant order, and only breaks ties
+/// within a class's RTT shortlist.
+fn same_protocol(a: &MeasurementTarget, b: &MeasurementTarget) -> bool {
+    discriminant(a) == discriminant(b)
+}
 
 const POLICY_INTERVAL: Duration = Duration::from_secs(30);
 // A target fails once it has been continuously unhealthy for this long. Actives
@@ -51,8 +47,8 @@ enum Class {
 impl Class {
     fn of(target: &MeasurementTarget) -> Self {
         match target {
-            MeasurementTarget::IcmpEcho(_) => Self::Echo,
-            MeasurementTarget::IcmpTimestamps(_) | MeasurementTarget::Irtt { .. } => {
+            MeasurementTarget::IcmpEcho { .. } => Self::Echo,
+            MeasurementTarget::IcmpTimestamps { .. } | MeasurementTarget::Irtt { .. } => {
                 Self::Directional
             }
         }
@@ -99,18 +95,18 @@ struct Live {
 
 /// One live target as this pass's selection sees it.
 struct Seat<'a> {
-    entry: &'a InventoryTarget,
+    entry: &'a MeasurementTarget,
     failed: bool,
     quality: Qualifications,
 }
 
 impl Seat<'_> {
     fn class(&self) -> Class {
-        Class::of(&self.entry.target)
+        Class::of(self.entry)
     }
 
     fn ip(&self) -> IpAddr {
-        self.entry.target.peer()
+        self.entry.peer()
     }
 }
 
@@ -137,7 +133,7 @@ impl Live {
 
     fn assess<'a>(
         &mut self,
-        entry: &'a InventoryTarget,
+        entry: &'a MeasurementTarget,
         period: Duration,
         applied: &AppliedState,
         now: Instant,
@@ -145,7 +141,7 @@ impl Live {
         let status = applied
             .targets
             .iter()
-            .find(|s| s.assignment.target == entry.target);
+            .find(|s| s.assignment.target == *entry);
         let Assessment { unhealthy, quality } =
             self.evidence.assess(now, self.entered_at, period, status);
         self.unhealthy_since = unhealthy.then(|| self.unhealthy_since.unwrap_or(now));
@@ -171,10 +167,10 @@ enum Source {
     Candidate(usize),
 }
 
-struct RankEntry {
+struct RankEntry<'a> {
     source: Source,
     baseline: ClassRtt,
-    preference: usize,
+    target: &'a MeasurementTarget,
 }
 
 /// The slot's active reflector as the improvement pass sees it.
@@ -262,11 +258,11 @@ fn select_promotions(
 }
 
 /// The candidate that should replace the slot's active reflector, if any outranks it.
-fn select_replacement(
+fn select_replacement<'a>(
     slot: usize,
-    active: Option<&Seat>,
+    active: Option<&Seat<'a>>,
     kind: PromotionKind,
-    candidates: &[Option<Seat>],
+    candidates: &[Option<Seat<'a>>],
     active_ips: &[Option<IpAddr>],
     rng: &mut fastrand::Rng,
 ) -> Option<usize> {
@@ -280,14 +276,14 @@ fn select_replacement(
             .enumerate()
             .any(|(other, held)| other != slot && *held == Some(ip))
     };
-    let rank_entry = |source, seat: &Seat| {
+    let rank_entry = |source, seat: &Seat<'a>| {
         Some(RankEntry {
             source,
             baseline: ClassRtt {
                 class: seat.class(),
                 rtt: kind.rtt(seat.quality)?,
             },
-            preference: seat.entry.preference,
+            target: seat.entry,
         })
     };
 
@@ -317,25 +313,24 @@ fn rank(mut pool: Vec<RankEntry>, rng: &mut fastrand::Rng) -> Option<Source> {
         .rtt
         .saturating_add(Duration::from_millis(5).max(best.rtt / 5));
     pool.retain(|e| e.baseline.class == best.class && e.baseline.rtt <= ceiling);
-    let preference = pool.iter().map(|e| e.preference).min()?;
-    pool.retain(|e| e.preference == preference);
+    // Only the preferred variant is taken from the minimum; endpoints and
+    // credentials never decide.
+    let preferred = pool.iter().map(|e| e.target).min()?;
+    pool.retain(|e| same_protocol(e.target, preferred));
     if pool.iter().any(|e| e.source == Source::Active) {
         return Some(Source::Active);
     }
     Some(pool[rng.usize(..pool.len())].source)
 }
 
-type PoolDiscovery = Pin<Box<dyn Future<Output = anyhow::Result<Vec<InventoryTarget>>> + Send>>;
-
 /// Selection owns desired slots and current evidence; the engine owns execution.
 pub struct ReflectorManager {
-    inventory: Vec<InventoryTarget>,
+    inventory: Vec<MeasurementTarget>,
     groups: Vec<InventoryGroup>,
     next_group: usize,
     active: Vec<Option<Live>>,
     candidates: Vec<Option<Live>>,
     next_policy_at: Instant,
-    pool_discovery: Option<PoolDiscovery>,
     active_period: Duration,
     candidate_period: Duration,
     rng: fastrand::Rng,
@@ -350,41 +345,39 @@ pub struct ReflectorManager {
 }
 
 impl ReflectorManager {
-    pub async fn new(
-        settings: &Settings,
+    /// `inventory` comes from [`inventory::build`].
+    pub fn new(
+        inventory: Vec<MeasurementTarget>,
+        reflectors: &ReflectorSettings,
         active_period: Duration,
         desired: watch::Sender<MeasurementPlan>,
         applied: watch::Receiver<AppliedState>,
         measurements: broadcast::Receiver<MeasurementEvent>,
         metrics: MetricsSender,
     ) -> anyhow::Result<Self> {
-        let reflectors = &settings.reflectors;
-        let mut inventory = discover(&reflectors.bootstrap, &[]).await?;
-        let (entries, countries) = (reflectors.entries.clone(), reflectors.countries.clone());
-        let pool = async move { discover(&entries, &countries).await };
-        let pool_discovery = if inventory.is_empty() || reflectors.num_candidates == 0 {
-            inventory::merge(&mut inventory, pool.await?)?;
-            None
-        } else {
-            Some(Box::pin(pool) as PoolDiscovery)
-        };
-        anyhow::ensure!(
-            !inventory.is_empty(),
-            "no usable reflectors with protocols supported by this build"
-        );
+        debug_assert!(inventory.windows(2).all(|pair| pair[0] < pair[1]));
         let now = Instant::now();
         let mut rng = fastrand::Rng::new();
-        let groups = inventory::groups(&inventory, &mut rng);
-        let mut startup = (0..inventory.len()).collect::<Vec<_>>();
-        // Keep bootstrap peers first within each protocol preference.
-        startup.sort_by_key(|&i| inventory[i].preference);
-        let mut peers = HashSet::new();
-        startup.retain(|&i| peers.insert(inventory[i].target.peer()));
+        let mut groups = inventory::groups(&inventory, &mut rng);
+        // Start from the most preferred protocols, one target per IP. The
+        // usual passes replace any that turn out unreachable or slow.
         let slots = reflectors.num_reflectors as usize;
-        if startup.len() > slots {
-            warn!("Configured startup set exceeds num_reflectors; selecting {slots} peers");
-        } else if startup.len() < slots {
-            warn!("Inventory cannot fill all active slots with distinct peers");
+        let mut startup: Vec<usize> = Vec::with_capacity(slots);
+        for group in &mut groups {
+            while startup.len() < slots
+                && let Some(target) = group.deal(&mut rng, |target| {
+                    let ip = inventory[target].peer();
+                    startup.iter().all(|&held| inventory[held].peer() != ip)
+                })
+            {
+                startup.push(target);
+            }
+        }
+        if startup.len() < slots {
+            warn!(
+                "Inventory has {} distinct reflector IPs for {slots} active slots",
+                startup.len()
+            );
         }
         let mut manager = Self {
             inventory,
@@ -395,7 +388,6 @@ impl ReflectorManager {
                 .collect(),
             candidates: (0..reflectors.num_candidates).map(|_| None).collect(),
             next_policy_at: now + POLICY_INTERVAL,
-            pool_discovery,
             active_period,
             candidate_period: Duration::from_secs_f64(reflectors.candidate_period),
             rng,
@@ -445,11 +437,11 @@ impl ReflectorManager {
         } in select_promotions(&active, &candidates, periodic, &mut self.rng)
         {
             let next = self.candidates[candidate].take().unwrap().enter(now);
-            let entry = &self.inventory[next.inventory].target;
+            let entry = &self.inventory[next.inventory];
             let peer = entry.peer();
             info!(
                 "Promoting {peer} ({}) into active slot {slot}: {}",
-                entry.protocol(),
+                entry.protocol_name(),
                 kind.reason()
             );
             self.metrics.send(Metric::event(
@@ -479,11 +471,11 @@ impl ReflectorManager {
                     .is_none_or(|live| live.failed(now)))
                 && let Some(target) = self.next_target(&seen)
             {
-                let entry = &self.inventory[target].target;
+                let entry = &self.inventory[target];
                 info!(
                     "Exploring {} ({}) in candidate slot {slot}",
                     entry.peer(),
-                    entry.protocol()
+                    entry.protocol_name()
                 );
                 self.metrics.send(Metric::event(
                     "reflector_explored",
@@ -503,41 +495,24 @@ impl ReflectorManager {
 
     /// Round-robin across protocol groups, each a shuffled deck.
     fn next_target(&mut self, excluded: &[usize]) -> Option<usize> {
-        for _ in 0..self.groups.len() {
-            let group_index = self.next_group;
-            self.next_group = (self.next_group + 1) % self.groups.len();
-            let group = &mut self.groups[group_index];
-            if group.targets.is_empty() {
-                continue;
-            }
-            if group.cursor >= group.targets.len() {
-                self.rng.shuffle(&mut group.targets);
-                group.cursor = 0;
-            }
-            for _ in 0..group.targets.len() {
-                // Finish this scan before reshuffling, so every target is
-                // visited even when the scan crosses the end of the deck.
-                let target = group.targets[group.cursor % group.targets.len()];
-                group.cursor += 1;
-                if !excluded.contains(&target)
-                    && !self
-                        .active
-                        .iter()
-                        .chain(&self.candidates)
-                        .flatten()
-                        .any(|a| a.inventory == target)
-                {
-                    return Some(target);
-                }
+        let live = |target| {
+            self.active
+                .iter()
+                .chain(&self.candidates)
+                .flatten()
+                .any(|live| live.inventory == target)
+        };
+        let groups = self.groups.len();
+        for _ in 0..groups {
+            let group = &mut self.groups[self.next_group];
+            self.next_group = (self.next_group + 1) % groups;
+            if let Some(target) = group.deal(&mut self.rng, |target| {
+                !excluded.contains(&target) && !live(target)
+            }) {
+                return Some(target);
             }
         }
         None
-    }
-
-    fn accept_pool(&mut self, discovered: Vec<InventoryTarget>) -> anyhow::Result<()> {
-        inventory::merge(&mut self.inventory, discovered)?;
-        self.groups = inventory::groups(&self.inventory, &mut self.rng);
-        Ok(())
     }
 
     fn observe(&mut self, event: MeasurementEvent) {
@@ -547,7 +522,7 @@ impl ReflectorManager {
             .iter_mut()
             .chain(&mut self.candidates)
             .flatten()
-            .find(|live| inventory[live.inventory].target == event.target)
+            .find(|live| inventory[live.inventory] == event.target)
         {
             live.evidence.record(event);
         }
@@ -566,7 +541,7 @@ impl ReflectorManager {
             for (slot, live) in slots.iter().enumerate() {
                 let Some(live) = live else { continue };
                 assignments.push(MeasurementAssignment {
-                    target: self.inventory[live.inventory].target.clone(),
+                    target: self.inventory[live.inventory].clone(),
                     role,
                     schedule: ProbeSchedule {
                         period,
@@ -600,17 +575,6 @@ impl ReflectorManager {
         loop {
             let mut refresh = false;
             tokio::select! {
-                pool = async {
-                    match &mut self.pool_discovery {
-                        Some(discovery) => discovery.await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    self.pool_discovery = None;
-                    if let Err(error) = pool.and_then(|pool| self.accept_pool(pool)) {
-                        warn!("Reflector pool discovery failed: {error}");
-                    }
-                },
                 event = self.measurements.recv() => match event {
                     Ok(event) => self.observe(event),
                     Err(broadcast::error::RecvError::Lagged(count)) => {

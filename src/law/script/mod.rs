@@ -68,7 +68,7 @@ pub(super) struct Measurement {
     /// The IP, or `ip:port` for IRTT, where one IP can serve several
     /// endpoints. With `protocol` it identifies the target.
     pub reflector: String,
-    pub protocol: String,
+    pub protocol: &'static str,
     /// `"active"` or `"candidate"`.
     pub role: &'static str,
     /// When the probe was sent; `t` is when it completed.
@@ -209,13 +209,13 @@ impl ScriptCtx<'_> {
 
     /// The reflectors currently probed as active, as `(reflector, protocol)`
     /// in the same form measurements carry.
-    pub fn active_reflectors(&self) -> Vec<(String, String)> {
+    pub fn active_reflectors(&self) -> Vec<(String, &'static str)> {
         self.law
             .applied
             .borrow()
             .active_targets()
             .iter()
-            .map(|target| (target.name(), target.protocol().to_string()))
+            .map(|target| (target.name(), target.protocol_name()))
             .collect()
     }
 }
@@ -411,7 +411,7 @@ fn measurement(event: &MeasurementEvent, ctx: &LawContext, sent: f64, t: f64) ->
     };
     Measurement {
         reflector: event.target.name(),
-        protocol: event.target.protocol().to_string(),
+        protocol: event.target.protocol_name(),
         role,
         sent,
         t,

@@ -2,8 +2,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use serde::Deserialize;
-use std::str::FromStr;
+use serde::{Deserialize, Deserializer};
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -11,55 +10,30 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "kebab-case")]
-pub enum MeasurementProtocol {
-    IcmpEcho,
-    IcmpTimestamps,
-    Irtt,
-}
-
-impl fmt::Display for MeasurementProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MeasurementProtocol::IcmpEcho => write!(f, "icmp-echo"),
-            MeasurementProtocol::IcmpTimestamps => write!(f, "icmp-timestamps"),
-            MeasurementProtocol::Irtt => write!(f, "irtt"),
-        }
-    }
-}
-
-impl FromStr for MeasurementProtocol {
-    type Err = ParseMeasurementProtocolError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "icmp-echo" => Ok(MeasurementProtocol::IcmpEcho),
-            "icmp-timestamps" => Ok(MeasurementProtocol::IcmpTimestamps),
-            "irtt" => Ok(MeasurementProtocol::Irtt),
-            _ => Err(ParseMeasurementProtocolError(s.to_owned())),
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("invalid measurement protocol: {0}")]
-pub struct ParseMeasurementProtocolError(String);
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Declared, and numbered, in protocol preference order: within a class's RTT
+/// shortlist the lowest discriminant wins. `Irtt` declares `endpoint` before
+/// `authentication`, so definitions of one endpoint sort next to each other.
+#[derive(Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(tag = "protocol", rename_all = "kebab-case", deny_unknown_fields)]
+#[repr(u8)]
 pub enum MeasurementTarget {
-    IcmpEcho(Ipv4Addr),
-    IcmpTimestamps(Ipv4Addr),
     Irtt {
         endpoint: SocketAddr,
+        #[serde(default, deserialize_with = "nonblank")]
         authentication: Option<Arc<str>>,
-    },
+    } = 0,
+    IcmpTimestamps {
+        endpoint: Ipv4Addr,
+    } = 1,
+    IcmpEcho {
+        endpoint: Ipv4Addr,
+    } = 2,
 }
 
 impl MeasurementTarget {
     pub fn peer(&self) -> IpAddr {
         match self {
-            Self::IcmpEcho(peer) | Self::IcmpTimestamps(peer) => (*peer).into(),
+            Self::IcmpEcho { endpoint } | Self::IcmpTimestamps { endpoint } => (*endpoint).into(),
             Self::Irtt { endpoint, .. } => endpoint.ip(),
         }
     }
@@ -77,20 +51,27 @@ impl MeasurementTarget {
         }
     }
 
-    pub fn protocol(&self) -> MeasurementProtocol {
+    /// The external protocol label, as configuration spells it.
+    pub fn protocol_name(&self) -> &'static str {
         match self {
-            Self::IcmpEcho(_) => MeasurementProtocol::IcmpEcho,
-            Self::IcmpTimestamps(_) => MeasurementProtocol::IcmpTimestamps,
-            Self::Irtt { .. } => MeasurementProtocol::Irtt,
+            Self::Irtt { .. } => "irtt",
+            Self::IcmpTimestamps { .. } => "icmp-timestamps",
+            Self::IcmpEcho { .. } => "icmp-echo",
         }
     }
 }
 
+/// A blank key means an unauthenticated session; any other is kept byte for byte.
+fn nonblank<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Arc<str>>, D::Error> {
+    Ok(Option::<Arc<str>>::deserialize(deserializer)?.filter(|key| !key.trim().is_empty()))
+}
+
+// Never derived: authentication keys stay out of logs and errors.
 impl fmt::Debug for MeasurementTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Irtt { endpoint, .. } => write!(f, "irtt({endpoint})"),
-            _ => write!(f, "{}({})", self.protocol(), self.peer()),
+            _ => write!(f, "{}({})", self.protocol_name(), self.peer()),
         }
     }
 }

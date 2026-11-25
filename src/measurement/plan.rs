@@ -36,7 +36,7 @@ impl MeasurementPlan {
             Instant::now().checked_add(self.active_interval).is_some(),
             "active interval overflows monotonic clock"
         );
-        let mut endpoints = HashSet::new();
+        let mut targets = HashSet::new();
         for assignment in &self.assignments {
             assignment.schedule.validate()?;
             anyhow::ensure!(
@@ -50,16 +50,14 @@ impl MeasurementPlan {
                     .is_some(),
                 "probe period overflows monotonic clock"
             );
-            let endpoint = match &assignment.target {
-                MeasurementTarget::Irtt { endpoint, .. } => {
-                    anyhow::ensure!(cfg!(feature = "irtt"), "IRTT feature is disabled");
-                    anyhow::ensure!(endpoint.port() != 0, "IRTT port must be nonzero");
-                    *endpoint
-                }
-                _ => std::net::SocketAddr::new(assignment.target.peer(), 0),
-            };
             anyhow::ensure!(
-                endpoints.insert((endpoint, assignment.target.protocol())),
+                cfg!(feature = "irtt")
+                    || !matches!(assignment.target, MeasurementTarget::Irtt { .. }),
+                "IRTT feature is disabled"
+            );
+            // The inventory rejects conflicting credentials for one endpoint.
+            anyhow::ensure!(
+                targets.insert(&assignment.target),
                 "duplicate measurement target"
             );
         }

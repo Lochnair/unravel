@@ -14,7 +14,7 @@ use crate::measurement::{
 };
 use crate::metrics::{Metric, Metrics, MetricsSender};
 use crate::platform::Platform;
-use crate::reflector_manager::ReflectorManager;
+use crate::reflector_manager::{self, ReflectorManager};
 use crate::runtime::{Direction, Runtime};
 use crate::settings::Settings;
 use ::log::{error, info};
@@ -53,8 +53,12 @@ pub(crate) struct App {
 }
 
 impl App {
-    pub(crate) async fn prepare(settings: Settings, instance: &str) -> anyhow::Result<Self> {
+    pub(crate) async fn prepare(mut settings: Settings, instance: &str) -> anyhow::Result<Self> {
         settings.validate()?;
+        // Checked before the previous run's statistics are replaced. Moved
+        // out, so the settings copies below do not carry the pool.
+        let inventory =
+            reflector_manager::inventory::build(std::mem::take(&mut settings.reflectors.entries))?;
         if settings.dry_run {
             info!("*** MONITORING MODE ACTIVE — qdisc rates will NOT be changed ***");
         }
@@ -171,14 +175,14 @@ impl App {
             settings.dry_run,
         );
         let manager = ReflectorManager::new(
-            &settings,
+            inventory,
+            &settings.reflectors,
             cadence.probe,
             plan_tx,
             applied_rx,
             manager_measurements,
             metrics.clone(),
-        )
-        .await?;
+        )?;
 
         Ok(Self {
             runtime,

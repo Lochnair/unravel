@@ -2,147 +2,90 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use super::PROTOCOLS;
-use crate::{
-    measurement::model::{MeasurementProtocol, MeasurementTarget},
-    settings::ReflectorDefinition,
-};
+use super::same_protocol;
+use crate::measurement::model::MeasurementTarget;
 use log::warn;
-use std::{collections::HashMap, net::SocketAddr};
 
-pub(super) struct InventoryTarget {
-    pub target: MeasurementTarget,
-    pub preference: usize,
-    country: Option<String>,
-}
-
-impl InventoryTarget {
-    pub fn key(&self) -> (SocketAddr, MeasurementProtocol) {
-        let endpoint = match &self.target {
-            MeasurementTarget::Irtt { endpoint, .. } => *endpoint,
-            target => SocketAddr::new(target.peer(), 0),
-        };
-        (endpoint, self.target.protocol())
+/// The targets this build can measure, sorted and so grouped by protocol in
+/// preference order. Runs before anything else starts, and never changes after.
+pub fn build(mut targets: Vec<MeasurementTarget>) -> anyhow::Result<Vec<MeasurementTarget>> {
+    anyhow::ensure!(
+        !targets.is_empty(),
+        "no reflectors are configured: add reflectors.entries or pool files"
+    );
+    targets.sort_unstable();
+    targets.dedup();
+    // Sorting places the definitions of one IRTT endpoint next to each other,
+    // and after dedup any two of them differ in authentication.
+    if let Some(pair) = targets.windows(2).find(|pair| {
+        matches!(
+            pair,
+            [
+                MeasurementTarget::Irtt { endpoint: a, .. },
+                MeasurementTarget::Irtt { endpoint: b, .. },
+            ] if a == b
+        )
+    }) {
+        anyhow::bail!("conflicting authentication for reflector {:?}", pair[0]);
     }
-
-    pub fn merge(&mut self, other: Self) -> anyhow::Result<()> {
-        let same_country = match (&self.country, &other.country) {
-            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-            _ => true,
-        };
-        anyhow::ensure!(
-            same_country && self.target == other.target,
-            "conflicting reflector definitions for {:?}",
-            other.target
-        );
-        if self.country.is_none() {
-            self.country = other.country;
+    if !cfg!(feature = "irtt") {
+        let configured = targets.len();
+        targets.retain(|target| !matches!(target, MeasurementTarget::Irtt { .. }));
+        let skipped = configured - targets.len();
+        if skipped > 0 {
+            warn!("Skipping {skipped} IRTT reflectors: this build has no IRTT support");
         }
-        Ok(())
+    }
+    anyhow::ensure!(
+        !targets.is_empty(),
+        "no configured reflectors use a protocol this build supports"
+    );
+    Ok(targets)
+}
+
+/// One protocol's targets as a shuffled deck of inventory indices.
+pub(super) struct InventoryGroup {
+    targets: Vec<usize>,
+    cursor: usize,
+}
+
+impl InventoryGroup {
+    /// The next target in the deck that `eligible` accepts. A scan finishes
+    /// before the deck is reshuffled, so every target is visited even when the
+    /// scan crosses the end of the deck.
+    pub fn deal(
+        &mut self,
+        rng: &mut fastrand::Rng,
+        eligible: impl Fn(usize) -> bool,
+    ) -> Option<usize> {
+        if self.cursor >= self.targets.len() {
+            rng.shuffle(&mut self.targets);
+            self.cursor = 0;
+        }
+        for _ in 0..self.targets.len() {
+            let target = self.targets[self.cursor % self.targets.len()];
+            self.cursor += 1;
+            if eligible(target) {
+                return Some(target);
+            }
+        }
+        None
     }
 }
 
-pub(super) struct InventoryGroup {
-    pub targets: Vec<usize>,
-    pub cursor: usize,
-}
-
+/// Groups in the inventory's protocol preference order.
 pub(super) fn groups(
-    inventory: &[InventoryTarget],
+    inventory: &[MeasurementTarget],
     rng: &mut fastrand::Rng,
 ) -> Vec<InventoryGroup> {
-    (0..PROTOCOLS.len())
-        .map(|preference| {
-            let mut targets = inventory
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| entry.preference == preference)
-                .map(|(i, _)| i)
-                .collect::<Vec<_>>();
+    let mut start = 0;
+    inventory
+        .chunk_by(same_protocol)
+        .map(|chunk| {
+            let mut targets = (start..start + chunk.len()).collect::<Vec<_>>();
+            start += chunk.len();
             rng.shuffle(&mut targets);
             InventoryGroup { targets, cursor: 0 }
         })
         .collect()
-}
-
-pub(super) async fn discover(
-    definitions: &[ReflectorDefinition],
-    countries: &[String],
-) -> anyhow::Result<Vec<InventoryTarget>> {
-    let mut inventory: Vec<InventoryTarget> = Vec::new();
-    let mut indices: HashMap<(SocketAddr, MeasurementProtocol), usize> = HashMap::new();
-    for definition in definitions {
-        if !countries.is_empty()
-            && definition.country.as_ref().is_some_and(|country| {
-                !countries
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(country))
-            })
-        {
-            continue;
-        }
-        for (preference, &protocol) in PROTOCOLS.iter().enumerate() {
-            if !definition.protocols.contains(&protocol) {
-                continue;
-            }
-            let port = if protocol == MeasurementProtocol::Irtt {
-                definition.irtt_port.unwrap_or(2112)
-            } else {
-                0
-            };
-            let endpoints = match tokio::net::lookup_host((definition.host.as_str(), port)).await {
-                Ok(endpoints) => endpoints,
-                Err(error) => {
-                    warn!("Failed to resolve reflector {}: {error}", definition.host);
-                    continue;
-                }
-            };
-            for endpoint in endpoints {
-                let target = match (protocol, endpoint.ip()) {
-                    (MeasurementProtocol::IcmpEcho, std::net::IpAddr::V4(peer)) => {
-                        MeasurementTarget::IcmpEcho(peer)
-                    }
-                    (MeasurementProtocol::IcmpTimestamps, std::net::IpAddr::V4(peer)) => {
-                        MeasurementTarget::IcmpTimestamps(peer)
-                    }
-                    (MeasurementProtocol::Irtt, _) => MeasurementTarget::Irtt {
-                        endpoint,
-                        authentication: definition
-                            .irtt_hmac
-                            .as_deref()
-                            .filter(|key| !key.trim().is_empty())
-                            .map(Into::into),
-                    },
-                    _ => continue,
-                };
-                let entry = InventoryTarget {
-                    target,
-                    preference,
-                    country: definition.country.clone(),
-                };
-                if let Some(&index) = indices.get(&entry.key()) {
-                    inventory[index].merge(entry)?;
-                } else {
-                    indices.insert(entry.key(), inventory.len());
-                    inventory.push(entry);
-                }
-            }
-        }
-    }
-    Ok(inventory)
-}
-
-pub(super) fn merge(
-    inventory: &mut Vec<InventoryTarget>,
-    discovered: Vec<InventoryTarget>,
-) -> anyhow::Result<()> {
-    for entry in discovered {
-        if let Some(existing) = inventory.iter_mut().find(|old| old.key() == entry.key()) {
-            existing.merge(entry)?;
-        } else {
-            // Append only: live measurements retain their inventory identity.
-            inventory.push(entry);
-        }
-    }
-    Ok(())
 }

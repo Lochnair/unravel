@@ -33,7 +33,7 @@ apk update
 apk add unravel
 ```
 
-The package includes the binary, reflector inventory, UCI configuration and init script. Edit `/etc/config/unravel` before starting the service.
+The package includes the binary, UCI configuration and init script. Edit `/etc/config/unravel` before starting the service.
 
 The feed only publishes APK packages. For older OpenWrt releases using opkg, build an `.ipk` with the SDK below.
 
@@ -86,7 +86,7 @@ cd unravel
 cargo build --release --locked
 sudo install -m 755 target/release/unravel /usr/sbin/unravel
 sudo mkdir -p /etc/unravel
-sudo install -m 644 reflectors.csv /etc/unravel/reflectors.csv
+sudo install -m 644 dist/unravel.toml /etc/unravel/wan.toml
 ```
 
 For a TOML-only build with IRTT support, run `cargo build --release --locked --no-default-features --features toml,irtt`.
@@ -125,7 +125,7 @@ To cap either shaper, set `download_max_percent` or `upload_max_percent` to at l
 
 ### TOML
 
-For a manual install, put the equivalent settings for `wan` in `/etc/unravel/wan.toml`.
+For a manual install, put the equivalent settings for `wan` in `/etc/unravel/wan.toml`. [dist/unravel.toml](dist/unravel.toml) has these settings and the default reflectors.
 
 ```toml
 dry_run = false
@@ -166,16 +166,15 @@ config law
 
 config reflectors
     option instance 'wan2'
-    list files '/etc/unravel/wan2-reflectors.csv'
-    list countries 'NO'
+    list files '/etc/unravel/wan2-reflectors.json'
 
-config bootstrap_reflector
+config reflector
     option instance 'wan2'
-    option host 'global.irtt.lochnair.net'
-    list protocols 'irtt'
+    option protocol 'irtt'
+    option endpoint '192.0.2.10:2112'
 ```
 
-Each subordinate section needs an `option instance` naming its owner. It can appear anywhere in the file and can be anonymous. Each instance can have one `law`, `reflectors`, `output` and `observability` section. Missing sections and options use built-in defaults. Use as many `reflector` and `bootstrap_reflector` sections as needed for each instance. Different instances can independently point to the same CSV or Lua file.
+Each subordinate section needs an `option instance` naming its owner. It can appear anywhere in the file and can be anonymous. Each instance can have one `law`, `reflectors`, `output` and `observability` section. Missing sections and options use built-in defaults. Use as many `reflector` sections as needed for each instance. Different instances can independently point to the same reflector pool or Lua file.
 
 Invalid instance names, duplicate section names, unknown section types and missing or invalid ownership links make the UCI package invalid. Duplicate singleton sections and invalid options within owned sections prevent the owning instance from starting.
 
@@ -352,24 +351,42 @@ At startup the script logs the largest packet size it will use for each directio
 
 unRAVEL selects reflectors and protocols automatically, preferring IRTT and ICMP timestamps so it can measure upload and download delay separately. If there aren't enough healthy directional reflectors, it can fall back to ICMP echo and switch back when they recover. Echo uses round-trip measurements, so it can't separate upload and download delay.
 
-unRAVEL starts with the built-in bootstrap hosts by default. After that, the reflector manager tries hosts from the combined bootstrap and configured inventory, replacing failed reflectors and looking for better ones. By default it uses up to five active reflectors and probes three candidates in the background, each every three seconds. SQMA uses the active set for rate control.
+At startup unRAVEL picks its active reflectors from the inventory at random, IRTT first, then ICMP timestamps, then ICMP echo, using each IP address at most once. After that, the reflector manager tries other reflectors from the inventory, replacing failed ones and looking for better ones. By default it uses up to five active reflectors and probes three candidates in the background, each every three seconds. SQMA uses the active set for rate control.
 
-You can change these with `num_reflectors`, `num_candidates` and `candidate_period` under `reflectors` (`config reflectors` in UCI). `candidate_period` is in seconds. Set `num_candidates` to `0` to keep the startup set fixed and turn off protocol switching. With multiple active reflectors you'll need at least two candidate slots for switching to work.
+You can change these with `num_reflectors`, `num_candidates` and `candidate_period` under `reflectors` (`config reflectors` in UCI). `candidate_period` is in seconds. Set `num_candidates` to `0` to keep the startup set fixed and turn off protocol switching. To choose that set yourself, configure only the reflectors you want. With multiple active reflectors you'll need at least two candidate slots for switching to work.
 
-Reflector entries declare their supported protocols: `icmp-timestamps`, `icmp-echo` or `irtt`. ICMP measurements use IPv4; IRTT supports IPv4 and IPv6, and its client is built into the default binary.
+Each reflector is one protocol at one address: `icmp-timestamps` or `icmp-echo` at an IPv4 address, or `irtt` at an IPv4 or IPv6 address with its port. To measure one host with several protocols, list it once per protocol. Host names aren't supported. The IRTT client is built into the default binary. A build without it skips IRTT reflectors with a warning.
 
-You can add your own reflectors with `[[reflectors.entries]]` in TOML or repeated `config reflector` sections in UCI:
+The shipped [UCI](dist/openwrt/unravel.config) and [TOML](dist/unravel.toml) configurations list a few anycast reflectors, one per network: IRTT, plus ICMP timestamps and echo at each ICMP host. unRAVEL has no built-in reflectors, so an instance without any won't start.
+
+The inventory combines these inline reflectors with any JSON pool files listed in `files`. A pool file is an array of reflectors:
+
+```json
+[
+    {"protocol": "icmp-timestamps", "endpoint": "9.9.9.9"},
+    {"protocol": "icmp-echo", "endpoint": "9.9.9.9"},
+    {"protocol": "irtt", "endpoint": "[2001:db8::1]:2112", "authentication": "example-key"}
+]
+```
+
+Inline reflectors use the same fields, with `[[reflectors.entries]]` in TOML or repeated `config reflector` sections in UCI:
 
 ```uci
 config reflector
     option instance 'wan'
-    option host 'global.irtt.lochnair.net'
-    list protocols 'irtt'
+    option protocol 'irtt'
+    option endpoint '192.0.2.10:2112'
 ```
 
-This adds to the instance’s CSV inventory. Use `config bootstrap_reflector` with the same fields, or `[[reflectors.bootstrap]]` in TOML, to replace the built-in bootstrap list for that instance. To skip file loading and use the built-in bootstrap hosts plus any inline entries, use `[reflectors]` with `files = []` in TOML, or a `config reflectors` section with `option files 'none'` in UCI. UCI drops empty string options, so `option files ''` won't disable file loading.
+```toml
+[[reflectors.entries]]
+protocol = "irtt"
+endpoint = "192.0.2.10:2112"
+```
 
-To load a different CSV file in UCI, use `list files '/path/to/reflectors.csv'` under `config reflectors`. For IRTT entries, absent or blank `irtt_hmac` values use unauthenticated sessions.
+Add pool files with `files = ["/path/to/pool.json"]` in TOML, or `list files '/path/to/pool.json'` in the `config reflectors` section in UCI. To clear files set by an earlier source, use `files = []` in TOML or `option files 'none'` in UCI.
+
+`authentication` is the IRTT HMAC key. If it's absent or blank, the session is unauthenticated. Listing the same reflector more than once is fine, but two IRTT entries for one endpoint with different keys are an error. unRAVEL never logs the key.
 
 unRAVEL checks directional timestamps before passing the results to the control law. If the router's clock jumps, SQMA drops to the configured minimum rates for five seconds while queues drain, then rebuilds its delay baselines. A timing change at one reflector only resets that reflector's baseline in SQMA.
 

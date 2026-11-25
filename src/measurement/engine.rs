@@ -50,9 +50,8 @@ pub struct MeasurementEngine {
 impl MeasurementEngine {
     /// Raw one-way times are kept, including ones integrity rejected.
     fn publish_metric(&self, event: &MeasurementEvent, role: MeasurementRole) {
-        let (peer, protocol) = (event.target.peer(), event.target.protocol());
         let metric = match event.outcome {
-            MeasurementOutcome::Loss => Metric::loss(peer, protocol, role),
+            MeasurementOutcome::Loss => Metric::loss(&event.target, role),
             MeasurementOutcome::Reply { one_way, .. } => {
                 let Some(rtt_ms) = event.rtt_ms() else {
                     return;
@@ -63,7 +62,7 @@ impl MeasurementEngine {
                         o.downlink.as_secs_f64() * 1000.0,
                     )
                 });
-                Metric::ping(peer, protocol, role, rtt_ms, one_way)
+                Metric::ping(&event.target, role, rtt_ms, one_way)
             }
         };
         self.metrics.send(metric);
@@ -163,7 +162,7 @@ impl MeasurementEngine {
 
     fn is_ready(&self, target: &MeasurementTarget) -> bool {
         match target {
-            MeasurementTarget::IcmpEcho(_) | MeasurementTarget::IcmpTimestamps(_) => {
+            MeasurementTarget::IcmpEcho { .. } | MeasurementTarget::IcmpTimestamps { .. } => {
                 self.icmp_status[target]
             }
             #[cfg(feature = "irtt")]
@@ -259,7 +258,7 @@ impl MeasurementEngine {
         }
         for target in due.drain(..) {
             match &target {
-                MeasurementTarget::IcmpEcho(_) | MeasurementTarget::IcmpTimestamps(_) => {
+                MeasurementTarget::IcmpEcho { .. } | MeasurementTarget::IcmpTimestamps { .. } => {
                     match self.icmp.poll_send(&target, cx) {
                         Poll::Ready(Ok(accepted_at)) => {
                             self.scheduler.committed(&target, accepted_at);
