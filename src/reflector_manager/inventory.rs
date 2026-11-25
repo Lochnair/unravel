@@ -13,6 +13,14 @@ pub fn build(mut targets: Vec<MeasurementTarget>) -> anyhow::Result<Vec<Measurem
         !targets.is_empty(),
         "no reflectors are configured: add reflectors.entries or pool files"
     );
+    if !cfg!(feature = "irtt") {
+        let configured = targets.len();
+        targets.retain(|target| !matches!(target, MeasurementTarget::Irtt { .. }));
+        let skipped = configured - targets.len();
+        if skipped > 0 {
+            warn!("Skipping {skipped} IRTT reflectors: this build has no IRTT support");
+        }
+    }
     targets.sort_unstable();
     targets.dedup();
     // Sorting places the definitions of one IRTT endpoint next to each other,
@@ -27,14 +35,6 @@ pub fn build(mut targets: Vec<MeasurementTarget>) -> anyhow::Result<Vec<Measurem
         )
     }) {
         anyhow::bail!("conflicting authentication for reflector {:?}", pair[0]);
-    }
-    if !cfg!(feature = "irtt") {
-        let configured = targets.len();
-        targets.retain(|target| !matches!(target, MeasurementTarget::Irtt { .. }));
-        let skipped = configured - targets.len();
-        if skipped > 0 {
-            warn!("Skipping {skipped} IRTT reflectors: this build has no IRTT support");
-        }
     }
     anyhow::ensure!(
         !targets.is_empty(),

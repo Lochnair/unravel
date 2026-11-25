@@ -2,12 +2,14 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+#[cfg(feature = "irtt")]
 use crate::measurement::model::MeasurementTarget;
 use crate::settings::ReflectorSettings;
 
 use super::{NetworkSettings, ObservabilitySettings, OutputSettings, Settings};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+#[cfg(feature = "irtt")]
 use std::net::IpAddr;
 
 const WARN_DOWNLOAD_MIN_KBITS: f64 = 1_000.0;
@@ -239,6 +241,8 @@ impl ReflectorSettings {
             );
         }
         // The inventory owns duplicates and conflicts; these are per target.
+        // Builds without IRTT skip its targets, so they go unchecked there.
+        #[cfg(feature = "irtt")]
         for target in &self.entries {
             let MeasurementTarget::Irtt { endpoint, .. } = target else {
                 continue;
