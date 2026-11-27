@@ -2,6 +2,14 @@
 
 These steps are for upgrading to `master`. If you're using a package from the OpenWrt feed, check its source revision and use the configuration for that build. [OpenWrt package recipe](https://github.com/Lochnair/openwrt-feeds/blob/main/net/unravel/Makefile)
 
+## Upgrading a named-instance OpenWrt configuration
+
+Keep `/etc/config/unravel` and its owned sections. The updated OpenWrt package converts that file to temporary per-instance JSON when applying the service. Install the daemon, init script and converter together. Standalone invocations use `--config /path/to/instance.json`, the optional per-instance TOML, or environment variables.
+
+Configuration errors in any enabled instance reject a service apply, including explicit restart. Fix the reported option before applying again. Check misspelled and obsolete options in JSON, TOML and environment overrides as well as UCI. `enabled` on an instance and `use_syslog` on its output section accept the standard true and false forms. An invalid value now fails the apply.
+
+For downstream OpenWrt packages, remove the `uci` Cargo feature from `RUST_PKG_FEATURES` and keep the selected IRTT, Lua and ubus features. Install [the converter](dist/openwrt/unravel-uci.uc) as executable `/usr/libexec/unravel-uci.uc` alongside the updated init script. Add `+ucode +ucode-mod-uci +ucode-mod-fs` to the package dependencies. Keep `/etc/config/unravel` as a conffile and ship the existing ubus ACL. If the recipe still installs the old CSV reflector file, update it for the current reflector format. LuCI versions that already support named instances and owned sections use the same UCI layout and ubus methods.
+
 ## Moving from sqm-autorate-rust
 
 The package and executable are now called `unravel`, and the OpenWrt service is `/etc/init.d/unravel`. OpenWrt won't upgrade across the package rename by itself. Back up your settings and reflector list, then stop and disable the old service before removing the old package and installing `unravel`.

@@ -22,7 +22,7 @@ mod settings;
 mod status;
 mod time;
 
-use crate::app::App;
+use crate::app::{App, ValidatedConfig};
 use crate::platform::warn_platform_limitations;
 use crate::settings::{Settings, valid_instance_name};
 use std::{path::PathBuf, process::ExitCode, time::Duration};
@@ -34,8 +34,18 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> anyhow::Result<ExitCode> {
-    let instance = match parse_args(std::env::args().skip(1))? {
-        Mode::Run(instance) => instance,
+    let (instance, config) = match parse_args(std::env::args().skip(1))? {
+        Mode::Run {
+            instance,
+            config,
+            check,
+        } => {
+            if check {
+                ValidatedConfig::new(Settings::load(&instance, config.as_deref())?)?;
+                return Ok(ExitCode::SUCCESS);
+            }
+            (instance, config)
+        }
         Mode::ConfigSchema(script) => {
             println!("{}", law::config_schema_json(&script)?);
             return Ok(ExitCode::SUCCESS);
@@ -48,11 +58,14 @@ fn main() -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let settings = Settings::load(&instance)?;
+        let settings = Settings::load(&instance, config.as_deref())?;
         ::log::set_max_level(settings.output.log_level.to_level_filter());
         warn_platform_limitations();
 
-        App::prepare(settings, &instance).await?.run().await
+        App::prepare(ValidatedConfig::new(settings)?, &instance)
+            .await?
+            .run()
+            .await
     });
     // Dropping the runtime would wait forever for blocking work; anything
     // still stuck after the timeout is left behind.
@@ -67,20 +80,25 @@ fn main() -> anyhow::Result<ExitCode> {
     })
 }
 
-const USAGE: &str = "usage: unravel --instance <name> | unravel --config-schema --script <path>";
+const USAGE: &str = "usage: unravel --instance <name> [--config <path>] [--check-config] | unravel --config-schema --script <path>";
 
 enum Mode {
     /// Run the named instance.
-    Run(String),
+    Run {
+        instance: String,
+        config: Option<PathBuf>,
+        check: bool,
+    },
     /// Print the options a script law declares, and exit.
     ConfigSchema(PathBuf),
 }
 
-/// Either `--instance <name>`, or `--config-schema --script <path>`. Values
-/// can also follow an `=`.
+/// Option values can also follow an `=`.
 fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Mode> {
     let mut instance = None;
     let mut script = None;
+    let mut config = None;
+    let mut check = false;
     let mut config_schema = false;
     while let Some(arg) = args.next() {
         if arg == "--config-schema" {
@@ -88,10 +106,17 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Mode> {
             config_schema = true;
             continue;
         }
+        if arg == "--check-config" {
+            anyhow::ensure!(!check, "--check-config given more than once");
+            check = true;
+            continue;
+        }
         let (flag, slot) = if arg.starts_with("--instance") {
             ("--instance", &mut instance)
         } else if arg.starts_with("--script") {
             ("--script", &mut script)
+        } else if arg.starts_with("--config") {
+            ("--config", &mut config)
         } else {
             anyhow::bail!("Unexpected argument {arg:?}; {USAGE}");
         };
@@ -106,16 +131,20 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Mode> {
         *slot = Some(value);
     }
 
-    match (instance, script, config_schema) {
-        (None, Some(script), true) => Ok(Mode::ConfigSchema(PathBuf::from(script))),
-        (Some(name), None, false) => {
+    match (instance, script, config_schema, config, check) {
+        (None, Some(script), true, None, false) => Ok(Mode::ConfigSchema(PathBuf::from(script))),
+        (Some(name), None, false, config, check) => {
             anyhow::ensure!(
                 valid_instance_name(&name),
                 "Instance name {name:?} must be letters, digits and underscores"
             );
-            Ok(Mode::Run(name))
+            Ok(Mode::Run {
+                instance: name,
+                config: config.map(PathBuf::from),
+                check,
+            })
         }
-        (None, None, false) => anyhow::bail!("Missing instance name; {USAGE}"),
-        _ => anyhow::bail!("--config-schema takes --script and no --instance; {USAGE}"),
+        (None, None, false, _, _) => anyhow::bail!("Missing instance name; {USAGE}"),
+        _ => anyhow::bail!("Invalid argument combination; {USAGE}"),
     }
 }

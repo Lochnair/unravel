@@ -33,7 +33,7 @@ apk update
 apk add unravel
 ```
 
-The package includes the binary, UCI configuration and init script. Edit `/etc/config/unravel` before starting the service.
+The package includes the daemon, UCI configuration, init script and ucode converter. Edit `/etc/config/unravel` before starting the service.
 
 The feed only publishes APK packages. For older OpenWrt releases using opkg, build an `.ipk` with the SDK below.
 
@@ -72,7 +72,7 @@ apk add --allow-untrusted /tmp/unravel*.apk
 
 ### Building with Cargo
 
-For other Linux systems, use a current stable Rust toolchain. The default build reads TOML and UCI configuration files, supports IRTT and bundles Lua 5.1. It also includes ubus status support. On Debian or Ubuntu, install the build dependencies first.
+For other Linux systems, use a current stable Rust toolchain. The default build reads JSON and TOML configuration files, supports IRTT and bundles Lua 5.1. It also includes ubus status support. On Debian or Ubuntu, install the build dependencies first.
 
 ```sh
 sudo apt install build-essential
@@ -89,17 +89,25 @@ sudo mkdir -p /etc/unravel
 sudo install -m 644 dist/unravel.toml /etc/unravel/wan.toml
 ```
 
-For a TOML-only build with IRTT support, run `cargo build --release --locked --no-default-features --features toml,irtt`.
+For a build with JSON, TOML and IRTT support only, run `cargo build --release --locked --no-default-features --features toml,irtt`.
 
 ## Configuration
 
-On OpenWrt, edit `/etc/config/unravel`. If you use `uci set`, run `uci commit unravel` before restarting the service so it reads the updated file. If you're upgrading an existing installation, start with the [migration guide](MIGRATION.md).
+unRAVEL merges an explicit JSON file supplied with `--config <path>`, the optional `/etc/unravel/<instance>.toml` on builds with TOML support, and environment overrides in that order. For example, `UNRAVEL__NETWORK__UPLOAD_INTERFACE=wan` overrides the corresponding setting in both files. The JSON file must exist when supplied. It uses the same tables and option names as the [TOML example](dist/unravel.toml), and the instance name comes from `--instance`.
 
-For an instance named `wan`, unRAVEL reads its settings from UCI first, then applies `/etc/unravel/wan.toml` on builds with TOML support. Environment variables override both, for example `UNRAVEL__NETWORK__UPLOAD_INTERFACE=wan`.
+To check the merged configuration before starting an instance, run:
+
+```sh
+unravel --instance wan --config /path/to/wan.json --check-config
+```
+
+A successful check exits with status zero. The check validates application and selected-law settings, script options and cadence, and loads and validates reflector pools. It leaves interfaces, shaping, statistics, law state and ubus alone. Script-law checking evaluates the top-level Lua chunk in the normal sandbox, with its instruction limit. It does not invoke the law's runtime callbacks or establish that the configured interfaces and CAKE qdiscs exist.
 
 ### UCI
 
-Set your interface names and bandwidths in `/etc/config/unravel`.
+On OpenWrt, set your interface names and rates in `/etc/config/unravel`. If you use `uci set`, run `uci commit unravel` before applying changes. The init script generates private JSON files under `/var/run/unravel-config` and validates all enabled instances before submitting the new service configuration. A configuration error leaves the previous service running. The managed service and its preflight use a clean environment. If you are upgrading, see the [migration guide](MIGRATION.md).
+
+Use `/etc/init.d/unravel reload` to apply UCI changes. procd reloads instances whose generated JSON or service options changed. Use `/etc/init.d/unravel restart` after changing the contents of referenced Lua scripts, reflector pools or optional TOML overrides. Those files are checked during preflight, while procd watches the generated JSON for instance changes. Each JSON file is replaced by an atomic rename. Publication across multiple files and the procd update are separate operations.
 
 ```uci
 config instance 'wan'
@@ -176,9 +184,9 @@ config reflector
 
 Each subordinate section needs an `option instance` naming its owner. It can appear anywhere in the file and can be anonymous. Each instance can have one `law`, `reflectors`, `output` and `observability` section. Missing sections and options use built-in defaults. Use as many `reflector` sections as needed for each instance. Different instances can independently point to the same reflector pool or Lua file.
 
-Invalid instance names, duplicate section names, unknown section types and missing or invalid ownership links make the UCI package invalid. Duplicate singleton sections and invalid options within owned sections prevent the owning instance from starting.
+Invalid instance names, unknown section types, missing or invalid ownership links, duplicate owned singleton sections, and invalid `enabled` or `use_syslog` values reject the package. Repeated named declarations and empty scalar options follow libuci semantics. Unknown application options and invalid script options reject the configuration of an enabled instance and prevent the batch from being applied.
 
-On Linux, set `measurement_bind_device` on an instance if you need to bind its probes to a particular interface. To start the second WAN manually, run `/usr/sbin/unravel --instance wan2`. With TOML support, its override file is `/etc/unravel/wan2.toml`.
+On Linux, set `measurement_bind_device` on an instance if you need to bind its probes to a particular interface. For a standalone second instance, use `unravel --instance wan2 --config /path/to/wan2.json`, or supply `/etc/unravel/wan2.toml` on a build with TOML support.
 
 ## Running it
 

@@ -1,71 +1,120 @@
 #!/bin/sh /etc/rc.common
-# shellcheck disable=SC2034,SC3043
+# SPDX-License-Identifier: MPL-2.0
+# shellcheck shell=ash disable=SC2034,SC3043
 USE_PROCD=1
 START=97
 STOP=4
 
 PROG=/usr/sbin/unravel
-SERVICE_NAME="unravel"
+CONVERTER=/usr/libexec/unravel-uci.uc
+UCI_FILE=/etc/config/unravel
+RUNDIR=/var/run/unravel-config
 
 service_triggers() {
-    procd_add_reload_trigger "$SERVICE_NAME"
+    procd_add_reload_trigger unravel
 }
 
-# Prints 1 or 0 for a UCI boolean, or $2 if it is unset or unrecognised.
-bool_to_int() {
-    case "$1" in
-        1|true|yes|y|on|enabled) echo 1 ;;
-        0|false|no|n|off|disabled) echo 0 ;;
-        *) echo "$2" ;;
-    esac
-}
+apply_config() (
+    local action="$1" stage instance syslog target status payload remaining
 
-# Prints the section part of each section of type $1: the name of a named
-# section, `@type[n]` for an anonymous one.
-sections_of_type() {
-    uci -q show "$SERVICE_NAME" |
-        sed -n "s/^${SERVICE_NAME}\.\([^.=]*\)=$1\$/\1/p"
-}
+    # procd.sh uses this descriptor for all service operations, including stop.
+    # Require the lock even if the platform helper only logged a failure.
+    flock 1000 || exit 1
+    cd / || exit 1
+    umask 077
+    [ -d "$RUNDIR" ] || mkdir "$RUNDIR" || exit 1
+    [ ! -L "$RUNDIR" ] && [ -O "$RUNDIR" ] && chmod 700 "$RUNDIR" || exit 1
+    stage=$(mktemp -d "$RUNDIR/.stage.XXXXXXXX") || exit 1
+    trap 'rm -rf "$stage"' EXIT
+    trap 'exit 1' HUP INT TERM
 
-start_instance() {
-    local section="$1" outputs="$2"
-    local enabled output owner syslog_out
+    "$CONVERTER" "$UCI_FILE" "$stage" > "$stage/manifest" || exit 1
+    while IFS=' ' read -r instance syslog; do
+        case "$instance" in ''|*[!a-zA-Z0-9_]*) exit 1 ;; esac
+        case "$syslog" in 0|1) ;; *) exit 1 ;; esac
+        target="$RUNDIR/$instance.json"
+        [ ! -L "$target" ] && { [ ! -e "$target" ] || [ -f "$target" ]; } || exit 1
+        # Use the same working directory and clean environment as the daemon.
+        if ! /usr/bin/env -i "$PROG" --instance "$instance" \
+            --config "$stage/$instance.json" --check-config; then
+            echo "unravel: configuration check failed for instance $instance" >&2
+            exit 1
+        fi
+    done < "$stage/manifest"
 
-    case "$section" in
-        ''|*[!a-zA-Z0-9_]*)
-            logger -t "$SERVICE_NAME" "instance section '$section' requires an explicit name"
-            return 0
-            ;;
-    esac
+    while IFS=' ' read -r instance syslog; do
+        mv -f "$stage/$instance.json" "$RUNDIR/$instance.json" || exit 1
+    done < "$stage/manifest"
 
-    enabled=$(uci -q get "${SERVICE_NAME}.${section}.enabled")
-    [ "$(bool_to_int "$enabled" 1)" = 1 ] || return 0
+    # procd's stock wrapper discards the ubus exit status. Keep it so stale
+    # files are only removed after procd accepts the new instance set.
+    # shellcheck disable=SC2329
+    _procd_ubus_call() {
+        status=1
+        payload=$(json_dump) || return
+        ubus call service "$1" "$payload"
+        status=$?
+    }
 
-    for output in $outputs; do
-        owner=$(uci -q get "${SERVICE_NAME}.${output}.instance")
-        [ "$owner" = "$section" ] || continue
-        syslog_out=$(uci -q get "${SERVICE_NAME}.${output}.use_syslog")
-        break
+    if [ "$action" = restart ]; then
+        procd_kill unravel
+        # Deleting a service that has never started returns Not found.
+        [ "$status" = 0 ] || [ "$status" = 4 ] || exit 1
+        # Wait for procd to remove the old instances, including their stdio
+        # settings and any daemons still restoring their shapers.
+        remaining=7
+        while :; do
+            payload=$(ubus call service list '{"name":"unravel"}') || exit 1
+            json_load "$payload" || exit 1
+            json_is_a unravel object || break
+            if [ "$remaining" -eq 0 ]; then
+                echo 'unravel: timed out waiting for procd to stop the service' >&2
+                exit 1
+            fi
+            remaining=$((remaining - 1))
+            sleep 1
+        done
+    fi
+
+    # shellcheck disable=SC2154
+    procd_open_service unravel "$initscript"
+    while IFS=' ' read -r instance syslog; do
+        target="$RUNDIR/$instance.json"
+        procd_open_instance "$instance"
+        set -- "$PROG" --instance "$instance" --config "$target"
+        # procd preserves stdio settings across instance updates. Keep its
+        # settings fixed and make the selected routing part of the command.
+        if [ "$syslog" = 0 ]; then
+            # shellcheck disable=SC2016
+            set -- /bin/sh -c 'exec "$@" >/dev/null 2>&1' unravel "$@"
+        fi
+        procd_set_param command /usr/bin/env -i "$@"
+        procd_set_param file "$target"
+        procd_set_param respawn
+        procd_set_param stdout 1
+        procd_set_param stderr 1
+        procd_close_instance
+    done < "$stage/manifest"
+    procd_close_service set
+    [ "$status" = 0 ] || exit 1
+
+    for target in "$RUNDIR"/*.json; do
+        [ -f "$target" ] || continue
+        instance=${target##*/}
+        instance=${instance%.json}
+        case "$instance" in ''|*[!a-zA-Z0-9_]*) continue ;; esac
+        if ! grep -q "^$instance " "$stage/manifest"; then
+            rm -f "$target" || exit 1
+        fi
     done
-    syslog_out=$(bool_to_int "$syslog_out" 1)
-
-    procd_open_instance "$section"
-    procd_set_param command "$PROG" --instance "$section"
-    procd_set_param respawn
-    procd_set_param stdout "$syslog_out"
-    procd_set_param stderr "$syslog_out"
-    procd_close_instance
-}
+)
 
 start_service() {
-    local sections outputs section
+    apply_config start
+    # rc.common otherwise submits its own service set even after failure.
+    exit "$?"
+}
 
-    sections=$(sections_of_type instance)
-    outputs=$(sections_of_type output)
-    # Disable globbing for anonymous UCI selectors such as @output[0].
-    set -f
-    for section in $sections; do
-        start_instance "$section" "$outputs"
-    done
-    set +f
+restart() {
+    apply_config restart
 }

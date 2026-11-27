@@ -4,21 +4,13 @@
 
 use crate::law::LawKind;
 use crate::measurement::model::MeasurementTarget;
-use config::{Config, ConfigError, Environment};
+use anyhow::Context;
+use config::{Config, ConfigError, Environment, File, FileFormat};
 use log::Level;
 use serde::{Deserialize, Deserializer, de};
 use std::fmt::Display;
+use std::path::Path;
 use std::str::FromStr;
-use uci_derive::{UciConfig, UciSection};
-
-#[cfg(all(feature = "uci", unix))]
-use crate::settings::uci::UciSource;
-
-#[cfg(all(feature = "uci", unix))]
-pub mod uci;
-
-#[cfg(all(feature = "uci", unix))]
-pub(crate) mod uci_schema;
 mod validation;
 
 pub(crate) use validation::{
@@ -59,7 +51,7 @@ where
         type Value = bool;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a boolean, integer 0 or 1, or a UCI-compatible boolean string")
+            formatter.write_str("a boolean, integer 0 or 1, or a boolean string")
         }
 
         fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
@@ -132,46 +124,41 @@ impl FromStr for ObservabilityProtocol {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, UciConfig)]
-#[uci(package = "unravel")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Settings {
     #[serde(default, deserialize_with = "deserialize_flex_bool")]
-    #[uci(instance_option)]
     pub(crate) dry_run: bool,
 
     #[serde(default)]
-    #[uci(section)]
     pub(crate) law: LawSettings,
-
-    #[uci(section = "instance", instance)]
     pub(crate) network: NetworkSettings,
 
     #[serde(default)]
-    #[uci(section)]
     pub(crate) reflectors: ReflectorSettings,
 
     #[serde(default)]
-    #[uci(section)]
     pub(crate) output: OutputSettings,
 
     #[serde(default)]
-    #[uci(section)]
     pub(crate) observability: ObservabilitySettings,
 }
 
-// In UCI the law is chosen with `option type`, and the rest of the `law`
-// section is that law's own configuration.
-#[derive(Clone, Debug, Deserialize, UciSection)]
-#[serde(default)]
-#[uci(passthrough_key = "name")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct LawSettings {
-    #[uci(rename = "type")]
     #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) name: LawKind,
 
+    // Accept either law table so higher-priority sources can switch laws.
+    // Only the selected table is validated, with its source origins intact.
+    #[serde(rename = "sqma")]
+    _sqma: de::IgnoredAny,
+    #[serde(rename = "script")]
+    _script: de::IgnoredAny,
+
     /// The selected law's own table, `law.<name>`, left for the law to read.
     #[serde(skip)]
-    #[uci(skip)]
     pub(crate) config: Option<config::Value>,
 }
 
@@ -179,37 +166,56 @@ impl Default for LawSettings {
     fn default() -> Self {
         Self {
             name: LawKind::Sqma,
+            _sqma: de::IgnoredAny,
+            _script: de::IgnoredAny,
             config: None,
         }
     }
 }
 
 impl Settings {
-    /// Loads UCI, TOML and environment settings for the named instance.
-    pub(crate) fn load(instance: &str) -> Result<Self, ConfigError> {
+    pub(crate) fn load(instance: &str, json: Option<&Path>) -> anyhow::Result<Self> {
         Self::load_from(
             instance,
-            std::path::Path::new("/etc/config"),
-            std::path::Path::new("/etc/unravel"),
+            json,
+            Path::new("/etc/unravel"),
             Environment::with_prefix("UNRAVEL"),
         )
     }
 
     fn load_from(
         _instance: &str,
-        _uci_dir: &std::path::Path,
-        _toml_dir: &std::path::Path,
+        json: Option<&Path>,
+        _toml_dir: &Path,
         environment: Environment,
-    ) -> Result<Self, ConfigError> {
-        let builder = Config::builder();
-
-        #[cfg(all(feature = "uci", unix))]
-        let builder = builder.add_source(UciSource::from_schema::<Self>(_instance, _uci_dir));
+    ) -> anyhow::Result<Self> {
+        let mut builder = Config::builder();
+        if let Some(path) = json {
+            // File::from can fall back to a different filename. Read the exact
+            // path, with strict UTF-8, when one is explicitly supplied.
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("Reading JSON configuration {}", path.display()))?;
+            let source = Config::builder()
+                .add_source(File::from_str(&text, FileFormat::Json))
+                .build()
+                .map_err(|error| {
+                    // config-rs may include a scalar JSON root in its error.
+                    let detail = match error {
+                        ConfigError::FileParse { cause, .. } => cause
+                            .downcast_ref::<serde_json::Error>()
+                            .map_or_else(|| "expected an object".to_owned(), ToString::to_string),
+                        _ => "could not load JSON".to_owned(),
+                    };
+                    anyhow::anyhow!("Invalid JSON configuration {}: {detail}", path.display())
+                })?;
+            builder = builder.add_source(source);
+        }
 
         #[cfg(feature = "toml")]
-        let builder = builder.add_source(
-            config::File::from(_toml_dir.join(format!("{_instance}.toml"))).required(false),
-        );
+        {
+            let path = _toml_dir.join(format!("{_instance}.toml"));
+            builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(false));
+        }
 
         let builder = builder.add_source(
             environment
@@ -218,7 +224,7 @@ impl Settings {
                 .list_separator(",")
                 .with_list_parse_key("reflectors.files"),
         );
-        Self::from_config(builder.build()?)
+        Self::from_config(builder.build()?).map_err(Into::into)
     }
 
     fn from_config(config: Config) -> Result<Self, ConfigError> {
@@ -237,10 +243,8 @@ impl Settings {
     }
 }
 
-// `enabled` is read by the OpenWrt init script, which starts only the
-// instances that are not disabled.
-#[derive(Clone, Debug, Deserialize, UciSection)]
-#[uci(external = "enabled")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct NetworkSettings {
     pub(crate) download_interface: String,
     pub(crate) upload_interface: String,
@@ -300,7 +304,7 @@ impl NetworkSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, UciSection)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct ReflectorSettings {
     /// JSON pools, each an array of measurement targets.
@@ -308,7 +312,6 @@ pub(crate) struct ReflectorSettings {
     pub(crate) files: Vec<String>,
 
     /// Inline targets, joined by the pool files' targets once loaded.
-    #[uci(sections = "reflector")]
     pub(crate) entries: Vec<MeasurementTarget>,
 
     pub(crate) num_reflectors: u8,
@@ -344,34 +347,8 @@ impl Default for ReflectorSettings {
     }
 }
 
-// Each `config reflector` section is one target; serde enforces which
-// options its protocol takes.
-#[cfg(all(feature = "uci", unix))]
-impl uci_schema::UciSectionSchema for MeasurementTarget {
-    const UCI_OPTIONS: &'static [uci_schema::UciOptionMapping] = &[
-        uci_schema::UciOptionMapping {
-            uci_option: "protocol",
-            config_field: "protocol",
-        },
-        uci_schema::UciOptionMapping {
-            uci_option: "endpoint",
-            config_field: "endpoint",
-        },
-        uci_schema::UciOptionMapping {
-            uci_option: "authentication",
-            config_field: "authentication",
-        },
-    ];
-    const UCI_EXTERNAL_OPTIONS: &'static [&'static str] = &[];
-    const UCI_PASSTHROUGH_KEY: Option<&'static str> = None;
-    const UCI_REPEATED: &'static [uci_schema::UciRepeatedSectionMapping] = &[];
-}
-
-// `use_syslog` is read by the OpenWrt init script, which uses it to decide
-// whether procd sends stdout and stderr to syslog.
-#[derive(Clone, Debug, Deserialize, UciSection)]
-#[serde(default)]
-#[uci(external = "use_syslog")]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct OutputSettings {
     #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) log_level: Level,
@@ -392,8 +369,8 @@ impl Default for OutputSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, UciSection)]
-#[serde(default)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub(crate) struct ObservabilitySettings {
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) enabled: bool,

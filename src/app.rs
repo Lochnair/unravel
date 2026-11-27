@@ -52,27 +52,21 @@ pub(crate) struct App {
     measurement_done: watch::Receiver<bool>,
 }
 
-impl App {
-    pub(crate) async fn prepare(mut settings: Settings, instance: &str) -> anyhow::Result<Self> {
+/// Configuration shared by daemon startup and the configuration-only CLI check.
+pub(crate) struct ValidatedConfig {
+    settings: Settings,
+    inventory: Vec<crate::measurement::model::MeasurementTarget>,
+    law: Box<dyn Law>,
+    cadence: law::Cadence,
+    records: Option<mpsc::Receiver<diagnostics::DiagnosticRecord>>,
+}
+
+impl ValidatedConfig {
+    pub(crate) fn new(mut settings: Settings) -> anyhow::Result<Self> {
         settings.validate()?;
-        // Checked before the previous run's statistics are replaced. Moved
-        // out, so the settings copies below do not carry the pool.
+        // Move the inventory out so settings copies do not carry the pool.
         let inventory =
             reflector_manager::inventory::build(std::mem::take(&mut settings.reflectors.entries))?;
-        if settings.dry_run {
-            info!("*** MONITORING MODE ACTIVE — qdisc rates will NOT be changed ***");
-        }
-
-        let platform = Arc::new(Platform::default());
-        for interface in [
-            settings.network.download_interface(),
-            settings.network.upload_interface(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            platform.validate_shaper(interface)?;
-        }
 
         // The law is built first: it decides the probing and sampling cadence
         // the rest of the pipeline runs at. Its configuration is checked here,
@@ -93,6 +87,40 @@ impl App {
                 settings.law.name.as_str(),
             );
         }
+        Ok(Self {
+            settings,
+            inventory,
+            law,
+            cadence,
+            records,
+        })
+    }
+}
+
+impl App {
+    pub(crate) async fn prepare(config: ValidatedConfig, instance: &str) -> anyhow::Result<Self> {
+        let ValidatedConfig {
+            settings,
+            inventory,
+            law,
+            cadence,
+            records,
+        } = config;
+        if settings.dry_run {
+            info!("*** MONITORING MODE ACTIVE — qdisc rates will NOT be changed ***");
+        }
+
+        let platform = Arc::new(Platform::default());
+        for interface in [
+            settings.network.download_interface(),
+            settings.network.upload_interface(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            platform.validate_shaper(interface)?;
+        }
+
         let folder = Path::new(settings.output.folder.trim()).join(instance);
         let store = LawStore::new(&folder, law.name())?;
         let csv_writer = match records {

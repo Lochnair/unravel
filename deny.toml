@@ -30,7 +30,6 @@ allow = [
     "Zlib",
 ]
 
-exceptions = [{ name = "ucifer", allow = ["GPL-3.0-or-later"] }]
 
 [bans]
 multiple-versions = "warn"
