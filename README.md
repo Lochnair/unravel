@@ -95,7 +95,7 @@ For a build with JSON, TOML and IRTT support only, run `cargo build --release --
 
 Each unRAVEL process runs one instance. Pass `--instance <name>` when running or validating a configuration. The name identifies the process in logs and metrics, its output and law state directory, and its ubus object when enabled.
 
-Settings start with built-in defaults, then use the optional explicit file passed to `--config <path>`, then apply environment overrides such as `UNRAVEL__NETWORK__UPLOAD_INTERFACE=wan`. The file must exist and end in `.json` or `.toml`. JSON works in every build, and TOML requires the `toml` Cargo feature. Both formats use the same tables and option names. Choose the runtime name and configuration path independently.
+Settings come from the one file passed to `--config <path>`, with built-in defaults for any option it leaves out. The file must exist and end in `.json` or `.toml`. Values must have their own types, for example `6000` rather than `"6000"` and `true` rather than `"1"`. JSON works in every build, and TOML requires the `toml` Cargo feature. Both formats use the same tables and option names. Choose the runtime name and configuration path independently.
 
 To check the merged configuration before starting an instance, run:
 
@@ -103,7 +103,7 @@ To check the merged configuration before starting an instance, run:
 unravel --instance wan --config /path/to/wan.json --check-config
 ```
 
-A successful check exits with status zero. The check validates application and selected-law settings, script options and cadence, and loads and validates reflector pools. It leaves interfaces, shaping, statistics, law state and ubus alone. Script-law checking evaluates the top-level Lua chunk in the normal sandbox, with its instruction limit. It does not invoke the law's runtime callbacks or establish that the configured interfaces and CAKE qdiscs exist.
+A successful check exits with status zero. The check validates application and selected-law settings, script options and cadence, and loads and validates reflector pools. It leaves interfaces, shaping, statistics, law state and ubus alone. Script-law checking evaluates the top-level Lua chunk in the normal sandbox, with its instruction limit. It calls the script's `validate` hook but none of its other hooks, and doesn't establish that the configured interfaces and CAKE qdiscs exist.
 
 ### UCI
 
@@ -192,7 +192,7 @@ On Linux, set `measurement_bind_device` on an instance if you need to bind its p
 
 ## Running it
 
-To try it without changing CAKE's rates, set `option dry_run '1'` in the UCI instance section, set `dry_run = true` before any TOML table headers, or set `UNRAVEL__DRY_RUN=true`. Dry run still needs the configured interfaces and CAKE qdiscs. It sends probes and SQMA still writes its CSV files if statistics are enabled. Turn off `dry_run` when you're ready to let unRAVEL change the rates.
+To try it without changing CAKE's rates, set `option dry_run '1'` in the UCI instance section, or set `dry_run = true` before any TOML table headers. Dry run still needs the configured interfaces and CAKE qdiscs. It sends probes and SQMA still writes its CSV files if statistics are enabled. Turn off `dry_run` when you're ready to let unRAVEL change the rates.
 
 After configuring the OpenWrt package, start the service and enable it at boot:
 
@@ -312,37 +312,58 @@ If you want to keep SQMA's learned safe rates across a service restart, set `opt
 
 If you want to try your own rate control, select the `script` law in a build with Lua support. The default Cargo build includes it. The script gets probe results and traffic samples and decides when to change the rates. The example sets the shapers to their base rates and leaves them there. [examples/laws/minimal.lua](examples/laws/minimal.lua)
 
-Your script lists the options it takes in an `options` table next to `cadence`. List them in the order a settings page should show them. Before `init` runs, unRAVEL fills in the defaults, converts each value to its declared type and checks it. It doesn't start an instance whose `law` section sets an option the script doesn't list. `init` gets the checked options. An option without a value or a default is `nil`. A script that takes no options declares `options = {}`.
+Your script declares the options it takes in a `config` table next to `cadence`, each with its default. The default is also the option's type: a configured value must be a boolean, number, string, list or table like its default, and nothing is converted, so `"6"` is not a number. Before `init` runs, unRAVEL fills in the defaults for options that aren't set and checks the rest. It doesn't start an instance whose configuration sets an option the script doesn't declare. A script that takes no options can leave `config` out.
 
 ```lua
-options = {
-  { name = "delay_ms", type = "number", default = 15, above = 0,
-    label = "Delay threshold", unit = "ms" },
-  { name = "adaptive", type = "boolean", default = true },
-  { name = "mode", type = "string", choices = { "fast", "steady" }, required = true },
+config = {
+  delay_ms = 15,
+  adaptive = true,
+  mode = "fast",
+  hosts = { "a.example" },
+  download = { delay_ms = 30, enabled = true },
+  peers = { { host = "a.example", port = 2112 } },
 },
 ```
 
-Each option has a `name` and a `type`.
+- Tables nest. A table option takes only the fields its default has, and a field that isn't set keeps its default.
+- A list's first element is the template for every element of the list. Each element must have the template's type, and a table element that leaves fields out gets them from the template. Every element of the default list must fit the first one.
+- An empty default list, such as `tags = {}`, takes elements of any type.
+- An option can't default to `nil`. Use a value the script treats as unset, such as `0` or `""`, instead.
 
-- `name` is in lowercase letters, digits and underscores, starting with a letter. `instance`, `type` and `path` are taken by the `law` section.
-- `type` is `boolean`, `integer`, `number` or `string`.
+The optional `describe` table gives options JSON Schema keywords for settings pages and checks, keyed like `config`.
 
-The other fields are optional.
+```lua
+describe = {
+  delay_ms = { title = "Delay threshold", unit = "ms", exclusiveMinimum = 0 },
+  mode = { enum = { "fast", "steady" } },
+  download = { properties = { delay_ms = { maximum = 500 } } },
+  peers = { items = { properties = { port = { minimum = 1, maximum = 65535 } } } },
+},
+```
 
-- `default` must have the option's type. Use `required = true` instead to make the option mandatory.
-- Integers and numbers take `min` and `max` (inclusive), or `above` and `below` (exclusive). Integers must be whole numbers between -9007199254740991 and 9007199254740991, the range Lua holds exactly.
-- Boolean options accept `1`, `yes`, `on` or `true`, and `0`, `no`, `off` or `false`, as other UCI options do.
-- Strings take `choices`.
-- `label`, `description` and `unit` are for settings pages.
+- `title`, `description` and `unit` are for settings pages.
+- `minimum` and `maximum` (inclusive) and `exclusiveMinimum` and `exclusiveMaximum` bound number options. `enum` lists the values an option may take. unRAVEL enforces both.
+- `properties` describes the fields of a table option, and `items` the elements of a list option.
 
-Checks that involve more than one option still belong in `init`.
+unRAVEL rejects a script whose `describe` names an option it doesn't declare, uses another keyword, or puts a keyword where it can't apply, such as a bound on a string.
 
-To print a script's options as JSON, for example to build a settings page, run the following. It loads the script without starting an instance.
+For checks that involve more than one option, give the script a `validate` hook. It gets the checked options before `init`, and `--check-config` calls it too. It returns nothing when the options are fine, or a message or a list of messages.
+
+```lua
+function law:validate(config)
+  if config.download.delay_ms < config.delay_ms then
+    return "download.delay_ms must be at least delay_ms"
+  end
+end
+```
+
+To print the configuration as JSON Schema, for example to build a settings page or for editor completion, run `unravel --config-schema`. Add `--script` to include a script's options under `law.script`. It loads the script without starting an instance.
 
 ```sh
 unravel --config-schema --script /usr/share/unravel/laws/cake.lua
 ```
+
+The schema describes each option's type, default and `describe` keywords. `--check-config` applies the full validation, including the script's `validate` hook.
 
 If your script works out a delay signal, call `ctx:report_delay(direction, delay_ms, threshold_ms)` whenever it decides, so `ubus call unravel.wan status` and the LuCI status page can show it. The threshold is optional. The cake-autorate law reports its average delay and its delay threshold.
 
