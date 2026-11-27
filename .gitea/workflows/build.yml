@@ -11,14 +11,15 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Measure before stripping; the packaged copy is stripped below.
+  # Measure before stripping; package stripped copies separately.
   CARGO_PROFILE_RELEASE_STRIP: none
 
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Each target builds the release binary up to five times.
+    timeout-minutes: 120
     env:
       TARGET: ${{ matrix.target }}
     defaults:
@@ -53,12 +54,18 @@ jobs:
           echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Install Rust toolchain
+      - name: Install standard Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
         with:
           toolchain: ${{ startsWith(matrix.target, 'mips') && 'nightly' || 'stable' }}
           cache: false
           build-warnings: warn
+
+      - name: Install nightly toolchain and standard library sources
+        run: |
+          rustup toolchain install nightly \
+            --profile minimal \
+            --component rust-src
 
       - name: Install cross and binary tools
         run: |
@@ -67,7 +74,7 @@ jobs:
           cargo install --git https://github.com/cross-rs/cross --locked cross
           echo "RUST_TARGET=${TARGET%-*}-unknown-linux-${TARGET#*-}" >> "$GITHUB_ENV"
 
-      - name: Build release binary
+      - name: Build, verify, package, and compare
         env:
           # MIPS build-std lacks Rust's bundled CRT objects; use the cross GCC copies.
           RUSTFLAGS: ${{ startsWith(matrix.target, 'mips') && '-C target-feature=+crt-static -C link-self-contained=no' || '-C target-feature=+crt-static' }}
@@ -76,39 +83,188 @@ jobs:
           # Cross's per-artifact JSON capture hides compiler diagnostics.
           CROSS_REMOTE_COPY_FULL_TARGET_DIR: ${{ startsWith(matrix.target, 'mips') && 'true' || 'false' }}
         run: |
-          cross build --release --locked --target "$RUST_TARGET"
+          set -euo pipefail
 
-      - name: Verify, package, and summarize binary
-        run: |
-          binary="target/${RUST_TARGET}/release/unravel"
-          readelf --program-headers "$binary" > /tmp/program-headers.txt
-          readelf --dynamic "$binary" > /tmp/dynamic-section.txt
-          if grep -q INTERP /tmp/program-headers.txt || grep -q NEEDED /tmp/dynamic-section.txt; then
-            echo "Binary is not statically linked" >&2
-            exit 1
+          declare -A raw_size
+          declare -A stripped_size
+          declare -A compressed_size
+
+          # dist/ holds tracked sources, so stage packages elsewhere.
+          mkdir -p artifacts
+
+          # MIPS requires nightly build-std via Cross.toml.
+          # Every other standard build uses stable.
+          standard_toolchain=stable
+          if [[ "$TARGET" == mips* ]]; then
+            standard_toolchain=nightly
           fi
-          mkdir -p dist
-          stripped="dist/unravel-${TARGET}"
-          artifact="${stripped}.tar.gz"
-          cp "$binary" "$stripped"
-          llvm-strip --strip-all "$stripped"
-          # Tar preserves executable permissions when downloading the artifact.
-          tar -czf "$artifact" -C dist "unravel-${TARGET}" laws/cake.lua
 
-          size() {
-            stat -c %s "$1" | numfmt --to=iec-i --suffix=B --format='%.1f'
+          build_variant() {
+            local variant="$1"
+            local toolchain="$2"
+            shift 2
+
+            local binary="target/${RUST_TARGET}/release/unravel"
+            local directory="artifacts/${variant}"
+            local artifact="artifacts/unravel-${TARGET}-${variant}.tar.gz"
+
+            echo "::group::Build ${variant} (${toolchain})"
+
+            cross "+${toolchain}" build \
+              --release \
+              --locked \
+              --target "$RUST_TARGET" \
+              "$@"
+
+            # Reject dynamically linked executables.
+            readelf --program-headers "$binary" > /tmp/program-headers.txt
+            readelf --dynamic "$binary" > /tmp/dynamic-section.txt
+
+            if grep -q INTERP /tmp/program-headers.txt ||
+               grep -q NEEDED /tmp/dynamic-section.txt; then
+              echo "Binary is not statically linked: ${variant}" >&2
+              exit 1
+            fi
+
+            mkdir -p "$directory"
+            cp "$binary" "$directory/unravel"
+
+            raw_size[$variant]=$(stat -c %s "$binary")
+
+            llvm-strip --strip-all "$directory/unravel"
+            stripped_size[$variant]=$(stat -c %s "$directory/unravel")
+
+            # Each archive contains an executable named unravel and the CAKE law.
+            # Tar preserves executable permissions when downloading the artifact.
+            tar -czf "$artifact" \
+              -C "$directory" unravel \
+              -C "$PWD/dist" laws/cake.lua
+            compressed_size[$variant]=$(stat -c %s "$artifact")
+
+            echo "::endgroup::"
           }
+
+          human() {
+            numfmt --to=iec-i --suffix=B --format='%.1f' "$1"
+          }
+
+          # Negative means smaller than the reference binary.
+          delta() {
+            awk -v base="$1" -v current="$2" 'BEGIN {
+              if (base == 0) {
+                printf "N/A"
+              } else {
+                printf "%+.1f%%", 100 * (current - base) / base
+              }
+            }'
+          }
+
+          print_row() {
+            local variant="$1"
+            local label="$2"
+            local baseline="$3"
+            local comparison
+
+            if [[ "$variant" == "$baseline" ]]; then
+              comparison="Baseline"
+            else
+              comparison=$(delta \
+                "${compressed_size[$baseline]}" \
+                "${compressed_size[$variant]}")
+            fi
+
+            printf '| %s | %s | %s | %s | %s |\n' \
+              "$label" \
+              "$(human "${raw_size[$variant]}")" \
+              "$(human "${stripped_size[$variant]}")" \
+              "$(human "${compressed_size[$variant]}")" \
+              "$comparison"
+          }
+
+          # ---------------------------------------------------------
+          # Standard build: stable except MIPS.
+          # ---------------------------------------------------------
+
+          build_variant full "$standard_toolchain"
+
+          # ---------------------------------------------------------
+          # Nightly baseline: identical compiler for all experiments.
+          #
+          # MIPS already uses nightly for the standard build, so reuse
+          # that binary rather than compiling it twice.
+          # ---------------------------------------------------------
+
+          if [[ "$standard_toolchain" == "nightly" ]]; then
+            nightly_baseline=full
+          else
+            nightly_baseline=nightly-full
+            build_variant nightly-full nightly
+          fi
+
+          # ---------------------------------------------------------
+          # Nightly size experiments, always enabled.
+          # ---------------------------------------------------------
+
+          # Rebuild std with the ordinary std feature set.
+          build_variant rebuilt-std nightly \
+            -Z build-std
+
+          # Rebuild std without backtrace support.
+          build_variant no-backtrace nightly \
+            -Z build-std \
+            -Z build-std-features=panic-unwind
+
+          # Aggressive option: terminate immediately on panic.
+          build_variant immediate-abort nightly \
+            -Z panic-immediate-abort \
+            -Z build-std \
+            -Z build-std-features= \
+            --config 'profile.release.panic="immediate-abort"'
+
+          # ---------------------------------------------------------
+          # Job summary.
+          # ---------------------------------------------------------
+
           {
-            echo '| Target | Unstripped | Stripped | Compressed |'
-            echo '|:--|--:|--:|--:|'
-            printf '| %s | %s | %s | %s |\n' \
-              "$TARGET" "$(size "$binary")" "$(size "$stripped")" "$(size "$artifact")"
+            echo "### unravel: ${TARGET}"
+            echo
+
+            echo "#### Standard build"
+            echo
+            echo "Toolchain: \`${standard_toolchain}\`"
+            echo
+            echo '| Variant | Unstripped | Stripped | Compressed | Compressed vs baseline |'
+            echo '|:--|--:|--:|--:|--:|'
+
+            print_row full "Full" full
+
+            echo
+            echo "#### Nightly experiments"
+            echo
+            echo '| Variant | Unstripped | Stripped | Compressed | Compressed vs baseline |'
+            echo '|:--|--:|--:|--:|--:|'
+
+            print_row "$nightly_baseline" "Nightly full" "$nightly_baseline"
+            print_row rebuilt-std "Rebuilt std" "$nightly_baseline"
+            print_row no-backtrace "No backtrace" "$nightly_baseline"
+            print_row immediate-abort "Immediate abort" "$nightly_baseline"
+
+            if [[ "$standard_toolchain" == "stable" ]]; then
+              echo
+              echo "Nightly vs stable baseline (compressed): $(delta \
+                "${compressed_size[full]}" \
+                "${compressed_size[$nightly_baseline]}")"
+            else
+              echo
+              echo "MIPS: standard and nightly baselines are identical."
+              echo "Cross.toml already enables build-std for these targets."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload binary
+      - name: Upload binaries
         # Use the v3 artifact protocol supported by Gitea.
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: unravel-${{ matrix.target }}
-          path: dist/unravel-${{ matrix.target }}.tar.gz
+          path: artifacts/unravel-${{ matrix.target }}-*.tar.gz
           if-no-files-found: error
