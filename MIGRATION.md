@@ -102,6 +102,6 @@ If you wrote a script law for v0.6.0-rc1, add a `config` table next to `cadence`
 
 Options in the `law` section that the script doesn't declare now stop the instance from starting. Before, they reached the script, and `cake.lua` logged a warning and ignored them. Check the startup error for the misspelled option and where it was set.
 
-`cake.lua` options are now typed, and values must be numbers or booleans rather than strings. `*_wire_packet_bytes` now default to `0`, which reads the packet size from the interface.
+`cake.lua` options are now typed, and values must be numbers or booleans rather than strings. The per-direction options are now tables: `download_delay_ms` becomes `download.delay_ms`, and likewise for `adjust_up_delay_ms`, `adjust_down_delay_ms` and `wire_packet_bytes` in both directions. `wire_packet_bytes` now defaults to `0`, which reads the packet size from the interface.
 
 `unravel --config-schema --script <path>` now prints JSON Schema for the whole configuration, with the script's options under `properties.law.properties.script`. Update settings pages that read the old output.

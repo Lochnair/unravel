@@ -89,23 +89,31 @@ local DESCRIBE = {
     description = "Drop to the minimum rates after the reply timeout. Off upstream." },
 }
 
+-- Each direction has its own table of options, such as download.delay_ms.
 for _, d in ipairs(DIRECTIONS) do
-  local Dir = d:sub(1, 1):upper() .. d:sub(2)
-  CONFIG[d .. "_delay_ms"] = 30.0
-  CONFIG[d .. "_adjust_up_delay_ms"] = 10.0
-  CONFIG[d .. "_adjust_down_delay_ms"] = 60.0
-  -- Largest packet on the wire, MTU plus CAKE's overhead and ATM or PTM
-  -- framing. 0 reads it from the interface and its qdisc. At low rates the
-  -- time to send one raises every delay threshold and stretches the load window.
-  CONFIG[d .. "_wire_packet_bytes"] = 0
-  DESCRIBE[d .. "_delay_ms"] = { title = Dir .. " delay threshold", unit = "ms",
-    exclusiveMinimum = 0, description = "Delay over baseline that counts as a delayed reply." }
-  DESCRIBE[d .. "_adjust_up_delay_ms"] = { title = Dir .. " full-increase delay", unit = "ms",
-    minimum = 0, description = "Mean delay at or below which increases are at their largest." }
-  DESCRIBE[d .. "_adjust_down_delay_ms"] = { title = Dir .. " full-cut delay", unit = "ms",
-    minimum = 0, description = "Mean delay at or above which cuts are at their largest." }
-  DESCRIBE[d .. "_wire_packet_bytes"] = { title = Dir .. " wire packet size", unit = "bytes",
-    minimum = 0, description = "Overrides the size read from the interface and its qdisc; 0 reads it." }
+  CONFIG[d] = {
+    delay_ms = 30.0,
+    adjust_up_delay_ms = 10.0,
+    adjust_down_delay_ms = 60.0,
+    -- Largest packet on the wire, MTU plus CAKE's overhead and ATM or PTM
+    -- framing. 0 reads it from the interface and its qdisc. At low rates the
+    -- time to send one raises every delay threshold and stretches the load
+    -- window.
+    wire_packet_bytes = 0,
+  }
+  DESCRIBE[d] = {
+    title = d:sub(1, 1):upper() .. d:sub(2),
+    properties = {
+      delay_ms = { title = "Delay threshold", unit = "ms", exclusiveMinimum = 0,
+        description = "Delay over baseline that counts as a delayed reply." },
+      adjust_up_delay_ms = { title = "Full-increase delay", unit = "ms", minimum = 0,
+        description = "Mean delay at or below which increases are at their largest." },
+      adjust_down_delay_ms = { title = "Full-cut delay", unit = "ms", minimum = 0,
+        description = "Mean delay at or above which cuts are at their largest." },
+      wire_packet_bytes = { title = "Wire packet size", unit = "bytes", minimum = 0,
+        description = "Overrides the size read from the interface and its qdisc; 0 reads it." },
+    },
+  }
 end
 
 local FALLBACK_WIRE_PACKET_BYTES = 1500
@@ -156,9 +164,9 @@ end
 local function compensate(self, s)
   local c = self.config
   local extra_ms = s.wire_bits / s.rate
-  s.delay_ms = c[s.name .. "_delay_ms"] + extra_ms
-  s.adjust_up_delay_ms = c[s.name .. "_adjust_up_delay_ms"] + extra_ms
-  s.adjust_down_delay_ms = c[s.name .. "_adjust_down_delay_ms"] + extra_ms
+  s.delay_ms = c[s.name].delay_ms + extra_ms
+  s.adjust_up_delay_ms = c[s.name].adjust_up_delay_ms + extra_ms
+  s.adjust_down_delay_ms = c[s.name].adjust_down_delay_ms + extra_ms
 end
 
 local function apply(self, s, rate, ctx)
@@ -187,7 +195,7 @@ function law:init(config, ctx)
         error(string.format(
           "cake needs a maximum %s rate: set network.%s_max_percent", d, d), 0)
       end
-      local wire_bytes = self.config[d .. "_wire_packet_bytes"]
+      local wire_bytes = self.config[d].wire_packet_bytes
       local source = "set"
       if wire_bytes == 0 then
         wire_bytes, source = ctx:wire_packet_bytes(d), "detected"
