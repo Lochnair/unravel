@@ -39,7 +39,7 @@ const HISTORY_MAX_AGE_SECS: u64 = 6 * 3600;
 const HISTORY_HEADER: &str = "unravel-history 1";
 
 /// SQMA's own configuration, read from `law.sqma`.
-#[derive(Clone, Debug, Deserialize, garde::Validate)]
+#[derive(Clone, Debug, Deserialize, garde::Validate, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(crate) struct SqmaSettings {
@@ -94,14 +94,9 @@ impl Default for SqmaSettings {
 }
 
 impl SqmaSettings {
-    /// Reads the `law.sqma` table; an absent table means all defaults.
-    fn from_config(config: Option<config::Value>) -> anyhow::Result<Self> {
-        let settings = match config {
-            Some(value) => value
-                .try_deserialize::<Self>()
-                .context("Reading law.sqma settings")?,
-            None => Self::default(),
-        };
+    /// Validates the `law.sqma` table.
+    fn validated(self) -> anyhow::Result<Self> {
+        let settings = self;
         let mut report = Report::new();
         settings.validate_into(&(), &mut || Path::new("law").join("sqma"), &mut report);
         if garde::select!(report, law.sqma.high_load_level)
@@ -410,12 +405,12 @@ impl Law for SqmaLaw {
 }
 
 impl SqmaLaw {
-    /// `config` is the `law.sqma` table, if the configuration has one.
+    /// `settings` is the `law.sqma` table.
     pub fn new(
-        config: Option<config::Value>,
+        settings: SqmaSettings,
         diagnostics: Option<DiagnosticsSender>,
     ) -> anyhow::Result<Self> {
-        let settings = SqmaSettings::from_config(config)?;
+        let settings = settings.validated()?;
         let tick = settings.tick_interval;
 
         Ok(Self {

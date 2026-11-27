@@ -4,9 +4,9 @@ These steps are for upgrading to `master`. If you're using a package from the Op
 
 ## Upgrading a named-instance OpenWrt configuration
 
-Keep `/etc/config/unravel` and its owned sections. The updated OpenWrt package converts that file to temporary per-instance JSON when applying the service. Install the daemon, init script and converter together. Standalone invocations require `--instance <name>` and can use `--config` with a JSON or TOML file. Pass any previous per-instance TOML file explicitly. If you previously layered TOML on top of the OpenWrt configuration, move those settings into the owned UCI sections before upgrading.
+Keep `/etc/config/unravel` and its owned sections. The updated OpenWrt package converts that file to temporary per-instance JSON when applying the service. Install the daemon, init script and converter together. Standalone invocations require `--instance <name>` and `--config` with a JSON or TOML file. Pass any previous per-instance TOML file explicitly. If you previously layered TOML on top of the OpenWrt configuration, move those settings into the owned UCI sections before upgrading.
 
-Configuration errors in any enabled instance reject a service apply, including explicit restart. Fix the reported option before applying again. Check misspelled and obsolete options in JSON, TOML and environment overrides as well as UCI. `enabled` on an instance and `use_syslog` on its output section accept the standard true and false forms. An invalid value now fails the apply.
+Configuration errors in any enabled instance reject a service apply, including explicit restart. Fix the reported option before applying again. Check misspelled and obsolete options in JSON and TOML as well as UCI. `enabled` on an instance and `use_syslog` on its output section accept the standard true and false forms. An invalid value now fails the apply. The converter types every other option from `unravel --config-schema`, which it runs for each enabled instance, so the converter and daemon must come from the same build.
 
 For downstream OpenWrt packages, remove the `uci` Cargo feature from `RUST_PKG_FEATURES` and keep the selected IRTT, Lua and ubus features. Install [the converter](dist/openwrt/unravel-uci.uc) as executable `/usr/libexec/unravel-uci.uc` alongside the updated init script. Add `+ucode +ucode-mod-uci +ucode-mod-fs` to the package dependencies. Keep `/etc/config/unravel` as a conffile and ship the existing ubus ACL. If the recipe still installs the old CSV reflector file, update it for the current reflector format. LuCI versions that already support named instances and owned sections use the same UCI layout and ubus methods.
 
@@ -22,18 +22,22 @@ Use your old settings to fill in the new configuration. Check the option changes
 | TOML configuration | `/etc/sqm-autorate-rust/config.toml` | `/etc/unravel/<instance>.toml` |
 | Reflector inventory | `/etc/sqm-autorate-rust/reflectors.csv` | `config reflector` sections, or JSON pool files in `reflectors.files` |
 
-Update any scripts or service overrides that set environment variables. For example, `SQMA__NETWORK__DOWNLOAD_INTERFACE` becomes `UNRAVEL__NETWORK__DOWNLOAD_INTERFACE`. If you're coming from v0.4.1, add the section name as well. `SQMA_DOWNLOAD_INTERFACE` goes to the same new name.
+Environment overrides such as `SQMA__NETWORK__DOWNLOAD_INTERFACE` are no longer read. Move their values into the configuration file.
 
 ## Changing your configuration
 
-If you already run an earlier build of `unravel`, check these settings too. Unknown UCI section types and options can stop the service from starting, so remove the old keys from `/etc/config/unravel` after moving their values. Check TOML and environment overrides too.
+### Configuration files
+
+unRAVEL now reads exactly one file, named with `--config`, which is required. `UNRAVEL__*` environment overrides are gone; put those settings in the file. Values in JSON and TOML must have their own types: write `download_base_kbits = 6000`, not `"6000"`, and `dry_run = true`, not `"1"`. `reflectors.files` must be a list. Use `[]` for no pool files instead of `"none"` or an empty string. `output.log_level` and `observability.protocol` must be lowercase.
+
+If you already run an earlier build of `unravel`, check these settings too. Unknown UCI section types and options can stop the service from starting, so remove the old keys from `/etc/config/unravel` after moving their values. Check TOML too.
 
 ### Assigning an instance name and section ownership
 
 1. Replace each UCI `config network` with `config instance '<name>'`, keeping its interface and rate options. Choose a name such as `wan` for a previously anonymous instance. Names use ASCII letters, digits and underscores.
 2. Move each instance's selected `law`, `reflectors`, `output` and `observability` settings into its own sections. Add `option instance '<name>'` to each section and remove the profile reference options from the instance. If several WANs used one profile, copy its settings into a section for each owner. Each of these section types can appear at most once for a given owner.
 3. Assign every `config reflector` to an instance with `option instance '<name>'`. Copy entries to each WAN that needs them. Set reflector pool files in each WAN's owned `reflectors` section. Multiple instances may reference the same reflector pool or Lua file.
-4. Remove `advanced_settings` from UCI and TOML. Put `option dry_run '1'` or `'0'` directly in the UCI instance section. In TOML, place `dry_run = true` or `false` at the top of the file before table headers. Rename `UNRAVEL__ADVANCED_SETTINGS__DRY_RUN` to `UNRAVEL__DRY_RUN`.
+4. Remove `advanced_settings` from UCI and TOML. Put `option dry_run '1'` or `'0'` directly in the UCI instance section. In TOML, place `dry_run = true` or `false` at the top of the file before table headers.
 5. For manual starts and service wrappers, use `unravel --instance <name> --config /etc/unravel/config.toml`, substituting the path to your TOML file. The TOML table for network settings is still `[network]`.
 6. Update ubus clients to call `unravel.<name>`. The old unnamed `unravel` object and anonymous instance are removed. An instance named `default` uses the same conventions as any other name.
 
@@ -47,7 +51,6 @@ SQMA is still the default control law. If you've set any of the following in `ad
 
 - In UCI, put them in the instance's owned `config law` with `option type 'sqma'`.
 - In TOML, use `[law.sqma]`.
-- For environment overrides, use `UNRAVEL__LAW__SQMA__` followed by the option name, for example `UNRAVEL__LAW__SQMA__DOWNLOAD_DELAY_MS`.
 
 If you set `history_file`, see [CSV files and saved history](#csv-files-and-saved-history) below.
 
@@ -95,10 +98,10 @@ Use the `instance` tag to keep WANs separate in your dashboards. If you renamed 
 
 ### Script laws
 
-If you wrote a script law for v0.6.0-rc1, add an `options` table next to `cadence` before you upgrade. It lists every option the script takes. A script with no options declares `options = {}`. unRAVEL now checks each value against its declared type and bounds, fills in the defaults, and hands `init` the result. It won't start the script without the table. [Using a Lua script](README.md#using-a-lua-script)
+If you wrote a script law for v0.6.0-rc1, add a `config` table next to `cadence` before you upgrade. It holds every option the script takes, each with its default, and the default's type is the option's type. unRAVEL now checks each value against it, fills in the defaults, and hands `init` the result. Move checks that involve more than one option from `init` to a `validate` hook, so `--check-config` runs them. [Using a Lua script](README.md#using-a-lua-script)
 
 Options in the `law` section that the script doesn't declare now stop the instance from starting. Before, they reached the script, and `cake.lua` logged a warning and ignored them. Check the startup error for the misspelled option and where it was set.
 
-`cake.lua` options are now typed. `detection_window`, `detection_threshold` and the `*_wire_packet_bytes` options must be whole numbers. `min_rates_on_timeout` takes the same boolean values as other UCI options, for example `1`, `yes` or `on`.
+`cake.lua` options are now typed. In JSON and TOML, values must be numbers or booleans rather than strings. The UCI converter converts them using the script's schema. The per-direction options are now tables in JSON and TOML: `download_delay_ms` becomes `download.delay_ms`, and likewise for `adjust_up_delay_ms`, `adjust_down_delay_ms` and `wire_packet_bytes` in both directions. UCI keeps the old option names. `wire_packet_bytes` now defaults to `0`, which reads the packet size from the interface.
 
-If you set a string option of a script law in an environment variable, the variable's value mustn't look like a number. unRAVEL reads `007` from the environment as the number 7 and rejects it for a string option. Set it in UCI or TOML instead.
+`unravel --config-schema --script <path>` now prints JSON Schema for the whole configuration, with the script's options under `properties.law.properties.script`. Update settings pages that read the old output.

@@ -13,7 +13,7 @@ use std::{
 /// Declared, and numbered, in protocol preference order: within a class's RTT
 /// shortlist the lowest discriminant wins. `Irtt` declares `endpoint` before
 /// `authentication`, so definitions of one endpoint sort next to each other.
-#[derive(Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Deserialize, schemars::JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(tag = "protocol", rename_all = "kebab-case", deny_unknown_fields)]
 #[repr(u8)]
 pub enum MeasurementTarget {

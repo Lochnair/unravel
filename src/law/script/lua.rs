@@ -13,13 +13,12 @@ use std::{
 
 use anyhow::Context;
 use mlua::{
-    BorrowedStr, Function, HookTriggers, IntoLua, Lua, LuaOptions, LuaSerdeExt, StdLib, Table,
-    UserData, UserDataMethods, VmState,
+    BorrowedStr, Function, HookTriggers, Lua, LuaOptions, LuaSerdeExt, StdLib, Table, UserData,
+    UserDataMethods, VmState, serde::DeserializeOptions,
 };
 
 use super::{
-    Backend, Event, OPTIONAL_HOOKS, REQUIRED_HOOKS, Schema, ScriptCadence, ScriptCtx, Value,
-    schema::OptionSpec,
+    Backend, Event, OPTIONAL_HOOKS, REQUIRED_HOOKS, ScriptCadence, ScriptConfig, ScriptCtx,
 };
 use crate::law::{Cadence, LawContext};
 
@@ -145,27 +144,44 @@ impl Backend for LuaBackend {
         })
     }
 
-    fn schema(&self) -> anyhow::Result<Schema> {
-        let options: Table = self
-            .law
-            .get::<Option<Table>>("options")
-            .context("options must be a table")?
-            .context("missing options table; a script without options declares options = {}")?;
-        // mlua reads a sequence by its length and drops other keys, so a
-        // table keyed by option name would silently become no options.
-        check_sequence(&options, "options")?;
-        for (index, entry) in options.sequence_values::<mlua::Value>().enumerate() {
-            if let mlua::Value::Table(entry) = entry?
-                && let Some(choices) = entry.get::<Option<Table>>("choices").ok().flatten()
-            {
-                check_sequence(&choices, &format!("options[{}].choices", index + 1))?;
+    fn config(&self) -> anyhow::Result<ScriptConfig> {
+        // An empty table is a list: an empty map would be an option that
+        // takes no keys. Tables with both list items and keys are rejected,
+        // rather than read as a list with the keys dropped.
+        let options = DeserializeOptions::new()
+            .encode_empty_tables_as_array(true)
+            .detect_mixed_tables(true);
+        let read = |key: &str| -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+            let value = self.law.get::<mlua::Value>(key)?;
+            match self.lua.from_value_with(value, options) {
+                Ok(serde_json::Value::Null) => Ok(serde_json::Map::new()),
+                Ok(serde_json::Value::Array(list)) if list.is_empty() => Ok(serde_json::Map::new()),
+                Ok(serde_json::Value::Object(map)) => Ok(map),
+                Ok(_) => anyhow::bail!("{key} must be a table keyed by option name"),
+                Err(error) => Err(error).with_context(|| format!("Reading {key}")),
             }
+        };
+        ScriptConfig::new(read("config")?, read("describe")?)
+    }
+
+    fn validate(&self, config: &serde_json::Value) -> anyhow::Result<Vec<String>> {
+        let Some(function) = self.law.get::<Option<Function>>("validate")? else {
+            return Ok(Vec::new());
+        };
+        self.ticks.store(0, Ordering::Relaxed);
+        let found: mlua::Value = function.call((self.law.clone(), self.lua.to_value(config)?))?;
+        match found {
+            mlua::Value::Nil => Ok(Vec::new()),
+            mlua::Value::String(message) => Ok(vec![message.to_str()?.to_owned()]),
+            mlua::Value::Table(messages) => Ok(messages
+                .sequence_values::<String>()
+                .collect::<Result<_, _>>()
+                .context("validate must return a list of messages")?),
+            other => anyhow::bail!(
+                "validate must return nothing, a message or a list of messages, not {}",
+                other.type_name()
+            ),
         }
-        let options: Vec<OptionSpec> = self
-            .lua
-            .from_value(mlua::Value::Table(options))
-            .context("Reading options")?;
-        Schema::new(options)
     }
 
     fn call(&mut self, event: &Event, ctx: &ScriptCtx<'_>) -> anyhow::Result<()> {
@@ -179,7 +195,7 @@ impl Backend for LuaBackend {
         lua.scope(|scope| {
             let ctx = scope.create_userdata_ref(ctx.law)?;
             match event {
-                Event::Init(config) => function.call::<()>((law, to_lua(lua, config)?, ctx)),
+                Event::Init(config) => function.call::<()>((law, lua.to_value(config)?, ctx)),
                 Event::Measurement(m) => {
                     let t = lua.create_table()?;
                     t.set("reflector", m.reflector.as_str())?;
@@ -207,44 +223,6 @@ impl Backend for LuaBackend {
         })?;
         Ok(())
     }
-}
-
-/// Fails unless `table` is a list: keys 1 to n, nothing else.
-fn check_sequence(table: &Table, what: &str) -> anyhow::Result<()> {
-    let len = table.raw_len();
-    let mut count = 0;
-    for pair in table.pairs::<mlua::Value, mlua::Value>() {
-        let (key, _) = pair?;
-        count += 1;
-        let index = match key {
-            mlua::Value::Integer(i) => Some(i as f64),
-            mlua::Value::Number(n) => Some(n),
-            _ => None,
-        };
-        anyhow::ensure!(
-            index.is_some_and(|i| i >= 1.0 && i <= len as f64 && i.fract() == 0.0),
-            "{what} must be a list, with no keys or gaps"
-        );
-    }
-    // A table with gaps can report any border as its length.
-    anyhow::ensure!(count == len, "{what} must be a list, with no keys or gaps");
-    Ok(())
-}
-
-fn to_lua(lua: &Lua, value: &Value) -> mlua::Result<mlua::Value> {
-    Ok(match value {
-        Value::Nil => mlua::Nil,
-        Value::Bool(b) => mlua::Value::Boolean(*b),
-        Value::Number(n) => mlua::Value::Number(*n),
-        Value::String(s) => s.as_str().into_lua(lua)?,
-        Value::Map(entries) => {
-            let table = lua.create_table()?;
-            for (key, item) in entries {
-                table.set(key.as_str(), to_lua(lua, item)?)?;
-            }
-            mlua::Value::Table(table)
-        }
-    })
 }
 
 // The ctx is the law's own context, so its type is 'static and mlua builds
@@ -339,4 +317,93 @@ impl UserData for LawContext {
 
 fn ctx(law: &LawContext) -> ScriptCtx<'_> {
     ScriptCtx { law }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(script: &str, name: &str) -> LuaBackend {
+        let path = std::env::temp_dir().join(format!("unravel-{name}-{}.lua", std::process::id()));
+        std::fs::write(&path, script).unwrap();
+        let backend = LuaBackend::load(&path);
+        std::fs::remove_file(&path).unwrap();
+        backend.unwrap()
+    }
+
+    /// `validate` sees the applied config and may return one message or a
+    /// list of them.
+    #[test]
+    fn validate_returns_messages() {
+        let backend = load(
+            r#"
+            return {
+              cadence = { probe = 1 },
+              config = { low = 1, high = 2 },
+              validate = function(_, c)
+                if c.low > c.high then return { "low must be at most high", "again" } end
+              end,
+              on_measurement = function() end,
+              on_traffic = function() end,
+            }
+            "#,
+            "validate",
+        );
+        let config = backend.config().unwrap();
+        let fine = config.apply(serde_json::Map::new()).unwrap();
+        assert!(backend.validate(&fine).unwrap().is_empty());
+        let given = serde_json::json!({ "low": 3 });
+        let wrong = config.apply(given.as_object().unwrap().clone()).unwrap();
+        assert_eq!(
+            backend.validate(&wrong).unwrap(),
+            ["low must be at most high", "again"]
+        );
+    }
+
+    /// A script's declared config, overridden from JSON, reaches its hooks
+    /// with Lua types intact: numbers, nested tables, lists of tables, and
+    /// list elements filled from their template.
+    #[test]
+    fn config_round_trips_through_lua() {
+        let script = r#"
+            return {
+              cadence = { probe = 1 },
+              config = {
+                delay_ms = 15, factor = 1.0, enabled = true, tags = {},
+                download = { delay_ms = 30.0, on = false },
+                peers = { { host = "a", port = 1 } },
+              },
+              describe = { download = { properties = { delay_ms = { minimum = 0 } } } },
+              init = function() end,
+              on_measurement = function() end,
+              on_traffic = function() end,
+            }
+        "#;
+        let backend = load(script, "round-trip");
+
+        let given = serde_json::json!({
+            "factor": 2.5, "tags": ["t1"],
+            "download": { "on": true },
+            "peers": [{ "host": "b" }, { "host": "c", "port": 3 }],
+        });
+        let config = backend
+            .config()
+            .unwrap()
+            .apply(given.as_object().unwrap().clone())
+            .unwrap();
+        let probe: Function = backend
+            .lua
+            .load(
+                r#"return function(c)
+                  return string.format("%s:%s %s %s %s:%s %s:%s:%s %s:%s:%s",
+                    c.delay_ms, type(c.delay_ms), c.factor, tostring(c.enabled), #c.tags, c.tags[1],
+                    c.download.delay_ms, tostring(c.download.on), type(c.download),
+                    c.peers[1].host, c.peers[1].port, c.peers[2].port)
+                end"#,
+            )
+            .eval()
+            .unwrap();
+        let seen: String = probe.call(backend.lua.to_value(&config).unwrap()).unwrap();
+        assert_eq!(seen, "15:number 2.5 true 1:t1 30:true:table b:1:3");
+    }
 }

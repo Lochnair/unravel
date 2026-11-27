@@ -28,7 +28,7 @@ apply_config() (
     trap 'rm -rf "$stage"' EXIT
     trap 'exit 1' HUP INT TERM
 
-    "$CONVERTER" "$UCI_FILE" "$stage" > "$stage/manifest" || exit 1
+    "$CONVERTER" "$UCI_FILE" "$stage" "$PROG" > "$stage/manifest" || exit 1
     while IFS=' ' read -r instance syslog; do
         case "$instance" in ''|*[!a-zA-Z0-9_]*) exit 1 ;; esac
         case "$syslog" in 0|1) ;; *) exit 1 ;; esac

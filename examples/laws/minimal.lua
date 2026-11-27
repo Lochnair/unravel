@@ -10,20 +10,34 @@ local law = {
   -- Seconds. `traffic` defaults to `probe`; `timer` is needed by on_timer.
   cadence = { probe = 0.5, traffic = 0.5, timer = 1.0 },
 
-  -- Required. The options this law takes in its law section, in the order a
-  -- frontend shows them. unravel checks each value and applies the defaults
-  -- before init, and rejects options that aren't listed. For example:
+  -- Optional. Each option this law takes in its law section, with its
+  -- default. A configured value must have the default's type; other keys are
+  -- rejected. Tables nest, a list's first element is the template for the
+  -- rest, and an empty list takes any elements. For example:
   --
-  --   { name = "delay_ms", type = "number", default = 15, above = 0,
-  --     label = "Delay threshold", unit = "ms" },
+  --   config = { delay_ms = 15, mode = "auto", hosts = { "a", "b" } },
+  config = {},
+
+  -- Optional. JSON Schema keywords per option for settings pages: title,
+  -- description, unit, minimum, maximum, exclusiveMinimum, exclusiveMaximum
+  -- and enum. unravel enforces the bounds and enum. A table option's fields
+  -- are described under properties, a list's elements under items.
   --
-  -- Types are boolean, integer, number and string. Numbers take min and max
-  -- (inclusive) or above and below (exclusive); strings take choices.
-  options = {},
+  --   describe = {
+  --     delay_ms = { title = "Delay threshold", unit = "ms", exclusiveMinimum = 0 },
+  --     hosts = { items = { description = "A reflector host." } },
+  --   },
 }
 
--- Optional. `config` holds the declared options; one without a value or a
--- default is nil.
+-- Optional. Rules between options, which types and bounds can't express.
+-- Called before init and by --check-config, with the same config. Return
+-- nothing when it is fine, or a message or list of messages.
+--
+--   function law:validate(config)
+--     if config.min_ms > config.max_ms then return "min_ms must be at most max_ms" end
+--   end
+
+-- Optional. `config` holds every declared option, set or defaulted.
 function law:init(config, ctx)
   for _, direction in ipairs({ "download", "upload" }) do
     local base = ctx:base(direction)

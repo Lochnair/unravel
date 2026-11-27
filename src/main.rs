@@ -41,13 +41,13 @@ fn main() -> anyhow::Result<ExitCode> {
             check,
         } => {
             if check {
-                ValidatedConfig::new(Settings::load(config.as_deref())?)?;
+                ValidatedConfig::new(Settings::load(&config)?)?;
                 return Ok(ExitCode::SUCCESS);
             }
             (instance, config)
         }
         Mode::ConfigSchema(script) => {
-            println!("{}", law::config_schema_json(&script)?);
+            println!("{}", law::config_schema_json(script.as_deref())?);
             return Ok(ExitCode::SUCCESS);
         }
     };
@@ -58,8 +58,8 @@ fn main() -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let settings = Settings::load(config.as_deref())?;
-        ::log::set_max_level(settings.output.log_level.to_level_filter());
+        let settings = Settings::load(&config)?;
+        ::log::set_max_level(::log::Level::from(settings.output.log_level).to_level_filter());
         warn_platform_limitations();
 
         App::prepare(ValidatedConfig::new(settings)?, &instance)
@@ -80,17 +80,17 @@ fn main() -> anyhow::Result<ExitCode> {
     })
 }
 
-const USAGE: &str = "usage: unravel --instance <name> [--config <path>] [--check-config] | unravel --config-schema --script <path>";
+const USAGE: &str = "usage: unravel --instance <name> --config <path> [--check-config] | unravel --config-schema [--script <path>]";
 
 enum Mode {
     /// Run the named instance.
     Run {
         instance: String,
-        config: Option<PathBuf>,
+        config: PathBuf,
         check: bool,
     },
-    /// Print the options a script law declares, and exit.
-    ConfigSchema(PathBuf),
+    /// Print the configuration schema, with a script's options if given, and exit.
+    ConfigSchema(Option<PathBuf>),
 }
 
 /// Option values can also follow an `=`.
@@ -132,19 +132,22 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Mode> {
     }
 
     match (instance, script, config_schema, config, check) {
-        (None, Some(script), true, None, false) => Ok(Mode::ConfigSchema(PathBuf::from(script))),
-        (Some(name), None, false, config, check) => {
+        (None, script, true, None, false) => Ok(Mode::ConfigSchema(script.map(PathBuf::from))),
+        (Some(name), None, false, Some(config), check) => {
             anyhow::ensure!(
                 valid_instance_name(&name),
                 "Instance name {name:?} must be letters, digits and underscores"
             );
             Ok(Mode::Run {
                 instance: name,
-                config: config.map(PathBuf::from),
+                config: PathBuf::from(config),
                 check,
             })
         }
         (None, None, false, _, _) => anyhow::bail!("Missing required --instance <name>; {USAGE}"),
+        (Some(_), None, false, None, _) => {
+            anyhow::bail!("Missing required --config <path>; {USAGE}")
+        }
         _ => anyhow::bail!("Invalid argument combination; {USAGE}"),
     }
 }

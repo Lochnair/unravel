@@ -28,91 +28,92 @@
 --   	option type 'script'
 --   	option path '/usr/share/unravel/laws/cake.lua'
 --
--- Every option below can be set in the law section. unravel applies the
+-- Every option in CONFIG can be set in the law section. unravel applies the
 -- defaults and checks each option's type and bounds before init.
 
 local DIRECTIONS = { "download", "upload" }
 
-local OPTIONS = {}
-for _, d in ipairs(DIRECTIONS) do
-  local Dir = d:sub(1, 1):upper() .. d:sub(2)
-  for _, option in ipairs({
-    { name = d .. "_delay_ms", type = "number", default = 30.0, above = 0,
-      label = Dir .. " delay threshold", unit = "ms",
-      description = "Delay over baseline that counts as a delayed reply." },
-    { name = d .. "_adjust_up_delay_ms", type = "number", default = 10.0, min = 0,
-      label = Dir .. " full-increase delay", unit = "ms",
-      description = "Mean delay at or below which increases are at their largest." },
-    { name = d .. "_adjust_down_delay_ms", type = "number", default = 60.0, min = 0,
-      label = Dir .. " full-cut delay", unit = "ms",
-      description = "Mean delay at or above which cuts are at their largest." },
-  }) do
-    table.insert(OPTIONS, option)
-  end
-end
-for _, option in ipairs({
-  { name = "detection_window", type = "integer", default = 6, min = 1,
-    label = "Detection window", unit = "replies",
+-- Each option with its default. A value set in the law section must have the
+-- default's type. Bounds in DESCRIBE are checked by unravel; rules between
+-- options are checked in law:validate.
+local CONFIG = {
+  detection_window = 6,
+  detection_threshold = 3,
+  alpha_baseline_increase = 0.001,
+  alpha_baseline_decrease = 0.9,
+  adjust_down_bufferbloat_min = 0.99,
+  adjust_down_bufferbloat_max = 0.75,
+  adjust_up_load_high_min = 1.0,
+  adjust_up_load_high_max = 1.04,
+  adjust_down_load_low = 0.99,
+  adjust_up_load_low = 1.01,
+  high_load_level = 0.75,
+  bufferbloat_refractory_ms = 300,
+  decay_refractory_ms = 1000,
+  reply_timeout_s = 10.0,
+  min_rates_on_timeout = false,
+}
+
+-- For settings pages: JSON Schema keywords per option.
+local DESCRIBE = {
+  detection_window = { title = "Detection window", unit = "replies", minimum = 1,
     description = "Bufferbloat is detected when detection_threshold of the last "
       .. "detection_window replies are delayed." },
-  { name = "detection_threshold", type = "integer", default = 3, min = 1,
-    label = "Detection threshold", unit = "replies" },
-
-  { name = "alpha_baseline_increase", type = "number", default = 0.001, above = 0, max = 1,
-    label = "Baseline rise factor",
+  detection_threshold = { title = "Detection threshold", unit = "replies", minimum = 1 },
+  alpha_baseline_increase = { title = "Baseline rise factor", exclusiveMinimum = 0, maximum = 1,
     description = "How fast a reflector's baseline follows its delay up." },
-  { name = "alpha_baseline_decrease", type = "number", default = 0.9, above = 0, max = 1,
-    label = "Baseline fall factor",
+  alpha_baseline_decrease = { title = "Baseline fall factor", exclusiveMinimum = 0, maximum = 1,
     description = "How fast a reflector's baseline follows its delay down." },
-
-  { name = "adjust_down_bufferbloat_min", type = "number", default = 0.99, above = 0, max = 1,
-    label = "Smallest bufferbloat cut",
+  adjust_down_bufferbloat_min = { title = "Smallest bufferbloat cut",
+    exclusiveMinimum = 0, maximum = 1,
     description = "Factor applied to the rate on bufferbloat at low mean delay." },
-  { name = "adjust_down_bufferbloat_max", type = "number", default = 0.75, above = 0, max = 1,
-    label = "Largest bufferbloat cut",
+  adjust_down_bufferbloat_max = { title = "Largest bufferbloat cut",
+    exclusiveMinimum = 0, maximum = 1,
     description = "Factor applied to the rate on bufferbloat at high mean delay." },
-  { name = "adjust_up_load_high_min", type = "number", default = 1.0, min = 1,
-    label = "Smallest high-load raise",
+  adjust_up_load_high_min = { title = "Smallest high-load raise", minimum = 1,
     description = "Factor applied to the rate under high load as the mean delay nears the threshold." },
-  { name = "adjust_up_load_high_max", type = "number", default = 1.04, min = 1,
-    label = "Largest high-load raise",
+  adjust_up_load_high_max = { title = "Largest high-load raise", minimum = 1,
     description = "Factor applied to the rate under high load at low mean delay." },
-  { name = "adjust_down_load_low", type = "number", default = 0.99, above = 0, max = 1,
-    label = "Low-load decay down",
+  adjust_down_load_low = { title = "Low-load decay down", exclusiveMinimum = 0, maximum = 1,
     description = "Factor that moves a rate above base back towards it on low load." },
-  { name = "adjust_up_load_low", type = "number", default = 1.01, min = 1,
-    label = "Low-load decay up",
+  adjust_up_load_low = { title = "Low-load decay up", minimum = 1,
     description = "Factor that moves a rate below base back towards it on low load." },
-
-  { name = "high_load_level", type = "number", default = 0.75, above = 0,
-    label = "High load level",
+  high_load_level = { title = "High load level", exclusiveMinimum = 0,
     description = "Achieved rate over the current rate above which load is high." },
-
-  { name = "bufferbloat_refractory_ms", type = "number", default = 300, min = 0,
-    label = "Bufferbloat refractory period", unit = "ms" },
-  { name = "decay_refractory_ms", type = "number", default = 1000, min = 0,
-    label = "Decay refractory period", unit = "ms" },
-
-  { name = "reply_timeout_s", type = "number", default = 10.0, above = 0,
-    label = "Reply timeout", unit = "s",
+  bufferbloat_refractory_ms = { title = "Bufferbloat refractory period", unit = "ms", minimum = 0 },
+  decay_refractory_ms = { title = "Decay refractory period", unit = "ms", minimum = 0 },
+  reply_timeout_s = { title = "Reply timeout", unit = "s", exclusiveMinimum = 0,
     description = "With no reply from any active reflector for this long, send a "
       .. "reflector_unavailable event." },
-  { name = "min_rates_on_timeout", type = "boolean", default = false,
-    label = "Minimum rates on timeout",
+  min_rates_on_timeout = { title = "Minimum rates on timeout",
     description = "Drop to the minimum rates after the reply timeout. Off upstream." },
+}
 
-  -- Largest packet on the wire per direction, MTU plus CAKE's overhead and
-  -- ATM or PTM framing. Read from the interface and its qdisc unless set; at
-  -- low rates the time to send one raises every delay threshold and stretches
-  -- the load window.
-  { name = "download_wire_packet_bytes", type = "integer", min = 1,
-    label = "Download wire packet size", unit = "bytes",
-    description = "Overrides the size read from the interface and its qdisc." },
-  { name = "upload_wire_packet_bytes", type = "integer", min = 1,
-    label = "Upload wire packet size", unit = "bytes",
-    description = "Overrides the size read from the interface and its qdisc." },
-}) do
-  table.insert(OPTIONS, option)
+-- Each direction has its own table of options, such as download.delay_ms.
+for _, d in ipairs(DIRECTIONS) do
+  CONFIG[d] = {
+    delay_ms = 30.0,
+    adjust_up_delay_ms = 10.0,
+    adjust_down_delay_ms = 60.0,
+    -- Largest packet on the wire, MTU plus CAKE's overhead and ATM or PTM
+    -- framing. 0 reads it from the interface and its qdisc. At low rates the
+    -- time to send one raises every delay threshold and stretches the load
+    -- window.
+    wire_packet_bytes = 0,
+  }
+  DESCRIBE[d] = {
+    title = d:sub(1, 1):upper() .. d:sub(2),
+    properties = {
+      delay_ms = { title = "Delay threshold", unit = "ms", exclusiveMinimum = 0,
+        description = "Delay over baseline that counts as a delayed reply." },
+      adjust_up_delay_ms = { title = "Full-increase delay", unit = "ms", minimum = 0,
+        description = "Mean delay at or below which increases are at their largest." },
+      adjust_down_delay_ms = { title = "Full-cut delay", unit = "ms", minimum = 0,
+        description = "Mean delay at or above which cuts are at their largest." },
+      wire_packet_bytes = { title = "Wire packet size", unit = "bytes", minimum = 0,
+        description = "Overrides the size read from the interface and its qdisc; 0 reads it." },
+    },
+  }
 end
 
 local FALLBACK_WIRE_PACKET_BYTES = 1500
@@ -127,24 +128,31 @@ local law = {
   -- Upstream probes each reflector every 0.3 s and samples traffic every
   -- 0.2 s. The cadence is read before init, so it is not configurable.
   cadence = { probe = 0.3, traffic = 0.2, timer = 1.0 },
-  options = OPTIONS,
+  config = CONFIG,
+  describe = DESCRIBE,
 }
 
--- Each option's type and bounds are checked by unravel; these are the rules
--- between options.
-local function check_config(c)
+-- unravel checks each option's type and bounds before calling this hook.
+-- These additional rules apply before init and for --check-config.
+function law:validate(c)
+  local problems = {}
   local function check(ok, message)
     if not ok then
-      error(message, 0)
+      problems[#problems + 1] = message
     end
   end
 
+  check(c.detection_window % 1 == 0,
+    "detection_window must be a whole number")
+  check(c.detection_threshold % 1 == 0,
+    "detection_threshold must be a whole number")
   check(c.detection_threshold <= c.detection_window,
     "detection_threshold must be at most detection_window")
   check(c.adjust_down_bufferbloat_max <= c.adjust_down_bufferbloat_min,
     "adjust_down_bufferbloat_max must be at most adjust_down_bufferbloat_min")
   check(c.adjust_up_load_high_min <= c.adjust_up_load_high_max,
     "adjust_up_load_high_min must be at most adjust_up_load_high_max")
+  return problems
 end
 
 local function clamp(x, lo, hi)
@@ -160,9 +168,9 @@ end
 local function compensate(self, s)
   local c = self.config
   local extra_ms = s.wire_bits / s.rate
-  s.delay_ms = c[s.name .. "_delay_ms"] + extra_ms
-  s.adjust_up_delay_ms = c[s.name .. "_adjust_up_delay_ms"] + extra_ms
-  s.adjust_down_delay_ms = c[s.name .. "_adjust_down_delay_ms"] + extra_ms
+  s.delay_ms = c[s.name].delay_ms + extra_ms
+  s.adjust_up_delay_ms = c[s.name].adjust_up_delay_ms + extra_ms
+  s.adjust_down_delay_ms = c[s.name].adjust_down_delay_ms + extra_ms
 end
 
 local function apply(self, s, rate, ctx)
@@ -181,7 +189,6 @@ local function set_min_rates(self, ctx)
 end
 
 function law:init(config, ctx)
-  check_config(config)
   self.config = config
   self.shapers = {}
   for _, d in ipairs(DIRECTIONS) do
@@ -192,9 +199,9 @@ function law:init(config, ctx)
         error(string.format(
           "cake needs a maximum %s rate: set network.%s_max_percent", d, d), 0)
       end
-      local wire_bytes = self.config[d .. "_wire_packet_bytes"]
+      local wire_bytes = self.config[d].wire_packet_bytes
       local source = "set"
-      if not wire_bytes then
+      if wire_bytes == 0 then
         wire_bytes, source = ctx:wire_packet_bytes(d), "detected"
       end
       if not wire_bytes then
