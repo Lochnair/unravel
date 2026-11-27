@@ -22,86 +22,6 @@ pub(crate) fn valid_instance_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-pub(crate) struct FlexiBool(pub(crate) bool);
-
-impl FromStr for FlexiBool {
-    type Err = ConfigError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "1" | "true" | "yes" | "y" | "on" | "enabled" => Ok(FlexiBool(true)),
-            "0" | "false" | "no" | "n" | "off" | "disabled" => Ok(FlexiBool(false)),
-            _ => Err(ConfigError::Message(format!(
-                "invalid boolean string: {}",
-                s
-            ))),
-        }
-    }
-}
-
-pub(crate) fn deserialize_flex_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct FlexiBoolVisitor;
-
-    impl<'de> de::Visitor<'de> for FlexiBoolVisitor {
-        type Value = bool;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("a boolean, integer 0 or 1, or a boolean string")
-        }
-
-        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value)
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            match value {
-                0 => Ok(false),
-                1 => Ok(true),
-                _ => Err(E::custom("boolean integer must be 0 or 1")),
-            }
-        }
-
-        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            match value {
-                0 => Ok(false),
-                1 => Ok(true),
-                _ => Err(E::custom("boolean integer must be 0 or 1")),
-            }
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            value
-                .parse::<FlexiBool>()
-                .map(|value| value.0)
-                .map_err(E::custom)
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            self.visit_str(&value)
-        }
-    }
-
-    deserializer.deserialize_any(FlexiBoolVisitor)
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum ObservabilityProtocol {
     Udp,
@@ -126,7 +46,7 @@ impl FromStr for ObservabilityProtocol {
 #[serde(deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(crate) struct Settings {
-    #[serde(default, deserialize_with = "deserialize_flex_bool")]
+    #[serde(default)]
     pub(crate) dry_run: bool,
 
     #[serde(default)]
@@ -377,7 +297,6 @@ pub(crate) struct OutputSettings {
     /// saved state.
     #[garde(custom(rules::nonblank))]
     pub(crate) folder: String,
-    #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) suppress_statistics: bool,
 }
 
@@ -395,7 +314,6 @@ impl Default for OutputSettings {
 #[serde(default, deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(crate) struct ObservabilitySettings {
-    #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) enabled: bool,
     #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) protocol: ObservabilityProtocol,
@@ -407,13 +325,9 @@ pub(crate) struct ObservabilitySettings {
     pub(crate) batch_size: usize,
     #[garde(if(cond = self.enabled, range(min = 1)))]
     pub(crate) batch_timeout_ms: u64,
-    #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) export_ping_metrics: bool,
-    #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) export_rate_metrics: bool,
-    #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) export_law_metrics: bool,
-    #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) export_events: bool,
     pub(crate) host_tag: String,
 }

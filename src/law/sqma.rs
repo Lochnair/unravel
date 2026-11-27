@@ -22,7 +22,7 @@ use crate::{
     },
     metrics::Metric,
     runtime::{Direction, Shaper},
-    settings::{deserialize_flex_bool, rules, warning},
+    settings::{rules, warning},
 };
 
 const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
@@ -73,7 +73,6 @@ pub(crate) struct SqmaSettings {
     /// Keep the recorded safe rates across a service restart. They are read
     /// at startup if under 6 h old and saved with the same speed_hist_size
     /// and base rate. Off by default, the upstream behaviour.
-    #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) save_history: bool,
 }
 

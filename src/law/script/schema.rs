@@ -12,7 +12,6 @@ use config::ValueKind;
 use serde::{Deserialize, Serialize};
 
 use super::Value;
-use crate::settings::FlexiBool;
 
 /// Keys of the `law` section that never reach the script: `instance` is the
 /// UCI owner option, `type` selects the law (`LawSettings`) and `path` names
@@ -294,7 +293,10 @@ impl OptionSpec {
                 ValueKind::String(s) => self.accepts_string(s).then(|| Value::String(s.clone())),
                 _ => None,
             },
-            Kind::Boolean => boolean(kind).map(Value::Bool),
+            Kind::Boolean => config::Value::new(None, kind.clone())
+                .into_bool()
+                .ok()
+                .map(Value::Bool),
             Kind::Integer => {
                 let n = whole(kind)?;
                 self.accepts_integer(n).then_some(Value::Number(n as f64))
@@ -401,20 +403,4 @@ fn number(kind: &ValueKind) -> Option<f64> {
         _ => typed_integer(kind)? as f64,
     };
     n.is_finite().then_some(n)
-}
-
-/// A boolean option's value: a boolean, a UCI boolean spelling, or the
-/// integer 0 or 1. UCI's `'0'` and `'1'` arrive as strings, and TOML or the
-/// environment can give integers. Floats such as `1.0` are not booleans.
-fn boolean(kind: &ValueKind) -> Option<bool> {
-    match kind {
-        ValueKind::Boolean(b) => Some(*b),
-        ValueKind::String(s) => s.parse::<FlexiBool>().ok().map(|b| b.0),
-        ValueKind::Float(_) => None,
-        _ => match typed_integer(kind)? {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        },
-    }
 }
