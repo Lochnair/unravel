@@ -2,15 +2,12 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use crate::law::LawKind;
+use crate::law::{LawKind, sqma::SqmaSettings};
 use crate::measurement::model::MeasurementTarget;
 use anyhow::Context;
-use config::{Config, ConfigError, Environment, File, FileFormat};
-use log::Level;
-use serde::{Deserialize, Deserializer, de};
-use std::fmt::Display;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::str::FromStr;
 mod validation;
 
 pub(crate) use validation::{rules, warning};
@@ -22,27 +19,38 @@ pub(crate) fn valid_instance_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum ObservabilityProtocol {
     Udp,
     Tcp,
 }
 
-impl FromStr for ObservabilityProtocol {
-    type Err = ConfigError;
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "udp" => Ok(ObservabilityProtocol::Udp),
-            "tcp" => Ok(ObservabilityProtocol::Tcp),
-            _ => Err(ConfigError::Message(format!(
-                "invalid observability protocol: {s}",
-            ))),
+impl From<LogLevel> for log::Level {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Error => log::Level::Error,
+            LogLevel::Warn => log::Level::Warn,
+            LogLevel::Info => log::Level::Info,
+            LogLevel::Debug => log::Level::Debug,
+            LogLevel::Trace => log::Level::Trace,
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize, garde::Validate)]
+/// The configuration, read from one JSON or TOML file. Values must have their
+/// own types: frontends such as the OpenWrt converter convert theirs first.
+#[derive(Clone, Debug, Deserialize, garde::Validate, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(crate) struct Settings {
@@ -68,110 +76,59 @@ pub(crate) struct Settings {
     pub(crate) observability: ObservabilitySettings,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// `name` picks the law; each law reads its own table. SQMA's table is
+/// validated by SQMA, and a script's by the options it declares.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct LawSettings {
-    #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) name: LawKind,
-
-    // Accept either law table so higher-priority sources can switch laws.
-    // Only the selected table is validated, with its source origins intact.
-    #[serde(rename = "sqma")]
-    _sqma: de::IgnoredAny,
-    #[serde(rename = "script")]
-    _script: de::IgnoredAny,
-
-    /// The selected law's own table, `law.<name>`, left for the law to read.
-    #[serde(skip)]
-    pub(crate) config: Option<config::Value>,
-}
-
-impl Default for LawSettings {
-    fn default() -> Self {
-        Self {
-            name: LawKind::Sqma,
-            _sqma: de::IgnoredAny,
-            _script: de::IgnoredAny,
-            config: None,
-        }
-    }
+    pub(crate) sqma: SqmaSettings,
+    /// `path` names the script; the other keys are the script's own options.
+    pub(crate) script: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Settings {
-    pub(crate) fn load(path: Option<&Path>) -> anyhow::Result<Self> {
-        let mut builder = Config::builder();
-        let file = if let Some(path) = path {
-            let extension = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(str::to_ascii_lowercase);
-            let format = match extension.as_deref() {
-                Some("json") => FileFormat::Json,
-                #[cfg(feature = "toml")]
-                Some("toml") => FileFormat::Toml,
-                #[cfg(not(feature = "toml"))]
-                Some("toml") => anyhow::bail!(
-                    "Cannot load {}: this build has no TOML support",
-                    path.display()
-                ),
-                _ => anyhow::bail!(
-                    "Unsupported configuration format for {}: expected .json or .toml",
-                    path.display()
-                ),
-            };
-            // config-rs can search alternate filenames for a file source.
-            // Read the exact path so an explicitly missing file is an error.
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("Reading configuration {}", path.display()))?;
-            builder = builder.add_source(File::from_str(&text, format));
-            Some((path, format))
-        } else {
-            None
+    pub(crate) fn load(path: &Path) -> anyhow::Result<Self> {
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        let text = || {
+            std::fs::read_to_string(path)
+                .with_context(|| format!("Reading configuration {}", path.display()))
         };
-
-        let config = builder
-            .add_source(
-                Environment::with_prefix("UNRAVEL")
-                    .separator("__")
-                    .try_parsing(true)
-                    .list_separator(",")
-                    .with_list_parse_key("reflectors.files"),
-            )
-            .build()
-            .map_err(|error| match (file, error) {
-                (Some((path, format)), ConfigError::FileParse { cause, .. }) => {
-                    let detail = if format == FileFormat::Json {
-                        // config-rs may include a scalar JSON root in its error.
-                        cause
-                            .downcast_ref::<serde_json::Error>()
-                            .map_or_else(|| "expected an object".to_owned(), ToString::to_string)
-                    } else {
-                        cause.to_string()
-                    };
-                    anyhow::anyhow!("Invalid configuration {}: {detail}", path.display())
-                }
-                (_, error) => error.into(),
-            })?;
-        Self::from_config(config).map_err(Into::into)
-    }
-
-    fn from_config(config: Config) -> Result<Self, ConfigError> {
-        let mut settings: Self = config.clone().try_deserialize()?;
-
-        // get_table keeps each value's origin, which `get` would drop.
-        settings.law.config = match config.get_table(&format!("law.{}", settings.law.name.as_str()))
-        {
-            Ok(table) => Some(config::Value::new(None, config::ValueKind::Table(table))),
-            Err(ConfigError::NotFound(_)) => None,
-            Err(error) => return Err(error),
+        let invalid = |error: &dyn std::fmt::Display| {
+            anyhow::anyhow!("Invalid configuration {}: {error}", path.display())
+        };
+        let mut settings: Self = match extension.as_deref() {
+            Some("json") => serde_json::from_str(&text()?).map_err(|e| invalid(&e))?,
+            #[cfg(feature = "toml")]
+            Some("toml") => toml::from_str(&text()?).map_err(|e| invalid(&e))?,
+            #[cfg(not(feature = "toml"))]
+            Some("toml") => anyhow::bail!(
+                "Cannot load {}: this build has no TOML support",
+                path.display()
+            ),
+            _ => anyhow::bail!(
+                "Unsupported configuration format for {}: expected .json or .toml",
+                path.display()
+            ),
         };
         settings.reflectors.load_files()?;
-
         Ok(settings)
+    }
+
+    /// The configuration's JSON Schema, with subschemas inlined. It describes
+    /// types, defaults and simple bounds; validation remains authoritative.
+    pub(crate) fn json_schema() -> schemars::Schema {
+        schemars::generate::SchemaSettings::draft2020_12()
+            .with(|settings| settings.inline_subschemas = true)
+            .into_generator()
+            .into_root_schema_for::<Self>()
     }
 }
 
-#[derive(Clone, Debug, Deserialize, garde::Validate)]
+#[derive(Clone, Debug, Deserialize, garde::Validate, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(crate) struct NetworkSettings {
@@ -241,12 +198,11 @@ impl NetworkSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, garde::Validate)]
+#[derive(Clone, Debug, Deserialize, garde::Validate, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(crate) struct ReflectorSettings {
     /// JSON pools, each an array of measurement targets.
-    #[serde(deserialize_with = "deserialize_reflector_files")]
     pub(crate) files: Vec<String>,
 
     /// Inline targets, joined by the pool files' targets once loaded.
@@ -260,15 +216,12 @@ pub(crate) struct ReflectorSettings {
 }
 
 impl ReflectorSettings {
-    fn load_files(&mut self) -> Result<(), ConfigError> {
+    fn load_files(&mut self) -> anyhow::Result<()> {
         for path in &self.files {
-            let pool = std::fs::read(path).map_err(|error| {
-                ConfigError::Message(format!("reading reflector pool {path}: {error}"))
-            })?;
-            let targets: Vec<MeasurementTarget> =
-                serde_json::from_slice(&pool).map_err(|error| {
-                    ConfigError::Message(format!("parsing reflector pool {path}: {error}"))
-                })?;
+            let pool =
+                std::fs::read(path).with_context(|| format!("Reading reflector pool {path}"))?;
+            let targets: Vec<MeasurementTarget> = serde_json::from_slice(&pool)
+                .with_context(|| format!("Parsing reflector pool {path}"))?;
             self.entries.extend(targets);
         }
         Ok(())
@@ -287,12 +240,11 @@ impl Default for ReflectorSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, garde::Validate)]
+#[derive(Clone, Debug, Deserialize, garde::Validate, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(crate) struct OutputSettings {
-    #[serde(deserialize_with = "deserialize_from_str")]
-    pub(crate) log_level: Level,
+    pub(crate) log_level: LogLevel,
     /// Holds a folder per instance, with the CSV statistics and each law's
     /// saved state.
     #[garde(custom(rules::nonblank))]
@@ -303,19 +255,18 @@ pub(crate) struct OutputSettings {
 impl Default for OutputSettings {
     fn default() -> Self {
         Self {
-            log_level: Level::Info,
+            log_level: LogLevel::Info,
             folder: "/tmp/unravel".to_owned(),
             suppress_statistics: false,
         }
     }
 }
 
-#[derive(Clone, Debug, Deserialize, garde::Validate)]
+#[derive(Clone, Debug, Deserialize, garde::Validate, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 #[garde(allow_unvalidated)]
 pub(crate) struct ObservabilitySettings {
     pub(crate) enabled: bool,
-    #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) protocol: ObservabilityProtocol,
     #[garde(if(cond = self.enabled, required, inner(custom(rules::nonblank))))]
     pub(crate) host: Option<String>,
@@ -359,35 +310,4 @@ fn default_host_tag() -> String {
         .nodename()
         .to_string_lossy()
         .into_owned()
-}
-
-fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: FromStr,
-    T::Err: Display,
-{
-    let value = String::deserialize(deserializer)?;
-    value.parse().map_err(de::Error::custom)
-}
-
-// UCI drops empty string options; `option files 'none'` disables file loading.
-fn deserialize_reflector_files<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Files {
-        List(Vec<String>),
-        String(String),
-    }
-
-    match Files::deserialize(deserializer)? {
-        Files::List(files) => Ok(files),
-        Files::String(value) if value.trim().is_empty() || value.trim() == "none" => Ok(Vec::new()),
-        Files::String(_) => Err(de::Error::custom(
-            "reflector files must be a list, an empty string, or none",
-        )),
-    }
 }

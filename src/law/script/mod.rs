@@ -6,11 +6,11 @@
 //! the loop, the events, `ctx` and config conversion. Each language is a
 //! [`Backend`] in its own file behind its own cargo feature.
 
+mod config;
 #[cfg(feature = "lua")]
 mod lua;
-mod schema;
 
-pub(crate) use schema::Schema;
+pub(crate) use config::ScriptConfig;
 
 use std::{
     path::{Path, PathBuf},
@@ -33,8 +33,12 @@ pub(super) trait Backend: Send {
     /// Read once, right after loading.
     fn cadence(&self) -> anyhow::Result<ScriptCadence>;
 
-    /// The declared options, read and checked once, right after loading.
-    fn schema(&self) -> anyhow::Result<Schema>;
+    /// The declared configuration, read and checked once, right after loading.
+    fn config(&self) -> anyhow::Result<ScriptConfig>;
+
+    /// What the script's `validate` hook finds wrong with `config`, which
+    /// has passed the declared types and bounds. Nothing without the hook.
+    fn validate(&self, config: &serde_json::Value) -> anyhow::Result<Vec<String>>;
 
     /// Calls the hook for `event`. An absent optional hook is not an error.
     fn call(&mut self, event: &Event, ctx: &ScriptCtx<'_>) -> anyhow::Result<()>;
@@ -48,7 +52,7 @@ pub(super) struct ScriptCadence {
 
 /// What a hook is called with. Times are seconds since the law started.
 pub(super) enum Event {
-    Init(Value),
+    Init(serde_json::Value),
     Measurement(Measurement),
     Traffic(Traffic),
     Timer(f64),
@@ -68,7 +72,7 @@ impl Event {
 }
 
 pub(super) const REQUIRED_HOOKS: &[&str] = &["on_measurement", "on_traffic"];
-pub(super) const OPTIONAL_HOOKS: &[&str] = &["init", "on_timer", "on_clock_step"];
+pub(super) const OPTIONAL_HOOKS: &[&str] = &["validate", "init", "on_timer", "on_clock_step"];
 
 pub(super) struct Measurement {
     /// The IP, or `ip:port` for IRTT, where one IP can serve several
@@ -93,16 +97,6 @@ pub(super) struct Traffic {
     pub t: f64,
     pub download_kbps: f64,
     pub upload_kbps: f64,
-}
-
-/// The script's config, backend-neutral.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum Value {
-    Nil,
-    Bool(bool),
-    Number(f64),
-    String(String),
-    Map(Vec<(String, Value)>),
 }
 
 /// What a script can do, borrowed for one hook call.
@@ -211,19 +205,14 @@ pub(super) struct ScriptLaw {
     name: String,
     backend: Box<dyn Backend>,
     cadence: ScriptCadence,
-    config: Value,
+    config: serde_json::Value,
 }
 
 impl ScriptLaw {
     /// `config` is the `law.script` table: `path` plus the script's own config.
-    pub fn new(config: Option<config::Value>) -> anyhow::Result<Self> {
-        let mut table = match config.map(|value| value.kind) {
-            Some(config::ValueKind::Table(table)) => table,
-            None => config::Map::new(),
-            Some(_) => anyhow::bail!("law.script must be a table"),
-        };
-        let path = match table.remove("path").map(|value| value.kind) {
-            Some(config::ValueKind::String(path)) => PathBuf::from(path),
+    pub fn new(mut table: serde_json::Map<String, serde_json::Value>) -> anyhow::Result<Self> {
+        let path = match table.remove("path") {
+            Some(serde_json::Value::String(path)) => PathBuf::from(path),
             Some(_) => anyhow::bail!("law.script.path must be a string"),
             None => anyhow::bail!("law.script.path is required"),
         };
@@ -252,9 +241,18 @@ impl ScriptLaw {
             );
         }
         let config = backend
-            .schema()
-            .with_context(|| format!("Reading the options of {}", path.display()))?
+            .config()
+            .with_context(|| format!("Reading the config of {}", path.display()))?
             .apply(table)?;
+        // Rules between options. This runs for --check-config too, unlike init.
+        let problems = backend
+            .validate(&config)
+            .context("Script hook validate failed")?;
+        anyhow::ensure!(
+            problems.is_empty(),
+            "script config validation failed:\n  law.script: {}",
+            problems.join("\n  law.script: ")
+        );
 
         Ok(Self {
             name: format!("script-{stem}"),
@@ -265,11 +263,11 @@ impl ScriptLaw {
     }
 
     /// The options a script declares, without configuring or starting it.
-    pub fn inspect(path: &Path) -> anyhow::Result<Schema> {
+    pub fn inspect(path: &Path) -> anyhow::Result<ScriptConfig> {
         let backend = load(path).with_context(|| format!("Loading {}", path.display()))?;
         backend
-            .schema()
-            .with_context(|| format!("Reading the options of {}", path.display()))
+            .config()
+            .with_context(|| format!("Reading the config of {}", path.display()))
     }
 
     fn call(&mut self, ctx: &LawContext, event: Event) -> anyhow::Result<()> {
@@ -318,7 +316,7 @@ impl Law for ScriptLaw {
             None => -start.duration_since(at).as_secs_f64(),
         };
 
-        let config = std::mem::replace(&mut self.config, Value::Nil);
+        let config = std::mem::take(&mut self.config);
         self.call(&ctx, Event::Init(config))?;
 
         let mut timer = self.cadence.timer.map(|period| {

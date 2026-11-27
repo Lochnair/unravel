@@ -5,19 +5,26 @@
 mod context;
 #[cfg(feature = "lua")]
 mod script;
-mod sqma;
+pub(crate) mod sqma;
 mod store;
 
 pub(crate) use context::LawContext;
 pub(crate) use store::LawStore;
 
-use std::{path::Path, str::FromStr, time::Duration};
+use std::{path::Path, time::Duration};
+
+use anyhow::Context;
+
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 use crate::{diagnostics::DiagnosticsSender, settings::Settings};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum LawKind {
     Script,
+    #[default]
     Sqma,
 }
 
@@ -27,20 +34,6 @@ impl LawKind {
         match self {
             LawKind::Script => "script",
             LawKind::Sqma => "sqma",
-        }
-    }
-}
-
-impl FromStr for LawKind {
-    type Err = config::ConfigError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "script" => Ok(LawKind::Script),
-            "sqma" => Ok(LawKind::Sqma),
-            _ => Err(config::ConfigError::Message(format!(
-                "unknown law {s:?}; available: script, sqma"
-            ))),
         }
     }
 }
@@ -67,28 +60,38 @@ pub(crate) fn build(
     match settings.law.name {
         #[cfg(feature = "lua")]
         LawKind::Script => Ok(Box::new(script::ScriptLaw::new(
-            settings.law.config.clone(),
+            settings.law.script.clone(),
         )?)),
         #[cfg(not(feature = "lua"))]
         LawKind::Script => {
             anyhow::bail!("law \"script\" is not available: built without a script backend")
         }
         LawKind::Sqma => Ok(Box::new(sqma::SqmaLaw::new(
-            settings.law.config.clone(),
+            settings.law.sqma.clone(),
             diagnostics,
         )?)),
     }
 }
 
-/// The options a script law declares, as JSON for configuration frontends.
-#[cfg(feature = "lua")]
-pub(crate) fn config_schema_json(path: &Path) -> anyhow::Result<String> {
-    let schema = script::ScriptLaw::inspect(path)?;
+/// The configuration's JSON Schema. With a script, `law.script` lists the
+/// options that script declares.
+pub(crate) fn config_schema_json(script: Option<&Path>) -> anyhow::Result<String> {
+    let mut schema = serde_json::to_value(Settings::json_schema())?;
+    if let Some(path) = script {
+        *schema
+            .pointer_mut("/properties/law/properties/script")
+            .context("the configuration schema has no law.script")? = script_schema(path)?;
+    }
     Ok(serde_json::to_string_pretty(&schema)?)
 }
 
+#[cfg(feature = "lua")]
+fn script_schema(path: &Path) -> anyhow::Result<serde_json::Value> {
+    Ok(script::ScriptLaw::inspect(path)?.json_schema())
+}
+
 #[cfg(not(feature = "lua"))]
-pub(crate) fn config_schema_json(path: &Path) -> anyhow::Result<String> {
+fn script_schema(path: &Path) -> anyhow::Result<serde_json::Value> {
     anyhow::bail!(
         "cannot read {}: built without a script backend",
         path.display()
