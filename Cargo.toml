@@ -23,6 +23,7 @@ anyhow = "1.0"
 async-trait = "0.1.92"
 config = { version = "0.15.27", default-features = false, features = ["json"] }
 fastrand = "2"
+garde = { version = "0.23", default-features = false, features = ["derive"] }
 icmp-socket2 = { version = "0.6.6", features = ["tokio"] }
 irtt-client = { version = "0.8.0", optional = true, features = ["ancillary", "tokio"] }
 libc = "0.2"

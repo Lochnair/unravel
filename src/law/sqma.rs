@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::Context;
+use garde::{Path, Report, Validate};
 use log::{debug, info, warn};
 use serde::Deserialize;
 
@@ -21,10 +22,7 @@ use crate::{
     },
     metrics::Metric,
     runtime::{Direction, Shaper},
-    settings::{
-        ValidationReport, deserialize_flex_bool, validate_greater_than_zero_f64,
-        validate_zero_or_greater_f64,
-    },
+    settings::{deserialize_flex_bool, rules, warning},
 };
 
 const BASELINE_HALF_LIFE_SECS: f64 = 135.0;
@@ -41,26 +39,36 @@ const HISTORY_MAX_AGE_SECS: u64 = 6 * 3600;
 const HISTORY_HEADER: &str = "unravel-history 1";
 
 /// SQMA's own configuration, read from `law.sqma`.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, garde::Validate)]
 #[serde(default, deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(crate) struct SqmaSettings {
+    #[garde(range(min = 0.0))]
     pub(crate) download_delay_ms: f64,
+    #[garde(range(min = 0.0))]
     pub(crate) high_load_level: f64,
+    #[garde(custom(rules::change_interval))]
     pub(crate) min_change_interval: f64,
+    #[garde(range(min = 1))]
     pub(crate) speed_hist_size: u32,
     /// Probe and traffic sampling period, in seconds.
+    #[garde(custom(rules::timer_period))]
     pub(crate) tick_interval: f64,
+    #[garde(range(min = 0.0))]
     pub(crate) upload_delay_ms: f64,
     /// At or below low_load_level, each cut can take the rate no lower than
-    /// this fraction of the current rate (0 = off, the upstream behaviour).
+    /// this fraction of the current rate (0 through 0.99, with 0 disabling the floor).
+    #[garde(range(min = 0.0, max = 0.99))]
     pub(crate) low_load_cut_floor: f64,
     /// When the delay is under the threshold and load is at or below
     /// low_load_level, step the rate towards the median of the recorded
     /// safe rates by this percentage of the base rate per evaluation
     /// (0 = off, the upstream behaviour).
+    #[garde(range(min = 0.0, max = 100.0))]
     pub(crate) idle_recovery_percent: f64,
     /// Load at or below which low_load_cut_floor and idle_recovery_percent
     /// act. Above it, the decision is unchanged from upstream.
+    #[garde(range(min = 0.0, max = 1.0))]
     pub(crate) low_load_level: f64,
     /// Keep the recorded safe rates across a service restart. They are read
     /// at startup if under 6 h old and saved with the same speed_hist_size
@@ -95,80 +103,36 @@ impl SqmaSettings {
                 .context("Reading law.sqma settings")?,
             None => Self::default(),
         };
-        let mut report = ValidationReport::default();
-        settings.validate(&mut report);
-        report.finish()?;
-        Ok(settings)
+        let mut report = Report::new();
+        settings.validate_into(&(), &mut || Path::new("law").join("sqma"), &mut report);
+        if garde::select!(report, law.sqma.high_load_level)
+            .next()
+            .is_none()
+        {
+            settings.warn_about_high_load_level();
+        }
+        if report.is_empty() {
+            Ok(settings)
+        } else {
+            Err(anyhow::Error::new(report).context("settings validation failed"))
+        }
     }
 
-    fn validate(&self, report: &mut ValidationReport) {
-        validate_zero_or_greater_f64(report, "law.sqma.download_delay_ms", self.download_delay_ms);
-
-        validate_zero_or_greater_f64(report, "law.sqma.upload_delay_ms", self.upload_delay_ms);
-
-        let high_load_level_valid =
-            validate_zero_or_greater_f64(report, "law.sqma.high_load_level", self.high_load_level);
-
-        if validate_greater_than_zero_f64(
-            report,
-            "law.sqma.min_change_interval",
-            self.min_change_interval,
-        ) && !Duration::try_from_secs_f64(self.min_change_interval)
-            .is_ok_and(|interval| !interval.is_zero())
-        {
-            report.error(
-                "law.sqma.min_change_interval",
-                "must convert to a nonzero representable duration",
+    fn warn_about_high_load_level(&self) {
+        if self.high_load_level == 0.0 {
+            warning(
+                "law.sqma.high_load_level",
+                "0 causes any positive load to be treated as high load",
             );
-        }
-
-        if !Duration::try_from_secs_f64(self.tick_interval)
-            .is_ok_and(|period| !period.is_zero() && Instant::now().checked_add(period).is_some())
-        {
-            report.error(
-                "law.sqma.tick_interval",
-                "must be a nonzero representable duration",
+        } else if self.high_load_level > 1.0 {
+            warning(
+                "law.sqma.high_load_level",
+                format!(
+                    "{} requires utilisation to exceed the current shaper rate \
+                     before the high-load threshold is reached",
+                    self.high_load_level,
+                ),
             );
-        }
-
-        if !(0.0..1.0).contains(&self.low_load_cut_floor) {
-            report.error(
-                "law.sqma.low_load_cut_floor",
-                "must be at least 0 and below 1",
-            );
-        }
-
-        if !(0.0..=100.0).contains(&self.idle_recovery_percent) {
-            report.error(
-                "law.sqma.idle_recovery_percent",
-                "must be between 0 and 100",
-            );
-        }
-
-        if !(0.0..=1.0).contains(&self.low_load_level) {
-            report.error("law.sqma.low_load_level", "must be between 0 and 1");
-        }
-
-        if self.speed_hist_size == 0 {
-            report.error("law.sqma.speed_hist_size", "must be greater than 0");
-        }
-
-        if high_load_level_valid {
-            if self.high_load_level == 0.0 {
-                report.warning(
-                    "law.sqma.high_load_level",
-                    "0 causes any positive load to be treated as high load",
-                );
-            } else if self.high_load_level > 1.0 {
-                report.warning(
-                    "law.sqma.high_load_level",
-                    format!(
-                        "{} requires utilisation to exceed the current shaper rate \
-                         before the high-load threshold is reached",
-                        self.high_load_level,
-                    ),
-                );
-            }
         }
     }
 }

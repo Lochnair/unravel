@@ -13,9 +13,7 @@ use std::path::Path;
 use std::str::FromStr;
 mod validation;
 
-pub(crate) use validation::{
-    ValidationReport, validate_greater_than_zero_f64, validate_zero_or_greater_f64,
-};
+pub(crate) use validation::{rules, warning};
 
 pub(crate) fn valid_instance_name(name: &str) -> bool {
     !name.is_empty()
@@ -124,23 +122,29 @@ impl FromStr for ObservabilityProtocol {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, garde::Validate)]
 #[serde(deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(crate) struct Settings {
     #[serde(default, deserialize_with = "deserialize_flex_bool")]
     pub(crate) dry_run: bool,
 
     #[serde(default)]
     pub(crate) law: LawSettings,
+
+    #[garde(dive)]
     pub(crate) network: NetworkSettings,
 
     #[serde(default)]
+    #[garde(dive)]
     pub(crate) reflectors: ReflectorSettings,
 
     #[serde(default)]
+    #[garde(dive)]
     pub(crate) output: OutputSettings,
 
     #[serde(default)]
+    #[garde(dive)]
     pub(crate) observability: ObservabilitySettings,
 }
 
@@ -247,22 +251,31 @@ impl Settings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, garde::Validate)]
 #[serde(deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(crate) struct NetworkSettings {
+    #[garde(custom(rules::nonblank))]
     pub(crate) download_interface: String,
+    #[garde(custom(rules::nonblank))]
     pub(crate) upload_interface: String,
     #[serde(default)]
+    #[garde(if(cond = self.download_interface().is_some(), range(min = 1.0)))]
     pub(crate) download_base_kbits: f64,
     #[serde(default = "default_min_percent")]
+    #[garde(if(cond = self.download_interface().is_some(), range(min = 1.0, max = 100.0)))]
     pub(crate) download_min_percent: f64,
     #[serde(default)]
+    #[garde(if(cond = self.upload_interface().is_some(), range(min = 1.0)))]
     pub(crate) upload_base_kbits: f64,
     #[serde(default = "default_min_percent")]
+    #[garde(if(cond = self.upload_interface().is_some(), range(min = 1.0, max = 100.0)))]
     pub(crate) upload_min_percent: f64,
     /// The highest rate a law may set, as a percentage of base. Unset means
     /// no maximum.
+    #[garde(if(cond = self.download_interface().is_some(), range(min = 100.0)))]
     pub(crate) download_max_percent: Option<f64>,
+    #[garde(if(cond = self.upload_interface().is_some(), range(min = 100.0)))]
     pub(crate) upload_max_percent: Option<f64>,
 
     #[allow(dead_code)]
@@ -308,8 +321,9 @@ impl NetworkSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, garde::Validate)]
 #[serde(default, deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(crate) struct ReflectorSettings {
     /// JSON pools, each an array of measurement targets.
     #[serde(deserialize_with = "deserialize_reflector_files")]
@@ -318,8 +332,10 @@ pub(crate) struct ReflectorSettings {
     /// Inline targets, joined by the pool files' targets once loaded.
     pub(crate) entries: Vec<MeasurementTarget>,
 
+    #[garde(range(min = 1))]
     pub(crate) num_reflectors: u8,
     pub(crate) num_candidates: usize,
+    #[garde(custom(rules::timer_period))]
     pub(crate) candidate_period: f64,
 }
 
@@ -351,13 +367,15 @@ impl Default for ReflectorSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, garde::Validate)]
 #[serde(default, deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(crate) struct OutputSettings {
     #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) log_level: Level,
     /// Holds a folder per instance, with the CSV statistics and each law's
     /// saved state.
+    #[garde(custom(rules::nonblank))]
     pub(crate) folder: String,
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) suppress_statistics: bool,
@@ -373,16 +391,21 @@ impl Default for OutputSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, garde::Validate)]
 #[serde(default, deny_unknown_fields)]
+#[garde(allow_unvalidated)]
 pub(crate) struct ObservabilitySettings {
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) enabled: bool,
     #[serde(deserialize_with = "deserialize_from_str")]
     pub(crate) protocol: ObservabilityProtocol,
+    #[garde(if(cond = self.enabled, required, inner(custom(rules::nonblank))))]
     pub(crate) host: Option<String>,
+    #[garde(if(cond = self.enabled, range(min = 1)))]
     pub(crate) port: u16,
+    #[garde(if(cond = self.enabled, range(min = 1)))]
     pub(crate) batch_size: usize,
+    #[garde(if(cond = self.enabled, range(min = 1)))]
     pub(crate) batch_timeout_ms: u64,
     #[serde(deserialize_with = "deserialize_flex_bool")]
     pub(crate) export_ping_metrics: bool,
