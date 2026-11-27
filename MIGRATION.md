@@ -4,7 +4,7 @@ These steps are for upgrading to `master`. If you're using a package from the Op
 
 ## Upgrading a named-instance OpenWrt configuration
 
-Keep `/etc/config/unravel` and its owned sections. The updated OpenWrt package converts that file to temporary per-instance JSON when applying the service. Install the daemon, init script and converter together. Standalone invocations use `--config /path/to/instance.json`, the optional per-instance TOML, or environment variables.
+Keep `/etc/config/unravel` and its owned sections. The updated OpenWrt package converts that file to temporary per-instance JSON when applying the service. Install the daemon, init script and converter together. Standalone invocations require `--instance <name>` and can use `--config` with a JSON or TOML file. Pass any previous per-instance TOML file explicitly. If you previously layered TOML on top of the OpenWrt configuration, move those settings into the owned UCI sections before upgrading.
 
 Configuration errors in any enabled instance reject a service apply, including explicit restart. Fix the reported option before applying again. Check misspelled and obsolete options in JSON, TOML and environment overrides as well as UCI. `enabled` on an instance and `use_syslog` on its output section accept the standard true and false forms. An invalid value now fails the apply.
 
@@ -34,7 +34,7 @@ If you already run an earlier build of `unravel`, check these settings too. Unkn
 2. Move each instance's selected `law`, `reflectors`, `output` and `observability` settings into its own sections. Add `option instance '<name>'` to each section and remove the profile reference options from the instance. If several WANs used one profile, copy its settings into a section for each owner. Each of these section types can appear at most once for a given owner.
 3. Assign every `config reflector` to an instance with `option instance '<name>'`. Copy entries to each WAN that needs them. Set reflector pool files in each WAN's owned `reflectors` section. Multiple instances may reference the same reflector pool or Lua file.
 4. Remove `advanced_settings` from UCI and TOML. Put `option dry_run '1'` or `'0'` directly in the UCI instance section. In TOML, place `dry_run = true` or `false` at the top of the file before table headers. Rename `UNRAVEL__ADVANCED_SETTINGS__DRY_RUN` to `UNRAVEL__DRY_RUN`.
-5. Rename the old `/etc/unravel/config.toml` to `/etc/unravel/<name>.toml` and use `unravel --instance <name>` for manual starts and service wrappers. The TOML table for network settings is still `[network]`.
+5. For manual starts and service wrappers, use `unravel --instance <name> --config /etc/unravel/config.toml`, substituting the path to your TOML file. The TOML table for network settings is still `[network]`.
 6. Update ubus clients to call `unravel.<name>`. The old unnamed `unravel` object and anonymous instance are removed. An instance named `default` uses the same conventions as any other name.
 
 See the [shipped UCI configuration](dist/openwrt/unravel.config) for a complete named `wan` example.

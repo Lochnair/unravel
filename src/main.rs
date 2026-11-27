@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<ExitCode> {
             check,
         } => {
             if check {
-                ValidatedConfig::new(Settings::load(&instance, config.as_deref())?)?;
+                ValidatedConfig::new(Settings::load(config.as_deref())?)?;
                 return Ok(ExitCode::SUCCESS);
             }
             (instance, config)
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<ExitCode> {
         .enable_all()
         .build()?;
     let result = runtime.block_on(async {
-        let settings = Settings::load(&instance, config.as_deref())?;
+        let settings = Settings::load(config.as_deref())?;
         ::log::set_max_level(settings.output.log_level.to_level_filter());
         warn_platform_limitations();
 
@@ -144,7 +144,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Mode> {
                 check,
             })
         }
-        (None, None, false, _, _) => anyhow::bail!("Missing instance name; {USAGE}"),
+        (None, None, false, _, _) => anyhow::bail!("Missing required --instance <name>; {USAGE}"),
         _ => anyhow::bail!("Invalid argument combination; {USAGE}"),
     }
 }

@@ -93,7 +93,9 @@ For a build with JSON, TOML and IRTT support only, run `cargo build --release --
 
 ## Configuration
 
-unRAVEL merges an explicit JSON file supplied with `--config <path>`, the optional `/etc/unravel/<instance>.toml` on builds with TOML support, and environment overrides in that order. For example, `UNRAVEL__NETWORK__UPLOAD_INTERFACE=wan` overrides the corresponding setting in both files. The JSON file must exist when supplied. It uses the same tables and option names as the [TOML example](dist/unravel.toml), and the instance name comes from `--instance`.
+Each unRAVEL process runs one instance. Pass `--instance <name>` when running or validating a configuration. The name identifies the process in logs and metrics, its output and law state directory, and its ubus object when enabled.
+
+Settings start with built-in defaults, then use the optional explicit file passed to `--config <path>`, then apply environment overrides such as `UNRAVEL__NETWORK__UPLOAD_INTERFACE=wan`. The file must exist and end in `.json` or `.toml`. JSON works in every build, and TOML requires the `toml` Cargo feature. Both formats use the same tables and option names. Choose the runtime name and configuration path independently.
 
 To check the merged configuration before starting an instance, run:
 
@@ -107,7 +109,7 @@ A successful check exits with status zero. The check validates application and s
 
 On OpenWrt, set your interface names and rates in `/etc/config/unravel`. If you use `uci set`, run `uci commit unravel` before applying changes. The init script generates private JSON files under `/var/run/unravel-config` and validates all enabled instances before submitting the new service configuration. A configuration error leaves the previous service running. The managed service and its preflight use a clean environment. If you are upgrading, see the [migration guide](MIGRATION.md).
 
-Use `/etc/init.d/unravel reload` to apply UCI changes. procd reloads instances whose generated JSON or service options changed. Use `/etc/init.d/unravel restart` after changing the contents of referenced Lua scripts, reflector pools or optional TOML overrides. Those files are checked during preflight, while procd watches the generated JSON for instance changes. Each JSON file is replaced by an atomic rename. Publication across multiple files and the procd update are separate operations.
+Use `/etc/init.d/unravel reload` to apply UCI changes. procd reloads instances whose generated JSON or service options changed. Use `/etc/init.d/unravel restart` after changing the contents of referenced Lua scripts or reflector pools. Those files are checked during preflight, while procd watches the generated JSON for instance changes. Each JSON file is replaced by an atomic rename. Publication across multiple files and the procd update are separate operations.
 
 ```uci
 config instance 'wan'
@@ -133,7 +135,7 @@ To cap either shaper, set `download_max_percent` or `upload_max_percent` to at l
 
 ### TOML
 
-For a manual install, put the equivalent settings for `wan` in `/etc/unravel/wan.toml`. [dist/unravel.toml](dist/unravel.toml) has these settings and the default reflectors.
+For a manual install, save the settings in a file such as `/etc/unravel/wan.toml` and pass it with `--config /etc/unravel/wan.toml`. [dist/unravel.toml](dist/unravel.toml) includes these settings and a reflector list.
 
 ```toml
 dry_run = false
@@ -186,7 +188,7 @@ Each subordinate section needs an `option instance` naming its owner. It can app
 
 Invalid instance names, unknown section types, missing or invalid ownership links, duplicate owned singleton sections, and invalid `enabled` or `use_syslog` values reject the package. Repeated named declarations and empty scalar options follow libuci semantics. Unknown application options and invalid script options reject the configuration of an enabled instance and prevent the batch from being applied.
 
-On Linux, set `measurement_bind_device` on an instance if you need to bind its probes to a particular interface. For a standalone second instance, use `unravel --instance wan2 --config /path/to/wan2.json`, or supply `/etc/unravel/wan2.toml` on a build with TOML support.
+On Linux, set `measurement_bind_device` on an instance if you need to bind its probes to a particular interface. For a standalone second instance, use `unravel --instance wan2 --config /path/to/wan2.json`, or pass a TOML file with `--config` on a build with TOML support.
 
 ## Running it
 
@@ -199,14 +201,14 @@ After configuring the OpenWrt package, start the service and enable it at boot:
 /etc/init.d/unravel enable
 ```
 
-To try it in the foreground, stop the service first, then run the binary:
+To try an OpenWrt instance in the foreground after the service has generated its configuration, stop the service first, then run the binary:
 
 ```sh
 /etc/init.d/unravel stop
-/usr/sbin/unravel --instance wan
+/usr/sbin/unravel --instance wan --config /var/run/unravel-config/wan.json
 ```
 
-For a manual install on another Linux system, run `sudo /usr/sbin/unravel --instance wan`. Every invocation requires `--instance`. A manual binary install doesn't include a service definition.
+For a manual install on another Linux system, run `sudo /usr/sbin/unravel --instance wan --config /etc/unravel/wan.toml`. If you use a service manager, configure it to pass the runtime name and file path for each process.
 
 unRAVEL starts by setting the enabled shapers to their minimum rates. Once it's running, try a download or upload and watch the rates with `tc -s qdisc show dev wan` or the same command for the download interface.
 
@@ -424,7 +426,7 @@ protocol = "irtt"
 endpoint = "192.0.2.10:2112"
 ```
 
-Add pool files with `files = ["/path/to/pool.json"]` in TOML, or `list files '/path/to/pool.json'` in the `config reflectors` section in UCI. To clear files set by an earlier source, use `files = []` in TOML or `option files 'none'` in UCI.
+Add pool files with `files = ["/path/to/pool.json"]` in TOML, or `list files '/path/to/pool.json'` in the `config reflectors` section in UCI. To disable pool file loading, use `files = []` in TOML or `option files 'none'` in UCI.
 
 `authentication` is the IRTT HMAC key. If it's absent or blank, the session is unauthenticated. Listing the same reflector more than once is fine, but two IRTT entries for one endpoint with different keys are an error. unRAVEL never logs the key.
 

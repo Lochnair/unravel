@@ -174,57 +174,61 @@ impl Default for LawSettings {
 }
 
 impl Settings {
-    pub(crate) fn load(instance: &str, json: Option<&Path>) -> anyhow::Result<Self> {
-        Self::load_from(
-            instance,
-            json,
-            Path::new("/etc/unravel"),
-            Environment::with_prefix("UNRAVEL"),
-        )
-    }
-
-    fn load_from(
-        _instance: &str,
-        json: Option<&Path>,
-        _toml_dir: &Path,
-        environment: Environment,
-    ) -> anyhow::Result<Self> {
+    pub(crate) fn load(path: Option<&Path>) -> anyhow::Result<Self> {
         let mut builder = Config::builder();
-        if let Some(path) = json {
-            // File::from can fall back to a different filename. Read the exact
-            // path, with strict UTF-8, when one is explicitly supplied.
+        let file = if let Some(path) = path {
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_ascii_lowercase);
+            let format = match extension.as_deref() {
+                Some("json") => FileFormat::Json,
+                #[cfg(feature = "toml")]
+                Some("toml") => FileFormat::Toml,
+                #[cfg(not(feature = "toml"))]
+                Some("toml") => anyhow::bail!(
+                    "Cannot load {}: this build has no TOML support",
+                    path.display()
+                ),
+                _ => anyhow::bail!(
+                    "Unsupported configuration format for {}: expected .json or .toml",
+                    path.display()
+                ),
+            };
+            // config-rs can search alternate filenames for a file source.
+            // Read the exact path so an explicitly missing file is an error.
             let text = std::fs::read_to_string(path)
-                .with_context(|| format!("Reading JSON configuration {}", path.display()))?;
-            let source = Config::builder()
-                .add_source(File::from_str(&text, FileFormat::Json))
-                .build()
-                .map_err(|error| {
-                    // config-rs may include a scalar JSON root in its error.
-                    let detail = match error {
-                        ConfigError::FileParse { cause, .. } => cause
+                .with_context(|| format!("Reading configuration {}", path.display()))?;
+            builder = builder.add_source(File::from_str(&text, format));
+            Some((path, format))
+        } else {
+            None
+        };
+
+        let config = builder
+            .add_source(
+                Environment::with_prefix("UNRAVEL")
+                    .separator("__")
+                    .try_parsing(true)
+                    .list_separator(",")
+                    .with_list_parse_key("reflectors.files"),
+            )
+            .build()
+            .map_err(|error| match (file, error) {
+                (Some((path, format)), ConfigError::FileParse { cause, .. }) => {
+                    let detail = if format == FileFormat::Json {
+                        // config-rs may include a scalar JSON root in its error.
+                        cause
                             .downcast_ref::<serde_json::Error>()
-                            .map_or_else(|| "expected an object".to_owned(), ToString::to_string),
-                        _ => "could not load JSON".to_owned(),
+                            .map_or_else(|| "expected an object".to_owned(), ToString::to_string)
+                    } else {
+                        cause.to_string()
                     };
-                    anyhow::anyhow!("Invalid JSON configuration {}: {detail}", path.display())
-                })?;
-            builder = builder.add_source(source);
-        }
-
-        #[cfg(feature = "toml")]
-        {
-            let path = _toml_dir.join(format!("{_instance}.toml"));
-            builder = builder.add_source(File::from(path).format(FileFormat::Toml).required(false));
-        }
-
-        let builder = builder.add_source(
-            environment
-                .separator("__")
-                .try_parsing(true)
-                .list_separator(",")
-                .with_list_parse_key("reflectors.files"),
-        );
-        Self::from_config(builder.build()?).map_err(Into::into)
+                    anyhow::anyhow!("Invalid configuration {}: {detail}", path.display())
+                }
+                (_, error) => error.into(),
+            })?;
+        Self::from_config(config).map_err(Into::into)
     }
 
     fn from_config(config: Config) -> Result<Self, ConfigError> {
