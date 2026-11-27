@@ -188,6 +188,10 @@ Each subordinate section needs an `option instance` naming its owner. It can app
 
 Invalid instance names, unknown section types, missing or invalid ownership links, duplicate owned singleton sections, and invalid `enabled` or `use_syslog` values reject the package. Repeated named declarations and empty scalar options follow libuci semantics. Unknown application options and invalid script options reject the configuration of an enabled instance and prevent the batch from being applied.
 
+UCI values are strings. The converter reads `unravel --config-schema` for each enabled instance, with the script's options for a script law, and converts each value to the type the schema gives it. Boolean options accept `1`, `yes`, `on`, `true` or `enabled`, and `0`, `no`, `off`, `false` or `disabled`. List options take `list` entries or a single `option`. A value that doesn't convert is passed on unchanged, and the configuration check reports it.
+
+A script option that is a table is set with the table's name and the field joined by `_`: `option download_delay_ms '25'` sets `download.delay_ms`. The converter rejects a name that could mean two options, and a list of tables, which UCI can't hold. Use a JSON or TOML configuration for such a script.
+
 On Linux, set `measurement_bind_device` on an instance if you need to bind its probes to a particular interface. For a standalone second instance, use `unravel --instance wan2 --config /path/to/wan2.json`, or pass a TOML file with `--config` on a build with TOML support.
 
 ## Running it
