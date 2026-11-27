@@ -32,7 +32,7 @@ pub(crate) fn valid_instance_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-struct FlexiBool(bool);
+pub(crate) struct FlexiBool(pub(crate) bool);
 
 impl FromStr for FlexiBool {
     type Err = ConfigError;
@@ -224,8 +224,10 @@ impl Settings {
     fn from_config(config: Config) -> Result<Self, ConfigError> {
         let mut settings: Self = config.clone().try_deserialize()?;
 
-        settings.law.config = match config.get(&format!("law.{}", settings.law.name.as_str())) {
-            Ok(value) => Some(value),
+        // get_table keeps each value's origin, which `get` would drop.
+        settings.law.config = match config.get_table(&format!("law.{}", settings.law.name.as_str()))
+        {
+            Ok(table) => Some(config::Value::new(None, config::ValueKind::Table(table))),
             Err(ConfigError::NotFound(_)) => None,
             Err(error) => return Err(error),
         };

@@ -13,11 +13,14 @@ use std::{
 
 use anyhow::Context;
 use mlua::{
-    BorrowedStr, Function, HookTriggers, IntoLua, Lua, LuaOptions, StdLib, Table, UserData,
-    UserDataMethods, VmState,
+    BorrowedStr, Function, HookTriggers, IntoLua, Lua, LuaOptions, LuaSerdeExt, StdLib, Table,
+    UserData, UserDataMethods, VmState,
 };
 
-use super::{Backend, Event, OPTIONAL_HOOKS, REQUIRED_HOOKS, ScriptCadence, ScriptCtx, Value};
+use super::{
+    Backend, Event, OPTIONAL_HOOKS, REQUIRED_HOOKS, Schema, ScriptCadence, ScriptCtx, Value,
+    schema::OptionSpec,
+};
 use crate::law::{Cadence, LawContext};
 
 /// The instruction hook fires every this many VM instructions...
@@ -142,6 +145,29 @@ impl Backend for LuaBackend {
         })
     }
 
+    fn schema(&self) -> anyhow::Result<Schema> {
+        let options: Table = self
+            .law
+            .get::<Option<Table>>("options")
+            .context("options must be a table")?
+            .context("missing options table; a script without options declares options = {}")?;
+        // mlua reads a sequence by its length and drops other keys, so a
+        // table keyed by option name would silently become no options.
+        check_sequence(&options, "options")?;
+        for (index, entry) in options.sequence_values::<mlua::Value>().enumerate() {
+            if let mlua::Value::Table(entry) = entry?
+                && let Some(choices) = entry.get::<Option<Table>>("choices").ok().flatten()
+            {
+                check_sequence(&choices, &format!("options[{}].choices", index + 1))?;
+            }
+        }
+        let options: Vec<OptionSpec> = self
+            .lua
+            .from_value(mlua::Value::Table(options))
+            .context("Reading options")?;
+        Schema::new(options)
+    }
+
     fn call(&mut self, event: &Event, ctx: &ScriptCtx<'_>) -> anyhow::Result<()> {
         let Some(function) = self.law.get::<Option<Function>>(event.hook())? else {
             return Ok(());
@@ -183,19 +209,34 @@ impl Backend for LuaBackend {
     }
 }
 
+/// Fails unless `table` is a list: keys 1 to n, nothing else.
+fn check_sequence(table: &Table, what: &str) -> anyhow::Result<()> {
+    let len = table.raw_len();
+    let mut count = 0;
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        let (key, _) = pair?;
+        count += 1;
+        let index = match key {
+            mlua::Value::Integer(i) => Some(i as f64),
+            mlua::Value::Number(n) => Some(n),
+            _ => None,
+        };
+        anyhow::ensure!(
+            index.is_some_and(|i| i >= 1.0 && i <= len as f64 && i.fract() == 0.0),
+            "{what} must be a list, with no keys or gaps"
+        );
+    }
+    // A table with gaps can report any border as its length.
+    anyhow::ensure!(count == len, "{what} must be a list, with no keys or gaps");
+    Ok(())
+}
+
 fn to_lua(lua: &Lua, value: &Value) -> mlua::Result<mlua::Value> {
     Ok(match value {
         Value::Nil => mlua::Nil,
         Value::Bool(b) => mlua::Value::Boolean(*b),
         Value::Number(n) => mlua::Value::Number(*n),
         Value::String(s) => s.as_str().into_lua(lua)?,
-        Value::Array(items) => {
-            let table = lua.create_table()?;
-            for item in items {
-                table.push(to_lua(lua, item)?)?;
-            }
-            mlua::Value::Table(table)
-        }
         Value::Map(entries) => {
             let table = lua.create_table()?;
             for (key, item) in entries {

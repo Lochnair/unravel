@@ -84,3 +84,13 @@ If you export metrics, replace `observability.export_baseline_metrics` with `obs
 | `sqm_event`, `sqm_metrics_dropped` | `unravel_event`, `unravel_metrics_dropped`. |
 
 Use the `instance` tag to keep WANs separate in your dashboards. If you renamed an instance, update any dashboard filters that used its former tag value. [Metrics reference](README.md#metrics)
+
+### Script laws
+
+If you wrote a script law for v0.6.0-rc1, add an `options` table next to `cadence` before you upgrade. It lists every option the script takes. A script with no options declares `options = {}`. unRAVEL now checks each value against its declared type and bounds, fills in the defaults, and hands `init` the result. It won't start the script without the table. [Using a Lua script](README.md#using-a-lua-script)
+
+Options in the `law` section that the script doesn't declare now stop the instance from starting. Before, they reached the script, and `cake.lua` logged a warning and ignored them. Check the startup error for the misspelled option and where it was set.
+
+`cake.lua` options are now typed. `detection_window`, `detection_threshold` and the `*_wire_packet_bytes` options must be whole numbers. `min_rates_on_timeout` takes the same boolean values as other UCI options, for example `1`, `yes` or `on`.
+
+If you set a string option of a script law in an environment variable, the variable's value mustn't look like a number. unRAVEL reads `007` from the environment as the number 7 and rejects it for a string option. Set it in UCI or TOML instead.

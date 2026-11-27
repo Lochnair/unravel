@@ -11,7 +11,7 @@ mod store;
 pub(crate) use context::LawContext;
 pub(crate) use store::LawStore;
 
-use std::{str::FromStr, time::Duration};
+use std::{path::Path, str::FromStr, time::Duration};
 
 use crate::{diagnostics::DiagnosticsSender, settings::Settings};
 
@@ -78,4 +78,19 @@ pub(crate) fn build(
             diagnostics,
         )?)),
     }
+}
+
+/// The options a script law declares, as JSON for configuration frontends.
+#[cfg(feature = "lua")]
+pub(crate) fn config_schema_json(path: &Path) -> anyhow::Result<String> {
+    let schema = script::ScriptLaw::inspect(path)?;
+    Ok(serde_json::to_string_pretty(&schema)?)
+}
+
+#[cfg(not(feature = "lua"))]
+pub(crate) fn config_schema_json(path: &Path) -> anyhow::Result<String> {
+    anyhow::bail!(
+        "cannot read {}: built without a script backend",
+        path.display()
+    )
 }

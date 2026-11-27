@@ -8,6 +8,9 @@
 
 #[cfg(feature = "lua")]
 mod lua;
+mod schema;
+
+pub(crate) use schema::Schema;
 
 use std::{
     path::{Path, PathBuf},
@@ -29,6 +32,9 @@ use crate::{
 pub(super) trait Backend: Send {
     /// Read once, right after loading.
     fn cadence(&self) -> anyhow::Result<ScriptCadence>;
+
+    /// The declared options, read and checked once, right after loading.
+    fn schema(&self) -> anyhow::Result<Schema>;
 
     /// Calls the hook for `event`. An absent optional hook is not an error.
     fn call(&mut self, event: &Event, ctx: &ScriptCtx<'_>) -> anyhow::Result<()>;
@@ -96,34 +102,7 @@ pub(super) enum Value {
     Bool(bool),
     Number(f64),
     String(String),
-    Array(Vec<Value>),
     Map(Vec<(String, Value)>),
-}
-
-impl From<config::Value> for Value {
-    fn from(value: config::Value) -> Self {
-        use config::ValueKind;
-        match value.kind {
-            ValueKind::Nil => Value::Nil,
-            ValueKind::Boolean(b) => Value::Bool(b),
-            ValueKind::I64(n) => Value::Number(n as f64),
-            ValueKind::I128(n) => Value::Number(n as f64),
-            ValueKind::U64(n) => Value::Number(n as f64),
-            ValueKind::U128(n) => Value::Number(n as f64),
-            ValueKind::Float(n) => Value::Number(n),
-            // UCI has only strings, so `'15'` has to arrive as 15.
-            ValueKind::String(s) => match s.trim().parse::<f64>() {
-                Ok(n) => Value::Number(n),
-                Err(_) => Value::String(s),
-            },
-            ValueKind::Array(items) => Value::Array(items.into_iter().map(Value::from).collect()),
-            ValueKind::Table(table) => {
-                let mut entries: Vec<_> = table.into_iter().map(|(k, v)| (k, v.into())).collect();
-                entries.sort_by(|a: &(String, Value), b| a.0.cmp(&b.0));
-                Value::Map(entries)
-            }
-        }
-    }
 }
 
 /// What a script can do, borrowed for one hook call.
@@ -238,14 +217,14 @@ pub(super) struct ScriptLaw {
 impl ScriptLaw {
     /// `config` is the `law.script` table: `path` plus the script's own config.
     pub fn new(config: Option<config::Value>) -> anyhow::Result<Self> {
-        let Value::Map(mut entries) = config.map_or(Value::Map(vec![]), Value::from) else {
-            anyhow::bail!("law.script must be a table");
+        let mut table = match config.map(|value| value.kind) {
+            Some(config::ValueKind::Table(table)) => table,
+            None => config::Map::new(),
+            Some(_) => anyhow::bail!("law.script must be a table"),
         };
-        let path = match entries.iter().position(|(k, _)| k == "path") {
-            Some(i) => match entries.remove(i).1 {
-                Value::String(path) => PathBuf::from(path),
-                other => anyhow::bail!("law.script.path must be a string, not {other:?}"),
-            },
+        let path = match table.remove("path").map(|value| value.kind) {
+            Some(config::ValueKind::String(path)) => PathBuf::from(path),
+            Some(_) => anyhow::bail!("law.script.path must be a string"),
             None => anyhow::bail!("law.script.path is required"),
         };
 
@@ -272,13 +251,25 @@ impl ScriptLaw {
                 "cadence.timer is too large: {timer:?}"
             );
         }
+        let config = backend
+            .schema()
+            .with_context(|| format!("Reading the options of {}", path.display()))?
+            .apply(table)?;
 
         Ok(Self {
             name: format!("script-{stem}"),
             backend,
             cadence,
-            config: Value::Map(entries),
+            config,
         })
+    }
+
+    /// The options a script declares, without configuring or starting it.
+    pub fn inspect(path: &Path) -> anyhow::Result<Schema> {
+        let backend = load(path).with_context(|| format!("Loading {}", path.display()))?;
+        backend
+            .schema()
+            .with_context(|| format!("Reading the options of {}", path.display()))
     }
 
     fn call(&mut self, ctx: &LawContext, event: Event) -> anyhow::Result<()> {

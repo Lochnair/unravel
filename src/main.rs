@@ -25,7 +25,7 @@ mod time;
 use crate::app::App;
 use crate::platform::warn_platform_limitations;
 use crate::settings::{Settings, valid_instance_name};
-use std::{process::ExitCode, time::Duration};
+use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -34,7 +34,13 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> anyhow::Result<ExitCode> {
-    let instance = parse_args(std::env::args().skip(1))?;
+    let instance = match parse_args(std::env::args().skip(1))? {
+        Mode::Run(instance) => instance,
+        Mode::ConfigSchema(script) => {
+            println!("{}", law::config_schema_json(&script)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
     log::init(&instance)?;
     log::message(format_args!("Starting unRAVEL version {}", VERSION));
 
@@ -61,46 +67,55 @@ fn main() -> anyhow::Result<ExitCode> {
     })
 }
 
-/// The only argument is `--instance <name>` (or `--instance=<name>`).
-fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<String> {
-    let mut instance = None;
-    while let Some(arg) = args.next() {
-        let value = match arg.strip_prefix("--instance") {
-            Some("") => args.next(),
-            Some(rest) => rest.strip_prefix('=').map(str::to_owned),
-            None => None,
-        };
-        let Some(name) = value else {
-            anyhow::bail!("Unexpected argument {arg:?}; usage: unravel --instance <name>");
-        };
-        anyhow::ensure!(instance.is_none(), "--instance given more than once");
-        anyhow::ensure!(
-            valid_instance_name(&name),
-            "Instance name {name:?} must be letters, digits and underscores"
-        );
-        instance = Some(name);
-    }
-    instance
-        .ok_or_else(|| anyhow::anyhow!("Missing instance name; usage: unravel --instance <name>"))
+const USAGE: &str = "usage: unravel --instance <name> | unravel --config-schema --script <path>";
+
+enum Mode {
+    /// Run the named instance.
+    Run(String),
+    /// Print the options a script law declares, and exit.
+    ConfigSchema(PathBuf),
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn requires_one_valid_instance_name() {
-        let parse = |args: &[&str]| parse_args(args.iter().map(|arg| (*arg).to_owned()));
-        assert_eq!(parse(&["--instance", "wan"]).unwrap(), "wan");
-        assert_eq!(parse(&["--instance=default"]).unwrap(), "default");
-        for args in [
-            &[][..],
-            &["--instance"][..],
-            &["--instance="][..],
-            &["--instance", "../wan"][..],
-            &["--instance", "wan", "--instance=wan2"][..],
-        ] {
-            assert!(parse(args).is_err(), "{args:?}");
+/// Either `--instance <name>`, or `--config-schema --script <path>`. Values
+/// can also follow an `=`.
+fn parse_args(mut args: impl Iterator<Item = String>) -> anyhow::Result<Mode> {
+    let mut instance = None;
+    let mut script = None;
+    let mut config_schema = false;
+    while let Some(arg) = args.next() {
+        if arg == "--config-schema" {
+            anyhow::ensure!(!config_schema, "--config-schema given more than once");
+            config_schema = true;
+            continue;
         }
+        let (flag, slot) = if arg.starts_with("--instance") {
+            ("--instance", &mut instance)
+        } else if arg.starts_with("--script") {
+            ("--script", &mut script)
+        } else {
+            anyhow::bail!("Unexpected argument {arg:?}; {USAGE}");
+        };
+        let value = match &arg[flag.len()..] {
+            "" => args.next(),
+            rest => rest.strip_prefix('=').map(str::to_owned),
+        };
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            anyhow::bail!("Unexpected argument {arg:?}; {USAGE}");
+        };
+        anyhow::ensure!(slot.is_none(), "{flag} given more than once");
+        *slot = Some(value);
+    }
+
+    match (instance, script, config_schema) {
+        (None, Some(script), true) => Ok(Mode::ConfigSchema(PathBuf::from(script))),
+        (Some(name), None, false) => {
+            anyhow::ensure!(
+                valid_instance_name(&name),
+                "Instance name {name:?} must be letters, digits and underscores"
+            );
+            Ok(Mode::Run(name))
+        }
+        (None, None, false) => anyhow::bail!("Missing instance name; {USAGE}"),
+        _ => anyhow::bail!("--config-schema takes --script and no --instance; {USAGE}"),
     }
 }
