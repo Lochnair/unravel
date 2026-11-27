@@ -132,8 +132,8 @@ local law = {
   describe = DESCRIBE,
 }
 
--- unravel checks each option's type and bounds; these are the rules between
--- options. It calls this before init and for --check-config.
+-- unravel checks each option's type and bounds before calling this hook.
+-- These additional rules apply before init and for --check-config.
 function law:validate(c)
   local problems = {}
   local function check(ok, message)
@@ -142,6 +142,10 @@ function law:validate(c)
     end
   end
 
+  check(c.detection_window % 1 == 0,
+    "detection_window must be a whole number")
+  check(c.detection_threshold % 1 == 0,
+    "detection_threshold must be a whole number")
   check(c.detection_threshold <= c.detection_window,
     "detection_threshold must be at most detection_window")
   check(c.adjust_down_bufferbloat_max <= c.adjust_down_bufferbloat_min,
