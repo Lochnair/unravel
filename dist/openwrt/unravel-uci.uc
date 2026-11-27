@@ -5,8 +5,8 @@
 // Converts /etc/config/unravel into one JSON configuration per enabled
 // instance. UCI values are strings; `unravel --config-schema` says which are
 // booleans, numbers or lists. The schema only guides the conversion: a value
-// it can't convert is passed on as it is, and `unravel --check-config`
-// reports it.
+// it can't convert is passed on as it is for `unravel --check-config`,
+// unless conflicting options prevent it from building the JSON object.
 
 import { cursor } from 'uci';
 import { popen, stat, writefile } from 'fs';
@@ -135,8 +135,12 @@ function object(schema, raw, location) {
         let node = result, sub = schema;
         for (let i = 0; i < length(path) - 1; i++) {
             sub = sub.properties[path[i]];
-            if (type(node[path[i]]) != 'object')
+            if (!(path[i] in node))
                 node[path[i]] = {};
+            else if (type(node[path[i]]) != 'object') {
+                const parent = join('.', slice(path, 0, i + 1));
+                fail(location + '.' + name + ' conflicts with ' + location + '.' + parent);
+            }
             node = node[path[i]];
         }
         const last = path[length(path) - 1];
@@ -205,8 +209,15 @@ for (let section in sections) {
         break;
     default:
         instance.sections[kind] = options(section, { instance: true });
-        if (kind == 'reflectors' && 'entries' in instance.sections.reflectors)
-            fail(name + ': reflector entries must use reflector sections');
+        if (kind == 'reflectors') {
+            const reflectors = instance.sections.reflectors;
+            if ('entries' in reflectors)
+                fail(name + ': reflector entries must use reflector sections');
+            // The legacy scalar sentinel disables pool files. List entries are paths.
+            const files = type(reflectors.files) == 'string' ? trim(reflectors.files) : null;
+            if (files == 'none' || files == '')
+                reflectors.files = [];
+        }
     }
 }
 

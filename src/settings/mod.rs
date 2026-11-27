@@ -103,7 +103,22 @@ impl Settings {
         let mut settings: Self = match extension.as_deref() {
             Some("json") => serde_json::from_str(&text()?).map_err(|e| invalid(&e))?,
             #[cfg(feature = "toml")]
-            Some("toml") => toml::from_str(&text()?).map_err(|e| invalid(&e))?,
+            Some("toml") => {
+                let text = text()?;
+                toml::from_str(&text).map_err(|error: toml::de::Error| {
+                    // TOML's formatted diagnostic can include credentials from the source line.
+                    let message = error.message();
+                    if let Some(span) = error.span() {
+                        let before = &text.as_bytes()[..span.start.min(text.len())];
+                        let mut lines = before.split(|&byte| byte == b'\n');
+                        let column = lines.next_back().map_or(1, |line| line.len() + 1);
+                        let line = lines.count() + 1;
+                        invalid(&format_args!("line {line}, column {column}: {message}"))
+                    } else {
+                        invalid(&message)
+                    }
+                })?
+            }
             #[cfg(not(feature = "toml"))]
             Some("toml") => anyhow::bail!(
                 "Cannot load {}: this build has no TOML support",
