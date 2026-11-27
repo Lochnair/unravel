@@ -408,7 +408,7 @@ config law
     option path '/usr/share/unravel/laws/cake.lua'
 ```
 
-At startup the script logs the largest packet size it will use for each direction. On Linux, unRAVEL works this out from the interface MTU and CAKE's overhead and ATM or PTM framing. At low rates, sending a packet takes longer, so the script raises its delay thresholds and measures load over a longer window. If it can't get the packet size, it uses 1500 bytes. Set `download_wire_packet_bytes` or `upload_wire_packet_bytes` in the law section if you need to override it.
+At startup the script logs the largest packet size it will use for each direction. On Linux, unRAVEL works this out from the interface MTU and CAKE's overhead and ATM or PTM framing. At low rates, sending a packet takes longer, so the script raises its delay thresholds and measures load over a longer window. If it can't get the packet size, it uses 1500 bytes. Set `download.wire_packet_bytes` or `upload.wire_packet_bytes` under `law.script` if you need to override it.
 
 ## Reflectors and measurement protocols
 
