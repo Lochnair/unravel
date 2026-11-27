@@ -50,6 +50,7 @@ impl LawContext {
     }
 
     /// Configured number of active reflectors.
+    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     pub fn num_reflectors(&self) -> usize {
         self.num_reflectors
     }

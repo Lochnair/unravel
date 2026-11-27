@@ -371,7 +371,6 @@ pub(crate) struct SqmaLaw {
     history_saved_body: String,
 
     // Missing reflector data is checked every tick; warn once per episode.
-    warned_few_deltas: bool,
     warned_no_deltas: bool,
 }
 
@@ -468,7 +467,6 @@ impl SqmaLaw {
             diagnostics,
             history_saved_at: None,
             history_saved_body: String::new(),
-            warned_few_deltas: false,
             warned_no_deltas: false,
         })
     }
@@ -643,27 +641,7 @@ impl SqmaLaw {
     async fn evaluate(&mut self, ctx: &mut super::LawContext) -> anyhow::Result<()> {
         let now = Instant::now();
 
-        let (down_deltas, up_deltas, target_count) = {
-            let targets = ctx.applied.borrow().active_targets();
-            let (down, up) = self.deltas(targets.as_slice(), now);
-            (down, up, targets.len())
-        };
-
-        let minimum = ctx.num_reflectors().min(target_count);
-        if target_count == 0 || down_deltas.len() < minimum || up_deltas.len() < minimum {
-            if !self.warned_few_deltas {
-                warn!(
-                    "Not enough active delta values (D: {}, U: {}, need {})",
-                    down_deltas.len(),
-                    up_deltas.len(),
-                    minimum
-                );
-                self.warned_few_deltas = true;
-            }
-        } else if self.warned_few_deltas {
-            info!("Enough active delta values again");
-            self.warned_few_deltas = false;
-        }
+        let (down_deltas, up_deltas) = self.deltas(&ctx.applied.borrow().active_targets(), now);
 
         if down_deltas.is_empty() || up_deltas.is_empty() {
             if !self.warned_no_deltas {
